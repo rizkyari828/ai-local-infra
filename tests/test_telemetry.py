@@ -98,6 +98,15 @@ class LimitsTests(unittest.TestCase):
             with self.assertRaises(infra.InfraError):
                 telemetry.load_limits(path)
 
+    def test_max_runtime_below_model_timeout_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = pathlib.Path(temp) / "limits.yaml"
+            bad = json.loads(json.dumps(telemetry.DEFAULT_LIMITS))
+            bad["timeouts"]["max_runtime_seconds"] = bad["timeouts"]["model_timeout_seconds"] - 1
+            path.write_text(json.dumps(bad), encoding="utf-8")
+            with self.assertRaises(infra.InfraError):
+                telemetry.load_limits(path)
+
 
 class SpanValidationTests(unittest.TestCase):
     def test_valid_span_passes(self) -> None:

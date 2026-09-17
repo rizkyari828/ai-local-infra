@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+"""Run or health-check one task through the Agent Runtime.
+
+A health check is read-only and never downloads a model. Execution requires
+``--confirm-run`` and never pulls a model either. Prompts are sent to the
+provider but never stored; the runtime records only sanitized spans.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import pathlib
+import sys
+import uuid
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "common"))
+import providers  # noqa: E402
+import runtime  # noqa: E402
+
+
+def _uuid(value: str) -> str:
+    try:
+        uuid.UUID(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("not a UUID: %s" % value)
+    return value
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--health", action="store_true", help="Report provider readiness and exit")
+    parser.add_argument("--prompt", help="Task prompt; never stored in telemetry")
+    parser.add_argument("--prompt-file", type=pathlib.Path, help="Read the prompt from a file")
+    parser.add_argument("--provider", help="Provider name from config/runtime.yaml")
+    parser.add_argument("--model", help="Override the configured model")
+    parser.add_argument("--role", default="student", choices=("student", "teacher-cheap", "teacher-premium"))
+    parser.add_argument("--trace-id", type=_uuid, help="Reuse an existing trace for continuity")
+    parser.add_argument("--timeout-seconds", type=float, help="Per-attempt timeout override")
+    parser.add_argument("--max-attempts", type=int, help="Bounded attempts for retryable failures")
+    parser.add_argument("--config", type=pathlib.Path, help="Runtime config path")
+    parser.add_argument("--span-output", type=pathlib.Path, help="Span JSONL destination")
+    parser.add_argument("--confirm-run", action="store_true", help="Required for execution, not for health")
+    parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+    args = parser.parse_args()
+
+    config = providers.load_runtime_config(args.config) if args.config else providers.load_runtime_config()
+    agent = runtime.AgentRuntime.from_config(
+        config, args.provider, span_output=args.span_output, role=args.role
+    )
+
+    if args.health:
+        health = agent.health_check()
+        print(json.dumps(health, indent=2) if args.json else "provider=%s status=%s model=%s detail=%s" % (
+            health["provider"], health["status"], health["model"], health["detail"]))
+        return 0 if health["status"] == "healthy" else 1
+
+    if not args.confirm_run:
+        parser.error("--confirm-run is required for execution; models are never downloaded or run implicitly")
+    if args.prompt_file is not None:
+        prompt = args.prompt_file.read_text(encoding="utf-8")
+    elif args.prompt is not None:
+        prompt = args.prompt
+    else:
+        parser.error("provide --prompt or --prompt-file")
+
+    task = runtime.AgentTask(
+        prompt=prompt,
+        trace_id=args.trace_id,
+        model=args.model,
+        role=args.role,
+        timeout_seconds=args.timeout_seconds,
+        max_attempts=args.max_attempts,
+    )
+    result = agent.run(task)
+    if args.json:
+        print(json.dumps(result.as_dict(), indent=2))
+    else:
+        print("status=%s provider=%s model=%s attempts=%s duration_ms=%s trace_id=%s" % (
+            result.status, result.provider, result.model, result.attempts, result.duration_ms, result.trace_id))
+        if result.error_category:
+            print("error=%s:%s retryable=%s" % (result.error_category, result.error_code, result.retryable))
+        if result.content is not None:
+            print(result.content)
+    return 0 if result.status == "succeeded" else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -141,7 +141,7 @@ TARGET_HASH_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 DEFAULT_LIMITS: dict[str, Any] = {
     "schema_version": 1,
     "limits_version": "0.1.0",
-    "timeouts": {"model_timeout_seconds": 900},
+    "timeouts": {"model_timeout_seconds": 900, "max_runtime_seconds": 1800},
     "anomaly_thresholds": {
         "max_repeated_reads": 3,
         "max_retries": 2,
@@ -246,6 +246,12 @@ def _validate_limits(limits: dict[str, Any]) -> None:
     model_timeout = timeouts.get("model_timeout_seconds")
     if isinstance(model_timeout, bool) or not isinstance(model_timeout, int) or model_timeout <= 0:
         raise infra.InfraError("timeouts.model_timeout_seconds must be a positive integer")
+    max_runtime = timeouts.get("max_runtime_seconds")
+    if max_runtime is not None:
+        if isinstance(max_runtime, bool) or not isinstance(max_runtime, int) or max_runtime <= 0:
+            raise infra.InfraError("timeouts.max_runtime_seconds must be a positive integer")
+        if max_runtime < model_timeout:
+            raise infra.InfraError("timeouts.max_runtime_seconds must not be less than model_timeout_seconds")
     for key in ("max_repeated_reads", "max_retries"):
         value = thresholds.get(key)
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:

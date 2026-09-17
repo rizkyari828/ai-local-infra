@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "runtime_version": "0.1.0",
+  "providers_version": "0.1.0",
+  "default_provider": "ollama",
+  "providers": {
+    "ollama": {
+      "provider": "ollama",
+      "base_url": "http://localhost:11434",
+      "model": "qwen3.6:27b-coding",
+      "keep_alive": "5m"
+    },
+    "fake": {
+      "provider": "fake",
+      "model": "fake-model",
+      "scenario": "success"
+    }
+  },
+  "notes": "Agent Runtime v0.1 provider selection. Ollama is an independent inference service reached over localhost; the runtime never embeds weights, manages GPUs, or reimplements inference. Point base_url at the target PC later without changing code. No secrets belong in this file."
+}

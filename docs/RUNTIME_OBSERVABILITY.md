@@ -2,9 +2,9 @@
 
 Local-first telemetry for locating the real bottleneck in a task: inference, tools,
 reads, context growth, retries, validation, provider failure, or escalation. There is
-no tracing backend, database, or agent runtime in this repository; the goal is a
-stable contract and lightweight aggregation a future runtime (or a developer) can
-emit and read.
+no tracing backend or database; the goal is a stable contract and lightweight
+aggregation that the Agent Runtime (see [Agent runtime](AGENT_RUNTIME.md)) or a
+developer can emit and read.
 
 ## Trace model
 
@@ -92,10 +92,10 @@ signal about the student. The escalation summary keeps the student failure taxon
   attempts, retries, escalation chain and outcome, run-level duration/tokens/context.
 - **Partially measurable**: token usage and context size/utilization only when the
   provider/runtime exposes them; reasoning tokens are often unavailable.
-- **Not measurable here**: queue/wait times and provider retry storms, because this
-  repository has no queue and no provider retry path. Circuit breakers, bounded
-  retries, and backpressure belong to the future agent runtime and are intentionally
-  deferred.
+- **Not measurable here**: queue/wait times and provider retry storms. There is no
+  queue, and the Agent Runtime bounds retries and total runtime by configuration
+  instead of retrying indefinitely. Circuit breakers and backpressure remain
+  intentionally deferred.
 
 ## Privacy
 

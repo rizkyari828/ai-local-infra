@@ -2,7 +2,7 @@
 
 Reusable, local-first tooling for configuring, measuring, evaluating, and improving Ollama/Qwen workloads. It is the **HOW local AI runs** layer. Each product repository remains the **WHAT the agent needs to know** layer and keeps its own `AGENTS.md`, `QWEN.md`, checkpoint, lessons, architecture, and domain context.
 
-This v0.1 is deliberately file-based. It has profiles, a model registry, hardware facts, safe apply/rollback, drift detection, resource checks, JSONL telemetry, small eval definitions, and learning dataset schemas. It is not a runtime dependency of Content Studio and is not an API, UI, daemon, database, RAG system, agent platform, or training pipeline.
+This v0.1 is deliberately file-based. It has profiles, a model registry, hardware facts, safe apply/rollback, drift detection, resource checks, JSONL telemetry, small eval definitions, a minimal Agent Runtime, and learning dataset schemas. It is not a runtime dependency of Content Studio and is not an API, UI, daemon, database, RAG system, autonomous agent platform, or training pipeline.
 
 ## Quick start
 
@@ -61,6 +61,24 @@ runtime bottlenecks measurable instead of guessed:
 
 See [Runtime observability](docs/RUNTIME_OBSERVABILITY.md) and
 [`telemetry/schemas/span-event.schema.json`](telemetry/schemas/span-event.schema.json).
+
+## Agent runtime v0.1
+
+The minimal runtime executes one local-model task through a provider while
+automatically emitting validated spans, enforcing configured limits, honoring
+timeout/cancellation, and classifying failures. Ollama remains an independent
+service; the runtime never embeds weights or downloads models.
+
+```bash
+./scripts/agent-run --health
+./scripts/agent-run --provider fake --prompt "ping" --confirm-run --json
+./scripts/agent-run --config config/runtime.yaml --prompt-file task.txt --confirm-run
+```
+
+Providers are configured in [`config/runtime.yaml`](config/runtime.yaml) and
+resolved through a small registry, so DeepSeek/Codex providers and routing can be
+added later without changing the execution flow. Tests use a deterministic fake
+provider and need no live model. See [Agent runtime](docs/AGENT_RUNTIME.md).
 
 ## Agent guidance
 
