@@ -125,9 +125,9 @@ class DeepSeekProviderTests(unittest.TestCase):
             return FakeResponse(deepseek_reply("ok"))
 
         provider = providers.DeepSeekProvider(model="deepseek-flash", api_key="k",
-                                              reasoning_profile="medium", opener=opener)
+                                              reasoning_profile="high", opener=opener)
         provider.execute(providers.ProviderRequest(prompt="hi"))
-        self.assertEqual("medium", captured["body"]["reasoning_effort"])
+        self.assertEqual("high", captured["body"]["reasoning_effort"])
         provider.execute(providers.ProviderRequest(prompt="hi", options={"reasoning_effort": "low"}))
         self.assertEqual("low", captured["body"]["reasoning_effort"])
 
