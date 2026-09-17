@@ -13,7 +13,7 @@
     "deepseek": {
       "provider": "deepseek",
       "base_url": "https://api.deepseek.com",
-      "model": "deepseek-reasoner",
+      "model": "deepseek-flash",
       "reasoning_profile": "high",
       "api_key_env": "DEEPSEEK_API_KEY"
     },

@@ -59,7 +59,7 @@ def http_error(status: int, body: object) -> urllib.error.HTTPError:
 def deepseek_reply(content: str = "fixed", **usage: object) -> dict:
     return {
         "id": "chatcmpl-1",
-        "model": "deepseek-reasoner",
+        "model": "deepseek-flash",
         "choices": [{"message": {"content": content}, "finish_reason": "stop"}],
         "usage": usage,
     }
@@ -106,6 +106,17 @@ class DeepSeekProviderTests(unittest.TestCase):
         self.assertIsInstance(providers.build_provider(providers.DEFAULT_RUNTIME_CONFIG, "deepseek"),
                               providers.DeepSeekProvider)
 
+    def test_default_fallback_is_flash_high(self) -> None:
+        entry = providers.DEFAULT_RUNTIME_CONFIG["providers"]["deepseek"]
+        self.assertEqual("deepseek-flash", entry["model"])
+        self.assertEqual("high", entry["reasoning_profile"])
+        loaded = providers.load_runtime_config()
+        self.assertEqual("deepseek-flash", loaded["providers"]["deepseek"]["model"])
+        provider = providers.DeepSeekProvider(api_key="k")
+        self.assertEqual("deepseek-flash", provider.model)
+        self.assertEqual("high", provider.reasoning_profile)
+        self.assertEqual("deepseek-flash", provider.describe()["model"])
+
     def test_config_requires_base_url(self) -> None:
         config = json.loads(json.dumps(providers.DEFAULT_RUNTIME_CONFIG))
         del config["providers"]["deepseek"]["base_url"]
@@ -140,10 +151,10 @@ class DeepSeekProviderTests(unittest.TestCase):
                                                prompt_cache_hit_tokens=4,
                                                completion_tokens_details={"reasoning_tokens": 7}))
 
-        provider = providers.DeepSeekProvider(model="deepseek-reasoner", api_key="unit-key", opener=opener)
+        provider = providers.DeepSeekProvider(model="deepseek-flash", api_key="unit-key", opener=opener)
         response = provider.execute(providers.ProviderRequest(prompt="do it", options={"temperature": 0.2}))
         self.assertEqual("answer", response.content)
-        self.assertEqual("deepseek-reasoner", response.model)
+        self.assertEqual("deepseek-flash", response.model)
         self.assertEqual(11, response.input_tokens)
         self.assertEqual(22, response.output_tokens)
         self.assertEqual(4, response.cached_input_tokens)
@@ -153,6 +164,7 @@ class DeepSeekProviderTests(unittest.TestCase):
         self.assertTrue(captured["url"].endswith("/chat/completions"))
         self.assertEqual("Bearer unit-key", captured["auth"])
         self.assertEqual("do it", captured["body"]["messages"][0]["content"])
+        self.assertEqual("deepseek-flash", captured["body"]["model"])
         self.assertFalse(captured["body"]["stream"])
         self.assertEqual(0.2, captured["body"]["temperature"])
 
@@ -545,7 +557,7 @@ class OptionalDeepSeekIntegrationTests(unittest.TestCase):
     """Opt-in smoke test; tiny prompt, minimal tokens, skipped by default."""
 
     def test_tiny_completion(self) -> None:
-        provider = providers.DeepSeekProvider(model=os.environ.get("LAI_DEEPSEEK_MODEL", "deepseek-chat"))
+        provider = providers.DeepSeekProvider(model=os.environ.get("LAI_DEEPSEEK_MODEL", "deepseek-flash"))
         if not provider.has_api_key():
             self.skipTest("DEEPSEEK_API_KEY is not set")
         response = provider.execute(providers.ProviderRequest(prompt="Reply with the single word READY.",

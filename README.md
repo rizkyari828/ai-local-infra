@@ -38,7 +38,7 @@ The teacher/student escalation foundation adds logical model roles, escalation t
 ./scripts/record-escalation --run-id <uuid> --task-class <class> \
   --student-model qwen3.6:27b-coding --student-outcome failed \
   --failure-category missed_existing_pattern \
-  --teacher-provider deepseek --teacher-model deepseek-coder --teacher-reason failure
+  --teacher-provider deepseek --teacher-model deepseek-flash --teacher-reason failure
 ./scripts/record-learning-candidate --source-run <uuid> --task-class <class> \
   --observed-failure "..." --failure-category missed_existing_pattern \
   --destination lesson --status reviewed

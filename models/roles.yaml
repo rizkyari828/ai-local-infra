@@ -19,7 +19,7 @@
       "tier": "hosted",
       "provider": "deepseek",
       "model_family": "deepseek",
-      "model_reference": "deepseek-coder",
+      "model_reference": "deepseek-flash",
       "intent": "First paid escalation for bounded, clearly classified local failures.",
       "escalation_trigger": "Reviewed or recurring local failure where a cheaper hosted model is likely sufficient.",
       "required_for_operation": false,

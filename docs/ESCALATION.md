@@ -8,7 +8,7 @@ retry framework.
 ```text
 Qwen Local
   -> classified eligible failure (policy)
-  -> DeepSeek
+  -> DeepSeek V4.1 Flash (reasoning high)
   -> normalized result + existing telemetry
 ```
 
@@ -22,6 +22,10 @@ Qwen Local
   written to telemetry.
 - Configurable fields: `base_url`, `model`, `reasoning_profile` (default
   `high`), optional `api_key_env`, optional scalar generation options.
+- The configured fallback is **DeepSeek V4.1 Flash**: `model = deepseek-flash`,
+  `reasoning_profile = high`. The reasoning level is carried by the model choice
+  in the existing request format (the provider sends `model` plus its normal
+  scalar options); no new model abstraction or undocumented API field is added.
 - Response normalization into `ProviderResponse`: content, provider/model,
   duration, input/output tokens, cached input tokens, reasoning tokens, and
   finish reason. Unavailable values stay `null`; they are never invented.
@@ -35,7 +39,7 @@ Configuration (`config/runtime.yaml`):
 deepseek:
   provider: deepseek
   base_url: https://api.deepseek.com
-  model: deepseek-reasoner
+  model: deepseek-flash
   reasoning_profile: high
   api_key_env: DEEPSEEK_API_KEY
 ```

@@ -15,7 +15,7 @@ local-ai-infra to operate.
 | Role | Tier | Provider | Model reference | Purpose |
 |---|---|---|---|---|
 | `student` | local | Ollama | `qwen3.6:27b-coding` | Attempt every coding task first. |
-| `teacher-cheap` | hosted | DeepSeek | `deepseek-coder` | First paid escalation for bounded, classified failures. |
+| `teacher-cheap` | hosted | DeepSeek | `deepseek-flash` | First paid escalation for bounded, classified failures. |
 | `teacher-premium` | hosted | Codex | `codex` | Second paid escalation for hard or high-uncertainty tasks. |
 
 Escalation is always a human or explicit-policy decision in this milestone.
@@ -81,7 +81,7 @@ Record a sanitized observation:
   --task-class bounded-code-transformation \
   --student-model qwen3.6:27b-coding --student-profile coding-routine \
   --student-outcome failed --failure-category missed_existing_pattern \
-  --teacher-provider deepseek --teacher-model deepseek-coder --teacher-reason failure \
+  --teacher-provider deepseek --teacher-model deepseek-flash --teacher-reason failure \
   --teacher-outcome accepted --human-review-outcome accepted \
   --correction-required yes --human-correction-count 1 --tests yes \
   --lesson-candidate --eval-candidate --duration-ms 8400
@@ -133,7 +133,7 @@ mandatory.
   --reviewed-root-cause "Student did not search for an existing helper before writing one" \
   --validated-correction "Require a pattern search before introducing a new helper" \
   --validation-evidence "regression eval qwen-regression-example passed" \
-  --teacher-provider deepseek --teacher-model deepseek-coder \
+  --teacher-provider deepseek --teacher-model deepseek-flash \
   --destination lesson --status validated --reviewer "human-reviewer"
 ```
 

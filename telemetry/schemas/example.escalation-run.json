@@ -11,7 +11,7 @@
   "student_outcome": "failed",
   "failure_category": "missed_existing_pattern",
   "teacher_provider": "deepseek",
-  "teacher_model": "deepseek-coder",
+  "teacher_model": "deepseek-flash",
   "teacher_reason": "failure",
   "teacher_outcome": "accepted",
   "human_review_outcome": "accepted",

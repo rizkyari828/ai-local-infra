@@ -53,6 +53,7 @@ DEFAULT_HEALTH_TIMEOUT_SECONDS = 5.0
 
 DEEPSEEK_API_KEY_ENV = "DEEPSEEK_API_KEY"
 DEEPSEEK_DEFAULT_BASE_URL = "https://api.deepseek.com"
+DEEPSEEK_DEFAULT_MODEL = "deepseek-flash"
 DEEPSEEK_GENERATION_KEYS = (
     "temperature",
     "top_p",
@@ -539,7 +540,7 @@ class DeepSeekProvider(ModelProvider):
     def __init__(
         self,
         base_url: str = DEEPSEEK_DEFAULT_BASE_URL,
-        model: Optional[str] = None,
+        model: Optional[str] = DEEPSEEK_DEFAULT_MODEL,
         api_key: Optional[str] = None,
         api_key_env: str = DEEPSEEK_API_KEY_ENV,
         reasoning_profile: str = "high",
@@ -764,7 +765,7 @@ DEFAULT_RUNTIME_CONFIG: dict = {
         "deepseek": {
             "provider": "deepseek",
             "base_url": DEEPSEEK_DEFAULT_BASE_URL,
-            "model": "deepseek-reasoner",
+            "model": DEEPSEEK_DEFAULT_MODEL,
             "reasoning_profile": "high",
             "api_key_env": DEEPSEEK_API_KEY_ENV,
         },
