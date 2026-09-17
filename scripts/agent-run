@@ -16,6 +16,7 @@ import sys
 import uuid
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "common"))
+import escalation  # noqa: E402
 import providers  # noqa: E402
 import runtime  # noqa: E402
 import tool_runtime  # noqa: E402
@@ -45,6 +46,11 @@ def main() -> int:
     parser.add_argument("--workspace", type=pathlib.Path, help="Workspace root; enables tool execution")
     parser.add_argument("--tool", help="Run one tool instead of inference (requires --workspace)")
     parser.add_argument("--params", help="JSON object of tool parameters")
+    parser.add_argument("--escalate", action="store_true", help="Enable escalation for this run")
+    parser.add_argument("--escalation-mode", choices=("manual", "automatic"), help="Override escalation mode")
+    parser.add_argument("--hosted", action="store_true", help="Allow hosted execution; may incur provider cost")
+    parser.add_argument("--task-class", default="general", help="Escalation telemetry task class")
+    parser.add_argument("--escalation-output", type=pathlib.Path, help="Escalation JSONL destination")
     parser.add_argument("--confirm-run", action="store_true", help="Required for execution, not for health")
     parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
     args = parser.parse_args()
@@ -71,6 +77,8 @@ def main() -> int:
     if args.tool:
         if tool_engine is None:
             parser.error("--tool requires --workspace")
+        if args.escalate:
+            parser.error("--escalate applies to inference runs, not --tool")
         try:
             params = json.loads(args.params) if args.params else {}
         except json.JSONDecodeError as exc:
@@ -105,9 +113,28 @@ def main() -> int:
         timeout_seconds=args.timeout_seconds,
         max_attempts=args.max_attempts,
     )
-    result = agent.run(task)
+    session = agent.open_session(task)
+    result = agent.run(task, session=session)
+    outcome = None
+    if args.escalate:
+        policy = escalation.EscalationPolicy.from_config(config)
+        policy.enabled = True
+        if args.escalation_mode:
+            policy.mode = args.escalation_mode
+        if args.hosted:
+            policy.hosted_allowed = True
+        fallback = providers.build_provider(config, policy.fallback_provider)
+        controller = escalation.EscalationController(
+            policy, fallback, limits=agent.limits, span_output=args.span_output,
+            escalation_output=args.escalation_output, role="teacher-cheap",
+        )
+        outcome = controller.maybe_escalate(session, task, result, task_class=args.task_class)
+
     if args.json:
-        print(json.dumps(result.as_dict(), indent=2))
+        payload = result.as_dict()
+        if outcome is not None:
+            payload = {"result": payload, "escalation": outcome.as_dict()}
+        print(json.dumps(payload, indent=2))
     else:
         print("status=%s provider=%s model=%s attempts=%s duration_ms=%s trace_id=%s" % (
             result.status, result.provider, result.model, result.attempts, result.duration_ms, result.trace_id))
@@ -115,7 +142,18 @@ def main() -> int:
             print("error=%s:%s retryable=%s" % (result.error_category, result.error_code, result.retryable))
         if result.content is not None:
             print(result.content)
-    return 0 if result.status == "succeeded" else 1
+        if outcome is not None:
+            print("escalation: action=%s reason=%s eligible=%s escalated=%s provider=%s teacher_run_id=%s" % (
+                outcome.action, outcome.reason, outcome.eligible, outcome.escalated,
+                outcome.fallback_provider, outcome.teacher_run_id))
+            if outcome.teacher_result is not None and outcome.teacher_result.content is not None:
+                print(outcome.teacher_result.content)
+    if result.status == "succeeded":
+        return 0
+    if outcome is not None and outcome.escalated and outcome.teacher_result is not None \
+            and outcome.teacher_result.status == "succeeded":
+        return 0
+    return 1
 
 
 if __name__ == "__main__":

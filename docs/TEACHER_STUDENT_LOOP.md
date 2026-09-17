@@ -2,8 +2,9 @@
 
 This document describes the smallest useful foundation for a local Qwen student that
 escalates to hosted paid teachers. It is metadata, telemetry, taxonomy, candidate
-formats, docs, and lightweight metrics. It is **not** a router, proxy, fallback, or
-training pipeline.
+formats, docs, and lightweight metrics. A single bounded, opt-in Qwen -> DeepSeek
+escalation is implemented in code (see [Escalation](ESCALATION.md)); there is still
+no multi-hop router, proxy, autonomous fallback, or training pipeline.
 
 ## Roles
 
@@ -192,13 +193,16 @@ evaluations justify it.
   acceptance and cost are not yet analyzable.
 - No `task_id`/trace-level aggregation; metrics operate on rows (one row per task).
 - No attribution model distinguishing environment or infrastructure failures from
-  student-capability failures. `environment_issue` is recorded but still counts in the
-  local success denominator.
-- No automated teacher routing, fallback, or promotion. These are explicit non-goals.
+  student-capability failures beyond the escalation policy, which refuses to escalate
+  them. `environment_issue` is recorded but still counts in the local success
+  denominator.
+- No multi-hop routing or autonomous promotion. One reviewed Qwen -> DeepSeek hop is
+  implemented; Codex, scoring, and cost optimization are explicit non-goals.
 
 ## Non-goals
 
 See the authoritative operating constraints in [`../AGENTS.md`](../AGENTS.md) and
 the deferred-architecture list in [`ARCHITECTURE.md`](ARCHITECTURE.md). This
-milestone adds no router, fallback, autonomous self-training, or training
-execution, and leaves Content Studio untouched.
+milestone adds only a bounded, opt-in single-hop escalation; it adds no multi-hop
+router, autonomous self-training, or training execution, and leaves Content Studio
+untouched.

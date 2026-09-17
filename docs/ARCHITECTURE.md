@@ -20,6 +20,10 @@
   `test.run`) executes within one session trace, confined to an explicit workspace
   root, with automatic tool spans and a tool-call budget. See
   [Tool runtime](TOOL_RUNTIME.md).
+- A `DeepSeekProvider` and a conservative, opt-in `EscalationController` allow at
+  most one Qwen -> DeepSeek hop for classified model-capability failures, keeping
+  the original trace and the remaining runtime budget. See
+  [Escalation](ESCALATION.md).
 
 No server process exists. Commands are short-lived and state is inspectable. Active application files remain at `~/.qwen/settings.json` and `/etc/systemd/system/ollama.service.d/override.conf`; no symlinks are used.
 
@@ -31,4 +35,4 @@ Backups may contain Qwen credentials, so they live in a mode-0700 state director
 
 ## Deliberately absent
 
-There is no PostgreSQL, ClickHouse, DuckDB dependency, Redis/Valkey, pgvector, HTTP API, UI, daemon, broker, RAG, Docker stack, scheduler, multi-agent orchestrator, routing policy, hosting-provider integration, fine-tuning, LoRA, or cloud management in v0.1. The Agent Runtime is a single-task execution layer and the Tool Runtime executes one explicitly requested call at a time; neither is an autonomous platform.
+There is no PostgreSQL, ClickHouse, DuckDB dependency, Redis/Valkey, pgvector, HTTP API, UI, daemon, broker, RAG, Docker stack, scheduler, multi-agent orchestrator, multi-hop routing, provider scoring, cost optimizer, fine-tuning, LoRA, or cloud management in v0.1. The Agent Runtime is a single-task execution layer, the Tool Runtime executes one explicitly requested call at a time, and escalation is a single reviewed hop; none of them is an autonomous platform.

@@ -20,6 +20,7 @@ and environment problems can never be misread as model reasoning failures.
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import re
 import socket
@@ -49,6 +50,17 @@ FAKE_SCENARIOS = (
 HEALTH_STATUSES = ("healthy", "unreachable", "model_missing", "misconfigured")
 
 DEFAULT_HEALTH_TIMEOUT_SECONDS = 5.0
+
+DEEPSEEK_API_KEY_ENV = "DEEPSEEK_API_KEY"
+DEEPSEEK_DEFAULT_BASE_URL = "https://api.deepseek.com"
+DEEPSEEK_GENERATION_KEYS = (
+    "temperature",
+    "top_p",
+    "max_tokens",
+    "stop",
+    "frequency_penalty",
+    "presence_penalty",
+)
 
 ERROR_CODE_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
 
@@ -164,6 +176,7 @@ class ProviderResponse:
     duration_ms: Optional[float] = None
     input_tokens: Optional[int] = None
     output_tokens: Optional[int] = None
+    cached_input_tokens: Optional[int] = None
     reasoning_tokens: Optional[int] = None
     context_size: Optional[int] = None
     context_utilization: Optional[float] = None
@@ -512,6 +525,182 @@ class OllamaProvider(ModelProvider):
         return any(name.split(":")[0] == configured for name in names)
 
 
+class DeepSeekProvider(ModelProvider):
+    """Talk to the hosted DeepSeek chat-completions API (OpenAI-compatible).
+
+    Credentials come from an environment variable (``DEEPSEEK_API_KEY`` by
+    default); they are never stored in configuration, returned by ``describe``,
+    or written to telemetry. Only the request/response fields this project
+    requires are read or sent, and unavailable metrics stay ``None``.
+    """
+
+    name = "deepseek"
+
+    def __init__(
+        self,
+        base_url: str = DEEPSEEK_DEFAULT_BASE_URL,
+        model: Optional[str] = None,
+        api_key: Optional[str] = None,
+        api_key_env: str = DEEPSEEK_API_KEY_ENV,
+        reasoning_profile: str = "high",
+        timeout_seconds: Optional[float] = None,
+        options: Optional[dict] = None,
+        health_timeout_seconds: float = DEFAULT_HEALTH_TIMEOUT_SECONDS,
+        opener: Optional[Callable[..., Any]] = None,
+    ) -> None:
+        self.base_url = validate_base_url(base_url)
+        self._model = model
+        self.api_key_env = api_key_env if isinstance(api_key_env, str) and api_key_env else DEEPSEEK_API_KEY_ENV
+        self._api_key = api_key if api_key is not None else os.environ.get(self.api_key_env)
+        self.reasoning_profile = reasoning_profile if isinstance(reasoning_profile, str) and reasoning_profile else "high"
+        self.timeout_seconds = timeout_seconds
+        self.options = _deepseek_options(options or {})
+        self.health_timeout_seconds = health_timeout_seconds
+        self._opener = opener or urllib.request.urlopen
+
+    @property
+    def model(self) -> Optional[str]:
+        return self._model
+
+    def has_api_key(self) -> bool:
+        return bool(self._api_key)
+
+    def describe(self) -> dict:
+        return {
+            "provider": self.name,
+            "model": self._model,
+            "base_url": self.base_url,
+            "reasoning_profile": self.reasoning_profile,
+            "has_api_key": self.has_api_key(),
+            "default_timeout_seconds": self.timeout_seconds,
+        }
+
+    def _open(self, request: Any, timeout: Optional[float]) -> Any:
+        if timeout is None:
+            return self._opener(request)
+        return self._opener(request, timeout=timeout)
+
+    def _auth_headers(self) -> dict:
+        return {"Content-Type": "application/json", "Authorization": "Bearer %s" % self._api_key}
+
+    def _translate_http_error(self, status: int, body: bytes) -> ProviderError:
+        if status in (401, 403):
+            return ProviderConfigurationError("auth_error", "hosted endpoint rejected the credentials")
+        if status == 404:
+            return ProviderModelMissing("model_missing", "configured model is not available")
+        if status == 429:
+            return ProviderUnavailable("rate_limited", "hosted endpoint rate limited the request")
+        if status == 400:
+            return ProviderValidationError("bad_request", "hosted endpoint rejected the request")
+        if status >= 500:
+            return ProviderUnavailable("http_%d" % status, "hosted endpoint returned a server error")
+        return ProviderResponseError("http_%d" % status, "hosted endpoint rejected the request", retryable=False)
+
+    def _request(self, path: str, payload: Optional[dict], timeout: Optional[float]) -> dict:
+        url = self.base_url + path
+        data = json.dumps(payload).encode("utf-8") if payload is not None else None
+        request = urllib.request.Request(
+            url, data=data, headers=self._auth_headers(), method="POST" if data else "GET"
+        )
+        try:
+            with self._open(request, timeout) as response:
+                status = getattr(response, "status", 200)
+                body = response.read()
+        except urllib.error.HTTPError as exc:
+            raise self._translate_http_error(exc.code, exc.read()) from None
+        except urllib.error.URLError:
+            raise ProviderUnavailable("connection_error", "hosted endpoint is unreachable") from None
+        except (TimeoutError, socket.timeout):
+            raise ProviderTimeout("timeout", "hosted endpoint did not respond before the timeout") from None
+        except OSError:
+            raise ProviderUnavailable("connection_error", "hosted endpoint could not be reached") from None
+        if status != 200:
+            raise self._translate_http_error(status, body)
+        try:
+            value = json.loads(body.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            raise ProviderResponseError("invalid_response", "hosted endpoint returned a non-JSON body") from None
+        if not isinstance(value, dict):
+            raise ProviderResponseError("invalid_response", "hosted endpoint returned an unexpected payload")
+        return value
+
+    def execute(self, request: ProviderRequest) -> ProviderResponse:
+        if not isinstance(request.prompt, str) or not request.prompt.strip():
+            raise ProviderValidationError("empty_prompt", "prompt must be a non-empty string")
+        if request.cancel is not None and request.cancel.is_set():
+            raise ProviderCancelled("cancelled")
+        model = request.model or self._model
+        if not model:
+            raise ProviderConfigurationError("model_not_configured", "no model is configured for the provider")
+        if not self._api_key:
+            raise ProviderConfigurationError("missing_api_key", "hosted provider credentials are not set")
+        options = dict(self.options)
+        options.update(_deepseek_options(request.options))
+        payload: dict = {
+            "model": model,
+            "messages": [{"role": "user", "content": request.prompt}],
+            "stream": False,
+        }
+        for key in DEEPSEEK_GENERATION_KEYS:
+            if key in options:
+                payload[key] = options[key]
+        timeout = request.timeout_seconds or self.timeout_seconds
+        started = time.perf_counter()
+        raw = self._request("/chat/completions", payload, timeout)
+        duration_ms = round((time.perf_counter() - started) * 1000, 3)
+        return self._parse(raw, model, duration_ms)
+
+    def _parse(self, raw: dict, model: str, duration_ms: float) -> ProviderResponse:
+        choices = raw.get("choices")
+        if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+            raise ProviderResponseError("invalid_response", "hosted endpoint returned no choices")
+        first = choices[0]
+        message = first.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, str) or not content.strip():
+            raise ProviderResponseError("invalid_response", "hosted endpoint returned an empty response")
+        usage = raw.get("usage") if isinstance(raw.get("usage"), dict) else {}
+        details = usage.get("completion_tokens_details") if isinstance(usage.get("completion_tokens_details"), dict) else {}
+        finish_reason = first.get("finish_reason")
+        reported_model = raw.get("model")
+        return ProviderResponse(
+            content=content,
+            provider=self.name,
+            model=reported_model if isinstance(reported_model, str) and reported_model else model,
+            duration_ms=duration_ms,
+            input_tokens=_optional_int(usage.get("prompt_tokens")),
+            output_tokens=_optional_int(usage.get("completion_tokens")),
+            cached_input_tokens=_optional_int(usage.get("prompt_cache_hit_tokens")),
+            reasoning_tokens=_optional_int(details.get("reasoning_tokens")),
+            context_size=None,
+            context_utilization=None,
+            finish_reason=finish_reason if isinstance(finish_reason, str) else None,
+        )
+
+    def health_check(self) -> ProviderHealth:
+        if not self.has_api_key():
+            return ProviderHealth(provider=self.name, status="misconfigured", model=self._model,
+                                  base_url=self.base_url, detail="missing_api_key")
+        try:
+            self._request("/models", None, self.health_timeout_seconds)
+        except ProviderConfigurationError as exc:
+            return ProviderHealth(provider=self.name, status="misconfigured", model=self._model,
+                                  base_url=self.base_url, detail=exc.code)
+        except ProviderError as exc:
+            return ProviderHealth(provider=self.name, status="unreachable", model=self._model,
+                                  base_url=self.base_url, detail=exc.code)
+        return ProviderHealth(provider=self.name, status="healthy", model=self._model, base_url=self.base_url)
+
+
+def _deepseek_options(options: Any) -> dict:
+    clean = _validate_generation(options)
+    unknown = sorted(set(clean) - set(DEEPSEEK_GENERATION_KEYS))
+    if unknown:
+        raise ProviderConfigurationError("unsupported_option",
+                                         "unsupported DeepSeek generation option: %s" % ", ".join(unknown))
+    return clean
+
+
 PROVIDER_BUILDERS: dict = {}
 
 
@@ -542,8 +731,22 @@ def _build_fake(entry: dict) -> ModelProvider:
     )
 
 
+def _build_deepseek(entry: dict) -> ModelProvider:
+    if "base_url" not in entry:
+        raise ProviderConfigurationError("missing_base_url", "deepseek provider requires base_url")
+    return DeepSeekProvider(
+        base_url=entry["base_url"],
+        model=entry.get("model"),
+        api_key_env=entry.get("api_key_env", DEEPSEEK_API_KEY_ENV),
+        reasoning_profile=entry.get("reasoning_profile", "high"),
+        timeout_seconds=entry.get("timeout_seconds"),
+        options=entry.get("options"),
+    )
+
+
 register_provider("ollama", _build_ollama)
 register_provider("fake", _build_fake)
+register_provider("deepseek", _build_deepseek)
 
 
 DEFAULT_RUNTIME_CONFIG: dict = {
@@ -558,9 +761,61 @@ DEFAULT_RUNTIME_CONFIG: dict = {
             "model": "qwen3.6:27b-coding",
             "keep_alive": "5m",
         },
+        "deepseek": {
+            "provider": "deepseek",
+            "base_url": DEEPSEEK_DEFAULT_BASE_URL,
+            "model": "deepseek-reasoner",
+            "reasoning_profile": "high",
+            "api_key_env": DEEPSEEK_API_KEY_ENV,
+        },
         "fake": {"provider": "fake", "model": "fake-model", "scenario": "success"},
     },
+    "escalation": {
+        "enabled": False,
+        "mode": "manual",
+        "hosted_allowed": False,
+        "fallback_provider": "deepseek",
+        "eligible_categories": ["model_reasoning_failure", "validation_failure"],
+        "max_depth": 1,
+    },
 }
+
+ESCALATION_MODES = ("manual", "automatic")
+MAX_ESCALATION_DEPTH = 1
+
+
+def _validate_escalation(config: dict, providers_map: dict) -> None:
+    section = config.get("escalation")
+    if section is None:
+        return
+    if not isinstance(section, dict):
+        raise ProviderConfigurationError("invalid_escalation", "escalation must be an object")
+    unknown = sorted(set(section) - {
+        "enabled", "mode", "hosted_allowed", "fallback_provider", "eligible_categories", "max_depth",
+    })
+    if unknown:
+        raise ProviderConfigurationError("invalid_escalation", "escalation has unknown fields: %s" % ", ".join(unknown))
+    for key in ("enabled", "hosted_allowed"):
+        value = section.get(key)
+        if value is not None and not isinstance(value, bool):
+            raise ProviderConfigurationError("invalid_escalation", "escalation.%s must be true or false" % key)
+    mode = section.get("mode", "manual")
+    if mode not in ESCALATION_MODES:
+        raise ProviderConfigurationError("invalid_escalation", "escalation.mode must be one of: %s" % ", ".join(ESCALATION_MODES))
+    fallback = section.get("fallback_provider", "deepseek")
+    if fallback not in providers_map:
+        raise ProviderConfigurationError("invalid_escalation", "escalation.fallback_provider must be a configured provider")
+    categories = section.get("eligible_categories")
+    if categories is not None:
+        if not isinstance(categories, list) or not categories:
+            raise ProviderConfigurationError("invalid_escalation", "escalation.eligible_categories must be a non-empty list")
+        for category in categories:
+            if category not in telemetry.RUNTIME_ERROR_CATEGORIES:
+                raise ProviderConfigurationError("invalid_escalation", "unknown eligible category: %s" % category)
+    depth = section.get("max_depth", MAX_ESCALATION_DEPTH)
+    if isinstance(depth, bool) or depth != MAX_ESCALATION_DEPTH:
+        raise ProviderConfigurationError("invalid_escalation",
+                                         "escalation.max_depth must be %d in this milestone" % MAX_ESCALATION_DEPTH)
 
 
 def validate_runtime_config(config: Any) -> dict:
@@ -591,6 +846,17 @@ def validate_runtime_config(config: Any) -> dict:
             if "base_url" not in entry:
                 raise ProviderConfigurationError("missing_base_url", "ollama provider requires base_url")
             validate_base_url(entry["base_url"])
+        if name == "deepseek":
+            if "base_url" not in entry:
+                raise ProviderConfigurationError("missing_base_url", "deepseek provider requires base_url")
+            validate_base_url(entry["base_url"])
+            profile = entry.get("reasoning_profile")
+            if profile is not None and (not isinstance(profile, str) or not profile.strip()):
+                raise ProviderConfigurationError("invalid_reasoning_profile", "deepseek reasoning_profile must be a non-empty string")
+            api_key_env = entry.get("api_key_env")
+            if api_key_env is not None and (not isinstance(api_key_env, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", api_key_env)):
+                raise ProviderConfigurationError("invalid_api_key_env", "deepseek api_key_env must be an environment variable name")
+    _validate_escalation(config, providers)
     return config
 
 

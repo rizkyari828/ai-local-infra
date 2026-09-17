@@ -56,6 +56,7 @@ class AgentTask:
     options: dict = field(default_factory=dict)
     keep_alive: Optional[str] = None
     cancel: Optional[threading.Event] = None
+    parent_span_id: Optional[str] = None
 
 
 @dataclass
@@ -76,6 +77,7 @@ class RuntimeResult:
     retryable: bool
     input_tokens: Optional[int] = None
     output_tokens: Optional[int] = None
+    cached_input_tokens: Optional[int] = None
     reasoning_tokens: Optional[int] = None
     context_size: Optional[int] = None
     context_utilization: Optional[float] = None
@@ -100,6 +102,7 @@ class RuntimeResult:
             "retryable": self.retryable,
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
+            "cached_input_tokens": self.cached_input_tokens,
             "reasoning_tokens": self.reasoning_tokens,
             "context_size": self.context_size,
             "context_utilization": self.context_utilization,
@@ -126,9 +129,23 @@ class TaskSession:
     cancel: Optional[threading.Event] = None
     role: str = "student"
     tool_calls: int = 0
+    escalation_depth: int = 0
 
     def remaining(self, clock: Callable[[], float]) -> float:
         return max(0.0, self.budget - (clock() - self.started))
+
+    def child(self, run_id: Optional[str] = None, role: str = "teacher-cheap") -> "TaskSession":
+        """Derive a nested session that keeps the trace, budget, and cancellation."""
+        return TaskSession(
+            run_id=run_id or str(uuid.uuid4()),
+            trace_id=self.trace_id,
+            started=self.started,
+            budget=self.budget,
+            cancel=self.cancel,
+            role=role,
+            tool_calls=self.tool_calls,
+            escalation_depth=self.escalation_depth + 1,
+        )
 
     def describe(self) -> dict:
         return {
@@ -137,6 +154,7 @@ class TaskSession:
             "budget_seconds": self.budget,
             "role": self.role,
             "tool_calls": self.tool_calls,
+            "escalation_depth": self.escalation_depth,
         }
 
 
@@ -250,9 +268,11 @@ class AgentRuntime:
         model = task.model or self.provider.model
 
         if not isinstance(task.prompt, str) or not task.prompt.strip():
-            return self._fail_early(run_id, trace_id, started, 0, "validation_failure", "empty_prompt", False, model)
+            return self._fail_early(run_id, trace_id, started, 0, "validation_failure", "empty_prompt", False, model,
+                                    task.parent_span_id)
         if session.cancel is not None and session.cancel.is_set():
-            return self._fail_early(run_id, trace_id, started, 0, "user_cancelled", "cancelled", False, model)
+            return self._fail_early(run_id, trace_id, started, 0, "user_cancelled", "cancelled", False, model,
+                                    task.parent_span_id)
 
         max_attempts = self._allowed_attempts(task)
         per_attempt_timeout = self._per_attempt_timeout(task)
@@ -261,7 +281,7 @@ class AgentRuntime:
         while attempt < max_attempts:
             if self._clock() - started >= budget:
                 return self._fail_early(run_id, trace_id, started, attempt, "resource_limit",
-                                        "max_runtime_exceeded", False, model)
+                                        "max_runtime_exceeded", False, model, task.parent_span_id)
             attempt += 1
             remaining = budget - (self._clock() - started)
             timeout = max(0.001, min(per_attempt_timeout, remaining))
@@ -281,7 +301,7 @@ class AgentRuntime:
             except ProviderError as exc:
                 duration_ms = round((self._clock() - attempt_started) * 1000, 3)
                 span_id, written = self._record_span(trace_id, run_id, attempt, duration_ms,
-                                                     error=exc, model=model)
+                                                     error=exc, model=model, parent_span_id=task.parent_span_id)
                 if exc.retryable and attempt < max_attempts and (self._clock() - started) < budget:
                     continue
                 return self._result(run_id, trace_id, span_id, attempt, exc, model, started, written)
@@ -289,11 +309,12 @@ class AgentRuntime:
                 duration_ms = round((self._clock() - attempt_started) * 1000, 3)
                 error = ProviderError(type(exc).__name__, category="unknown", retryable=False)
                 span_id, written = self._record_span(trace_id, run_id, attempt, duration_ms,
-                                                     error=error, model=model)
+                                                     error=error, model=model, parent_span_id=task.parent_span_id)
                 return self._result(run_id, trace_id, span_id, attempt, error, model, started, written)
             duration_ms = round((self._clock() - attempt_started) * 1000, 3)
             span_id, written = self._record_span(trace_id, run_id, attempt, duration_ms,
-                                                 response=response, model=model)
+                                                 response=response, model=model,
+                                                 parent_span_id=task.parent_span_id)
             return RuntimeResult(
                 run_id=run_id,
                 trace_id=trace_id,
@@ -309,6 +330,7 @@ class AgentRuntime:
                 retryable=False,
                 input_tokens=response.input_tokens,
                 output_tokens=response.output_tokens,
+                cached_input_tokens=response.cached_input_tokens,
                 reasoning_tokens=response.reasoning_tokens,
                 context_size=response.context_size,
                 context_utilization=response.context_utilization,
@@ -318,7 +340,7 @@ class AgentRuntime:
             )
 
         return self._fail_early(run_id, trace_id, started, attempt, "resource_limit",
-                                "attempts_exhausted", False, model)
+                                "attempts_exhausted", False, model, task.parent_span_id)
 
     def _supervise(
         self,
@@ -405,6 +427,7 @@ class AgentRuntime:
         response: Optional[ProviderResponse] = None,
         error: Optional[ProviderError] = None,
         model: Optional[str] = None,
+        parent_span_id: Optional[str] = None,
     ) -> tuple:
         span_id = providers.new_span_id()
         record = {
@@ -412,7 +435,7 @@ class AgentRuntime:
             "trace_id": trace_id,
             "span_id": span_id,
             "timestamp_utc": infra.utc_now(),
-            "parent_span_id": None,
+            "parent_span_id": parent_span_id,
             "run_id": run_id,
             "stage": "inference",
             "duration_ms": duration_ms,
@@ -423,7 +446,7 @@ class AgentRuntime:
             "retry_count": max(0, attempt - 1),
             "input_tokens": response.input_tokens if response is not None else None,
             "output_tokens": response.output_tokens if response is not None else None,
-            "cached_input_tokens": None,
+            "cached_input_tokens": response.cached_input_tokens if response is not None else None,
             "reasoning_tokens": response.reasoning_tokens if response is not None else None,
             "context_size": response.context_size if response is not None else None,
             "context_utilization": response.context_utilization if response is not None else None,
@@ -458,10 +481,12 @@ class AgentRuntime:
         code: str,
         retryable: bool,
         model: Optional[str],
+        parent_span_id: Optional[str] = None,
     ) -> RuntimeResult:
         error = ProviderError(code, category=category, retryable=retryable)
         duration_ms = round((self._clock() - started) * 1000, 3)
-        span_id, written = self._record_span(trace_id, run_id, attempt, duration_ms, error=error, model=model)
+        span_id, written = self._record_span(trace_id, run_id, attempt, duration_ms, error=error, model=model,
+                                             parent_span_id=parent_span_id)
         return self._result(run_id, trace_id, span_id, attempt, error, model, started, written)
 
     def _result(

@@ -28,7 +28,9 @@ in the linked docs; do not repeat these rules in every task prompt.
 - Promotion always requires the existing evidence and human-review rules. Unknown or
   unreviewed data never counts as success.
 - No automatic lesson, eval, or training-data promotion.
-- No automatic routing, fallback, or autonomous self-training.
+- Escalation is bounded and opt-in: one reviewed Qwen -> DeepSeek hop, disabled,
+  manual, and hosted-blocked by default, kept inside the task trace and budget. No
+  multi-hop routing, provider scoring, or autonomous self-training.
 - No secrets, full prompts, or source captured by default; proprietary data requires
   explicit project consent.
 - See `docs/TEACHER_STUDENT_LOOP.md`, `docs/LEARNING_LOOP.md`, and

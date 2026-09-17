@@ -117,11 +117,12 @@ class ProviderConfigTests(unittest.TestCase):
         config = providers.load_runtime_config()
         self.assertIsInstance(providers.build_provider(config, "fake"), providers.FakeModelProvider)
         self.assertIsInstance(providers.build_provider(config, "ollama"), providers.OllamaProvider)
+        self.assertIsInstance(providers.build_provider(config, "deepseek"), providers.DeepSeekProvider)
 
     def test_unknown_provider_rejected(self) -> None:
         config = providers.load_runtime_config()
         with self.assertRaises(providers.ProviderError):
-            providers.build_provider(config, "deepseek")
+            providers.build_provider(config, "codex")
 
     def test_ollama_requires_base_url(self) -> None:
         bad = json.loads(json.dumps(providers.DEFAULT_RUNTIME_CONFIG))

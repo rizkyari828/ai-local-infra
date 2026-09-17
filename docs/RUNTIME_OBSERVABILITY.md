@@ -18,8 +18,11 @@ span events (telemetry/spans/runs.jsonl)
 
 - `run_id` identifies the escalation summary row (one row per task).
 - `trace_id` defaults to `run_id` and is the correlation key for spans.
-- `parent_span_id` nests spans (for example a retry span under an inference span).
-- `parent_run_id` remains available for future multi-tier attempt chains.
+- `parent_span_id` nests spans (for example a retry span under an inference span,
+  or a DeepSeek escalation span under the Qwen span).
+- `parent_run_id` links an escalation summary row to the run it escalated from
+  (for example `run_id` = DeepSeek run, `parent_run_id` = Qwen run). See
+  [Escalation](ESCALATION.md).
 
 ## Spans
 

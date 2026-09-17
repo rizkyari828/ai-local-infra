@@ -2,9 +2,10 @@
 
 Logical roles for the teacher/student loop live in [`../models/roles.yaml`](../models/roles.yaml):
 `student` (local Qwen), `teacher-cheap` (hosted DeepSeek), and `teacher-premium`
-(hosted Codex). They describe intent and escalation order only. No routing, proxy,
-automatic fallback, or secrets are implemented. See
-[Teacher/student learning loop](TEACHER_STUDENT_LOOP.md).
+(hosted Codex). They describe intent and escalation order. A single bounded,
+opt-in Qwen -> DeepSeek escalation is implemented (see
+[Escalation](ESCALATION.md)); Codex, multi-hop routing, scoring, and secrets in
+configuration remain unimplemented. No API keys are stored.
 
 | Workload | Default/candidate | Context | Notes |
 |---|---|---:|---|
