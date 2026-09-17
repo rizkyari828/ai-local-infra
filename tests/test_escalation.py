@@ -117,6 +117,39 @@ class DeepSeekProviderTests(unittest.TestCase):
         self.assertEqual("high", provider.reasoning_profile)
         self.assertEqual("deepseek-flash", provider.describe()["model"])
 
+    def test_reasoning_profile_maps_to_request(self) -> None:
+        captured: dict = {}
+
+        def opener(request, timeout=None):
+            captured["body"] = json.loads(request.data.decode("utf-8"))
+            return FakeResponse(deepseek_reply("ok"))
+
+        provider = providers.DeepSeekProvider(model="deepseek-flash", api_key="k",
+                                              reasoning_profile="medium", opener=opener)
+        provider.execute(providers.ProviderRequest(prompt="hi"))
+        self.assertEqual("medium", captured["body"]["reasoning_effort"])
+        provider.execute(providers.ProviderRequest(prompt="hi", options={"reasoning_effort": "low"}))
+        self.assertEqual("low", captured["body"]["reasoning_effort"])
+
+    def test_default_reasoning_profile_is_high_in_request(self) -> None:
+        captured: dict = {}
+
+        def opener(request, timeout=None):
+            captured["body"] = json.loads(request.data.decode("utf-8"))
+            return FakeResponse(deepseek_reply("ok"))
+
+        providers.DeepSeekProvider(model="deepseek-flash", api_key="k", opener=opener).execute(
+            providers.ProviderRequest(prompt="hi"))
+        self.assertEqual("high", captured["body"]["reasoning_effort"])
+
+    def test_invalid_reasoning_profile_rejected(self) -> None:
+        with self.assertRaises(providers.ProviderConfigurationError):
+            providers.DeepSeekProvider(api_key="k", reasoning_profile="extreme")
+        config = json.loads(json.dumps(providers.DEFAULT_RUNTIME_CONFIG))
+        config["providers"]["deepseek"]["reasoning_profile"] = "extreme"
+        with self.assertRaises(providers.ProviderConfigurationError):
+            providers.validate_runtime_config(config)
+
     def test_config_requires_base_url(self) -> None:
         config = json.loads(json.dumps(providers.DEFAULT_RUNTIME_CONFIG))
         del config["providers"]["deepseek"]["base_url"]
@@ -560,9 +593,17 @@ class OptionalDeepSeekIntegrationTests(unittest.TestCase):
         provider = providers.DeepSeekProvider(model=os.environ.get("LAI_DEEPSEEK_MODEL", "deepseek-flash"))
         if not provider.has_api_key():
             self.skipTest("DEEPSEEK_API_KEY is not set")
-        response = provider.execute(providers.ProviderRequest(prompt="Reply with the single word READY.",
-                                                              timeout_seconds=30,
-                                                              options={"max_tokens": 4}))
+        try:
+            response = provider.execute(providers.ProviderRequest(prompt="Reply with the single word READY.",
+                                                                  timeout_seconds=30,
+                                                                  options={"max_tokens": 64}))
+        except providers.ProviderError as exc:
+            self.fail("DeepSeek smoke failed: category=%s code=%s detail=%s"
+                      % (exc.category, exc.code, exc.detail))
+        print("deepseek smoke: model=%s content=%r input_tokens=%s output_tokens=%s "
+              "cached_input_tokens=%s reasoning_tokens=%s finish_reason=%s"
+              % (response.model, response.content, response.input_tokens, response.output_tokens,
+                 response.cached_input_tokens, response.reasoning_tokens, response.finish_reason))
         self.assertTrue(response.content.strip())
 
 

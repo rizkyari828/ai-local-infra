@@ -23,9 +23,10 @@ Qwen Local
 - Configurable fields: `base_url`, `model`, `reasoning_profile` (default
   `high`), optional `api_key_env`, optional scalar generation options.
 - The configured fallback is **DeepSeek V4.1 Flash**: `model = deepseek-flash`,
-  `reasoning_profile = high`. The reasoning level is carried by the model choice
-  in the existing request format (the provider sends `model` plus its normal
-  scalar options); no new model abstraction or undocumented API field is added.
+  `reasoning_profile = high`. The profile maps to the request `reasoning_effort`
+  field (`high` by default) alongside `model`; callers can override it with the
+  scalar generation option `reasoning_effort`. This reuses the existing
+  request/option handling and adds no new model abstraction.
 - Response normalization into `ProviderResponse`: content, provider/model,
   duration, input/output tokens, cached input tokens, reasoning tokens, and
   finish reason. Unavailable values stay `null`; they are never invented.
@@ -159,7 +160,11 @@ normalization, missing key, token metadata present/missing, timeout/failure,
 cancellation, hosted secret protection, disabled/blocked/manual/automatic
 policy, non-eligible failures, depth and cancellation protection, remaining
 budget, both teacher outcomes, escalation telemetry, and learning attribution.
-An opt-in live smoke test runs only with `LAI_DEEPSEEK_INTEGRATION=1`.
+An opt-in live smoke test runs only with `LAI_DEEPSEEK_INTEGRATION=1`. It sends
+one tiny prompt (`Reply with the single word READY.`) with a bounded
+`max_tokens` (reasoning consumes output tokens before the answer, so the cap must
+leave room for a short reply), prints only the provider-reported model/token
+usage, and never prints or stores the credential.
 
 ## Deferred
 

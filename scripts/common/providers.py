@@ -54,6 +54,8 @@ DEFAULT_HEALTH_TIMEOUT_SECONDS = 5.0
 DEEPSEEK_API_KEY_ENV = "DEEPSEEK_API_KEY"
 DEEPSEEK_DEFAULT_BASE_URL = "https://api.deepseek.com"
 DEEPSEEK_DEFAULT_MODEL = "deepseek-flash"
+DEEPSEEK_REASONING_PROFILES = ("minimal", "low", "medium", "high")
+DEEPSEEK_DEFAULT_REASONING_PROFILE = "high"
 DEEPSEEK_GENERATION_KEYS = (
     "temperature",
     "top_p",
@@ -61,6 +63,7 @@ DEEPSEEK_GENERATION_KEYS = (
     "stop",
     "frequency_penalty",
     "presence_penalty",
+    "reasoning_effort",
 )
 
 ERROR_CODE_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
@@ -553,7 +556,7 @@ class DeepSeekProvider(ModelProvider):
         self._model = model
         self.api_key_env = api_key_env if isinstance(api_key_env, str) and api_key_env else DEEPSEEK_API_KEY_ENV
         self._api_key = api_key if api_key is not None else os.environ.get(self.api_key_env)
-        self.reasoning_profile = reasoning_profile if isinstance(reasoning_profile, str) and reasoning_profile else "high"
+        self.reasoning_profile = _deepseek_reasoning_profile(reasoning_profile)
         self.timeout_seconds = timeout_seconds
         self.options = _deepseek_options(options or {})
         self.health_timeout_seconds = health_timeout_seconds
@@ -585,17 +588,19 @@ class DeepSeekProvider(ModelProvider):
         return {"Content-Type": "application/json", "Authorization": "Bearer %s" % self._api_key}
 
     def _translate_http_error(self, status: int, body: bytes) -> ProviderError:
+        detail = _deepseek_error_detail(body)
         if status in (401, 403):
-            return ProviderConfigurationError("auth_error", "hosted endpoint rejected the credentials")
+            return ProviderConfigurationError("auth_error", detail or "hosted endpoint rejected the credentials")
         if status == 404:
-            return ProviderModelMissing("model_missing", "configured model is not available")
+            return ProviderModelMissing("model_missing", detail or "configured model is not available")
         if status == 429:
-            return ProviderUnavailable("rate_limited", "hosted endpoint rate limited the request")
+            return ProviderUnavailable("rate_limited", detail or "hosted endpoint rate limited the request")
         if status == 400:
-            return ProviderValidationError("bad_request", "hosted endpoint rejected the request")
+            return ProviderValidationError("bad_request", detail or "hosted endpoint rejected the request")
         if status >= 500:
-            return ProviderUnavailable("http_%d" % status, "hosted endpoint returned a server error")
-        return ProviderResponseError("http_%d" % status, "hosted endpoint rejected the request", retryable=False)
+            return ProviderUnavailable("http_%d" % status, detail or "hosted endpoint returned a server error")
+        return ProviderResponseError("http_%d" % status, detail or "hosted endpoint rejected the request",
+                                     retryable=False)
 
     def _request(self, path: str, payload: Optional[dict], timeout: Optional[float]) -> dict:
         url = self.base_url + path
@@ -637,6 +642,7 @@ class DeepSeekProvider(ModelProvider):
             raise ProviderConfigurationError("missing_api_key", "hosted provider credentials are not set")
         options = dict(self.options)
         options.update(_deepseek_options(request.options))
+        options.setdefault("reasoning_effort", self.reasoning_profile)
         payload: dict = {
             "model": model,
             "messages": [{"role": "user", "content": request.prompt}],
@@ -691,6 +697,35 @@ class DeepSeekProvider(ModelProvider):
             return ProviderHealth(provider=self.name, status="unreachable", model=self._model,
                                   base_url=self.base_url, detail=exc.code)
         return ProviderHealth(provider=self.name, status="healthy", model=self._model, base_url=self.base_url)
+
+
+def _deepseek_reasoning_profile(value: Any) -> str:
+    """Normalize the configured reasoning profile to a supported effort level."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return DEEPSEEK_DEFAULT_REASONING_PROFILE
+    if not isinstance(value, str) or value.strip().lower() not in DEEPSEEK_REASONING_PROFILES:
+        raise ProviderConfigurationError(
+            "invalid_reasoning_profile",
+            "DeepSeek reasoning_profile must be one of: %s" % ", ".join(DEEPSEEK_REASONING_PROFILES))
+    return value.strip().lower()
+
+
+def _deepseek_error_detail(body: bytes) -> Optional[str]:
+    """Extract a short, sanitized error message for diagnostics (never the key)."""
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+        return None
+    message = None
+    if isinstance(payload, dict):
+        error = payload.get("error")
+        if isinstance(error, dict) and isinstance(error.get("message"), str):
+            message = error["message"]
+        elif isinstance(error, str):
+            message = error
+        elif isinstance(payload.get("message"), str):
+            message = payload["message"]
+    return _safe_detail(message) if message else None
 
 
 def _deepseek_options(options: Any) -> dict:
@@ -852,8 +887,8 @@ def validate_runtime_config(config: Any) -> dict:
                 raise ProviderConfigurationError("missing_base_url", "deepseek provider requires base_url")
             validate_base_url(entry["base_url"])
             profile = entry.get("reasoning_profile")
-            if profile is not None and (not isinstance(profile, str) or not profile.strip()):
-                raise ProviderConfigurationError("invalid_reasoning_profile", "deepseek reasoning_profile must be a non-empty string")
+            if profile is not None:
+                _deepseek_reasoning_profile(profile)
             api_key_env = entry.get("api_key_env")
             if api_key_env is not None and (not isinstance(api_key_env, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", api_key_env)):
                 raise ProviderConfigurationError("invalid_api_key_env", "deepseek api_key_env must be an environment variable name")
