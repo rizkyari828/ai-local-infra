@@ -198,7 +198,7 @@ evaluations justify it.
 
 ## Non-goals
 
-No automatic router, no automatic DeepSeek/Codex fallback, no autonomous
-self-training, no LoRA/QLoRA, no vector database, no PostgreSQL/ClickHouse, no
-Redis/Valkey, no API server, UI, daemon, multi-agent platform, or RAG. Content
-Studio is untouched and is not a runtime dependency of this work.
+See the authoritative operating constraints in [`../AGENTS.md`](../AGENTS.md) and
+the deferred-architecture list in [`ARCHITECTURE.md`](ARCHITECTURE.md). This
+milestone adds no router, fallback, autonomous self-training, or training
+execution, and leaves Content Studio untouched.

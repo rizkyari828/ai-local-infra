@@ -47,6 +47,12 @@ The teacher/student escalation foundation adds logical model roles, escalation t
 
 See [Teacher/student learning loop](docs/TEACHER_STUDENT_LOOP.md) and [Eval promotion](docs/EVAL_PROMOTION.md).
 
+## Agent guidance
+
+Stable operating rules for this solution live in [`AGENTS.md`](AGENTS.md). Task
+prompts can stay minimal by following
+[`docs/AGENT_TASK_TEMPLATE.md`](docs/AGENT_TASK_TEMPLATE.md).
+
 ## Why files only?
 
 One WSL2 workstation and one substantial GPU workload at a time do not justify PostgreSQL, Redis, a vector database, HTTP service, dashboard, or scheduler. JSON/JSONL keeps v0.1 inspectable, portable, and easy to replace when evidence supports a larger system.
