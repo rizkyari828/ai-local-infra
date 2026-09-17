@@ -16,10 +16,10 @@ import infra  # noqa: E402
 import learning  # noqa: E402
 
 RATE_LABELS = (
-    ("paid_escalation_rate", "paid escalation rate (teacher / total tasks)"),
-    ("local_success_rate", "local success rate (Qwen success / total tasks)"),
-    ("teacher_acceptance_rate", "teacher acceptance rate (accepted / escalations)"),
-    ("first_pass_local_success_rate", "first-pass local success rate (no correction / total)"),
+    ("paid_escalation_rate", "paid escalation rate (escalated / total tasks)"),
+    ("local_success_rate", "local success rate (student succeeded / total tasks)"),
+    ("teacher_acceptance_rate", "teacher acceptance rate (human-accepted / escalations)"),
+    ("first_pass_local_success_rate", "first-pass local success rate (accepted, no correction, no teacher / total)"),
 )
 
 
@@ -49,7 +49,10 @@ def main() -> int:
     for key, label in RATE_LABELS:
         print(f"{label}: {_percent(metrics[key])}")
     corrections = metrics["mean_human_corrections_per_task"]
-    print("mean human corrections per task: " + ("unknown" if corrections is None else f"{corrections:.3f}"))
+    known = metrics["tasks_with_known_correction_count"]
+    print(f"mean human corrections per known task: {corrections:.3f}" if corrections is not None
+          else f"mean human corrections per known task: unknown (0 of {metrics['total_tasks']} known)")
+    print(f"tasks with a known correction count: {known}")
     return 0
 
 

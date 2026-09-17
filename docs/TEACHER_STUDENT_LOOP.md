@@ -67,7 +67,10 @@ Records are flat, null-capable JSONL written to `telemetry/escalations/runs.json
   `cost_cache_hit_tokens`, `estimated_cost_usd`, `pricing_source`.
 
 Never captured: full source, full prompts, secrets, credentials, `.env`, or
-proprietary content without explicit project consent.
+proprietary content without explicit project consent. A minimal accidental-capture
+guard rejects obvious credential-like values (`sk-...`, `AKIA...`, private-key
+headers, and password/token/API-key assignments) in free-text fields before
+persistence; it is not a comprehensive DLP system.
 
 Record a sanitized observation:
 
@@ -105,9 +108,20 @@ acceptance, proposed destination (`lesson`, `eval`, or `training-candidate`), an
 promotion status.
 
 Lifecycle: `observation -> reviewed -> validated -> promoted`, or `rejected`.
-Recording a candidate changes nothing about lessons or datasets. A `promoted`
-candidate must carry human acceptance, a reviewer, a root cause, a correction, and
-validation evidence. A `training-candidate` requires explicit `project_consent`.
+Requirements are enforced in code, not only documented:
+
+- `observation`: records a failure; root cause, correction, and evidence are optional.
+- `reviewed`: requires a reviewed root cause.
+- `validated`: requires a reviewed root cause, a validated correction, and validation
+  evidence.
+- `promoted`: requires everything `validated` requires, plus human acceptance and a
+  reviewer identity.
+- `rejected`: recordable without promotion evidence.
+
+A `training-candidate` destination always requires explicit `project_consent`. Invalid
+transitions are refused with a non-zero exit code and an actionable message. Recording
+a candidate changes nothing about lessons, datasets, or prompts; human approval remains
+mandatory.
 
 ```bash
 ./scripts/record-learning-candidate \
@@ -130,15 +144,19 @@ Converted failures become sanitized regression evals. See
 
 ## Metrics
 
-Computed by `./scripts/learning-metrics` from local JSONL (no database):
+Computed by `./scripts/learning-metrics` from local JSONL (no database). Unknown or
+unreviewed data is never counted as success.
 
-- `paid_escalation_rate` = escalated tasks / total coding tasks.
-- `local_success_rate` = Qwen-succeeded tasks / total coding tasks.
-- `teacher_acceptance_rate` = accepted teacher solutions / teacher escalations.
-- `first_pass_local_success_rate` = Qwen tasks accepted without teacher correction / total.
-- `mean_human_corrections_per_task`.
+| Metric | Numerator | Denominator | Unknown / unreviewed handling |
+|---|---|---|---|
+| `paid_escalation_rate` | rows with a teacher provider or model | all rows | no teacher means local and is counted in the denominator |
+| `local_success_rate` | rows with `student_outcome = succeeded` | all rows | failed/uncertain/blocked still count against the rate |
+| `teacher_acceptance_rate` | escalations with `human_review_outcome = accepted` | rows with a teacher provider or model | `unreviewed`, `needs-review`, and `rejected` do not count; a teacher result rejected by human review is not accepted |
+| `first_pass_local_success_rate` | rows with `student_outcome = succeeded`, no teacher, `correction_required = false`, and `human_review_outcome = accepted` | all rows | unknown (`null`) `correction_required` and unreviewed rows do not count |
+| `mean_human_corrections_per_task` | sum of `human_correction_count` where known | rows where `human_correction_count` is not null | unknown counts are excluded from the denominator; `null` when no count is known |
 
 Rates are `null` when their denominator is empty; they are never invented.
+`tasks_with_known_correction_count` is reported so the correction mean is transparent.
 
 ```bash
 ./scripts/learning-metrics
@@ -165,6 +183,18 @@ Initially, improvement means:
 It does **not** mean the Qwen weights change. LoRA/QLoRA or other fine-tuning is
 deferred until a sufficiently large, reviewed, consented dataset exists and
 evaluations justify it.
+
+## Known v0.2 limitations (deferred)
+
+- One escalation row summarizes one coding task. The `teacher_*` fields describe only
+  the final teacher escalation for that task; a Qwen -> DeepSeek attempt -> Codex
+  attempt chain is not stored as separate attempt rows, so intermediate-tier
+  acceptance and cost are not yet analyzable.
+- No `task_id`/trace-level aggregation; metrics operate on rows (one row per task).
+- No attribution model distinguishing environment or infrastructure failures from
+  student-capability failures. `environment_issue` is recorded but still counts in the
+  local success denominator.
+- No automated teacher routing, fallback, or promotion. These are explicit non-goals.
 
 ## Non-goals
 

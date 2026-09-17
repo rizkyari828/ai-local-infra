@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "local-ai-infra/telemetry/escalation-run/1.0.0",
   "title": "Teacher/student escalation run",
-  "description": "Flat, privacy-conscious extension of the v0.1 telemetry model for the teacher/student learning loop. Null-capable columns keep JSONL compatible with future Parquet/DuckDB conversion. Never captures prompts, source, secrets, or credentials.",
+  "description": "Flat, privacy-conscious extension of the v0.1 telemetry model for the teacher/student learning loop. Invariant: one row summarizes one coding task, and teacher_* fields describe the final teacher escalation for that task; attempt-level multi-tier rows are deferred. Null-capable columns keep JSONL compatible with future Parquet/DuckDB conversion. Never captures prompts, source, secrets, or credentials; a minimal accidental secret-capture guard rejects obvious credential shapes.",
   "type": "object",
   "additionalProperties": false,
   "required": ["schema_version", "run_id", "event_id", "timestamp_utc", "task_class", "student_model", "student_outcome"],

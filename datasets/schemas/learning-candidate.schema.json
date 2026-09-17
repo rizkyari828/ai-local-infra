@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "local-ai-infra/datasets/learning-candidate/1.0.0",
   "title": "Reviewed learning candidate",
-  "description": "Structured record for one reviewed learning candidate. Observation is not promotion. A candidate may reference runs, but human approval is always required before lesson/eval/training promotion.",
+  "description": "Structured record for one reviewed learning candidate. Observation is not promotion. Lifecycle requirements are enforced by scripts/common/learning.py: reviewed requires reviewed_root_cause; validated additionally requires validated_correction and validation_evidence; promoted additionally requires human_accepted and reviewer. A training-candidate destination always requires explicit project_consent.",
   "type": "object",
   "additionalProperties": false,
   "required": ["schema_version", "candidate_id", "timestamp_utc", "source_run_ids", "task_class", "observed_failure", "failure_category", "proposed_destination", "promotion_status"],
