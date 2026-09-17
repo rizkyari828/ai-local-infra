@@ -89,7 +89,7 @@ def cmd_use(args: argparse.Namespace) -> int:
         if infra.OLLAMA_PATH in changed:
             infra.install_ollama(wanted_ollama)
             infra.restart_ollama()
-            if not infra.health_check(profile["ollama"]["endpoint"]):
+            if not infra.wait_for_health(profile["ollama"]["endpoint"]):
                 raise infra.InfraError("Ollama health check failed after restart")
         marker = {"id": profile["id"], "version": profile["version"], "applied_at": infra.utc_now()}
         infra.atomic_json(infra.ACTIVE_PATH, marker)

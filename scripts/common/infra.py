@@ -12,10 +12,11 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 import urllib.error
 import urllib.request
 import uuid
-from typing import Any
+from typing import Any, Callable
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 PROFILE_DIR = ROOT / "profiles"
@@ -31,6 +32,8 @@ MANAGED_ENV = (
     "OLLAMA_NUM_PARALLEL",
     "OLLAMA_MAX_LOADED_MODELS",
 )
+HEALTH_READY_TIMEOUT_SECONDS = 30.0
+HEALTH_READY_INTERVAL_SECONDS = 0.5
 
 
 class InfraError(RuntimeError):
@@ -302,6 +305,31 @@ def health_check(endpoint: str, timeout: float = 10.0) -> bool:
         return False
 
 
+def wait_for_health(
+    endpoint: str,
+    timeout: float = HEALTH_READY_TIMEOUT_SECONDS,
+    interval: float = HEALTH_READY_INTERVAL_SECONDS,
+    check: Callable[[str], bool] = health_check,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+) -> bool:
+    """Poll the readiness predicate until healthy or the bounded deadline expires.
+
+    Ollama may need several seconds after restart to finish GPU discovery, so a
+    single immediate probe is not a reliable readiness signal. Retries use a short
+    fixed backoff and stop at the deadline; a genuine startup failure still
+    returns False so the caller can roll back.
+    """
+    deadline = clock() + max(0.0, timeout)
+    while True:
+        if check(endpoint):
+            return True
+        remaining = deadline - clock()
+        if remaining <= 0:
+            return False
+        sleep(min(max(0.0, interval), remaining))
+
+
 def restore_backup(path: pathlib.Path, restart: bool = True) -> None:
     manifest = load_json(path / "manifest.json")
     system_changed = False
@@ -346,6 +374,10 @@ def loaded_models(endpoint: str) -> list[str]:
 
 def resource_conflicts(profile: dict[str, Any]) -> list[str]:
     if not profile["model"].get("heavy"):
+        return []
+    if os.environ.get("LAI_SKIP_SYSTEMD") == "1":
+        # No service restart or `ollama stop` is performed in test mode, so do not
+        # probe a real endpoint; keeps unit tests independent of a live Ollama.
         return []
     target = profile["model"]["id"]
     return [name for name in loaded_models(profile["ollama"]["endpoint"]) if name != target]
