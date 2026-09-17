@@ -16,6 +16,10 @@
   emitting validated spans automatically, enforcing configured limits, honoring
   timeout/cancellation, and classifying failures. Ollama remains an independent
   inference service. See [Agent runtime](AGENT_RUNTIME.md).
+- A bounded Tool Runtime (`file.read`, `file.search`, `file.write`, `shell.exec`,
+  `test.run`) executes within one session trace, confined to an explicit workspace
+  root, with automatic tool spans and a tool-call budget. See
+  [Tool runtime](TOOL_RUNTIME.md).
 
 No server process exists. Commands are short-lived and state is inspectable. Active application files remain at `~/.qwen/settings.json` and `/etc/systemd/system/ollama.service.d/override.conf`; no symlinks are used.
 
@@ -27,4 +31,4 @@ Backups may contain Qwen credentials, so they live in a mode-0700 state director
 
 ## Deliberately absent
 
-There is no PostgreSQL, ClickHouse, DuckDB dependency, Redis/Valkey, pgvector, HTTP API, UI, daemon, broker, RAG, Docker stack, scheduler, multi-agent orchestrator, routing policy, hosting-provider integration, fine-tuning, LoRA, or cloud management in v0.1. The Agent Runtime is a single-task execution layer, not an autonomous platform.
+There is no PostgreSQL, ClickHouse, DuckDB dependency, Redis/Valkey, pgvector, HTTP API, UI, daemon, broker, RAG, Docker stack, scheduler, multi-agent orchestrator, routing policy, hosting-provider integration, fine-tuning, LoRA, or cloud management in v0.1. The Agent Runtime is a single-task execution layer and the Tool Runtime executes one explicitly requested call at a time; neither is an autonomous platform.

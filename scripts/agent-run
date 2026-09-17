@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Run or health-check one task through the Agent Runtime.
+"""Run a task, a single tool, or a health check through the Agent Runtime.
 
 A health check is read-only and never downloads a model. Execution requires
 ``--confirm-run`` and never pulls a model either. Prompts are sent to the
-provider but never stored; the runtime records only sanitized spans.
+provider but never stored; the runtime records only sanitized spans. Tool
+execution is confined to the ``--workspace`` root.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ import uuid
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "common"))
 import providers  # noqa: E402
 import runtime  # noqa: E402
+import tool_runtime  # noqa: E402
 
 
 def _uuid(value: str) -> str:
@@ -40,13 +42,21 @@ def main() -> int:
     parser.add_argument("--max-attempts", type=int, help="Bounded attempts for retryable failures")
     parser.add_argument("--config", type=pathlib.Path, help="Runtime config path")
     parser.add_argument("--span-output", type=pathlib.Path, help="Span JSONL destination")
+    parser.add_argument("--workspace", type=pathlib.Path, help="Workspace root; enables tool execution")
+    parser.add_argument("--tool", help="Run one tool instead of inference (requires --workspace)")
+    parser.add_argument("--params", help="JSON object of tool parameters")
     parser.add_argument("--confirm-run", action="store_true", help="Required for execution, not for health")
     parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
     args = parser.parse_args()
 
     config = providers.load_runtime_config(args.config) if args.config else providers.load_runtime_config()
+    tool_engine = None
+    if args.workspace is not None:
+        tool_engine = tool_runtime.ToolRuntime(
+            args.workspace, span_output=args.span_output, role=args.role
+        )
     agent = runtime.AgentRuntime.from_config(
-        config, args.provider, span_output=args.span_output, role=args.role
+        config, args.provider, span_output=args.span_output, role=args.role, tools=tool_engine
     )
 
     if args.health:
@@ -57,12 +67,35 @@ def main() -> int:
 
     if not args.confirm_run:
         parser.error("--confirm-run is required for execution; models are never downloaded or run implicitly")
+
+    if args.tool:
+        if tool_engine is None:
+            parser.error("--tool requires --workspace")
+        try:
+            params = json.loads(args.params) if args.params else {}
+        except json.JSONDecodeError as exc:
+            parser.error("--params must be a JSON object: %s" % exc)
+        if not isinstance(params, dict):
+            parser.error("--params must be a JSON object")
+        session = agent.open_session(runtime.AgentTask(prompt=args.tool, trace_id=args.trace_id, role=args.role))
+        result = agent.call_tool(session, args.tool, params, timeout_seconds=args.timeout_seconds)
+        if args.json:
+            print(json.dumps(result.as_dict(), indent=2))
+        else:
+            print("tool=%s success=%s duration_ms=%s trace_id=%s" % (
+                result.tool_name, result.success, result.duration_ms, result.trace_id))
+            if result.error_category:
+                print("error=%s:%s" % (result.error_category, result.error_code))
+            if result.output is not None:
+                print(result.output)
+        return 0 if result.success else 1
+
     if args.prompt_file is not None:
         prompt = args.prompt_file.read_text(encoding="utf-8")
     elif args.prompt is not None:
         prompt = args.prompt
     else:
-        parser.error("provide --prompt or --prompt-file")
+        parser.error("provide --prompt, --prompt-file, or --tool")
 
     task = runtime.AgentTask(
         prompt=prompt,

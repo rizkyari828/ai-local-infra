@@ -32,7 +32,8 @@ A span is a *completed* stage measurement with a duration and completion timesta
   `context_size`, `context_utilization`. Unavailable values stay `null`; they are never
   invented.
 - Tools: `tool_kind` (`read`, `write`, `search`, `shell`, `test`, `git`, `other`),
-  `tool_name`, `tool_outcome`, `target_hash`, `repeated`.
+  `tool_name`, `tool_outcome`, `target_hash`, `repeated`, plus bounded tool metrics
+  `bytes_read`, `bytes_written`, `exit_code`, `result_count`.
 - Failures: `error_category`, `error_code`.
 - `limits_version` records which policy produced the limits in force.
 
@@ -65,9 +66,14 @@ warnings when configured thresholds are exceeded.
 
 One place for conservative defaults: [`../config/limits.yaml`](../config/limits.yaml).
 
-- `timeouts.model_timeout_seconds` bounds inference CLI calls (`benchmark-model`, `run-eval`).
+- `timeouts.model_timeout_seconds` bounds one inference attempt; `max_runtime_seconds`
+  bounds the whole task across attempts.
+- `tools` bounds tool execution: `tool_timeout_seconds`, `max_tool_calls`,
+  `max_file_read_bytes`, `max_file_write_bytes`, `max_shell_output_bytes`,
+  `max_search_results`. See [Tool runtime](TOOL_RUNTIME.md).
 - `anomaly_thresholds` (`max_repeated_reads`, `max_retries`, `max_attempts`,
-  `context_utilization_warn`) drive `trace-report` warnings.
+  `context_utilization_warn`) drive `trace-report` warnings, and `tools.max_tool_calls`
+  warns when a trace exceeds its tool-call budget.
 
 Load with `scripts.common.telemetry.load_limits()`. Missing file falls back to the same
 defaults. Do not scatter hard-coded limits across scripts.

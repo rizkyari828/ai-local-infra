@@ -2,7 +2,7 @@
 
 Reusable, local-first tooling for configuring, measuring, evaluating, and improving Ollama/Qwen workloads. It is the **HOW local AI runs** layer. Each product repository remains the **WHAT the agent needs to know** layer and keeps its own `AGENTS.md`, `QWEN.md`, checkpoint, lessons, architecture, and domain context.
 
-This v0.1 is deliberately file-based. It has profiles, a model registry, hardware facts, safe apply/rollback, drift detection, resource checks, JSONL telemetry, small eval definitions, a minimal Agent Runtime, and learning dataset schemas. It is not a runtime dependency of Content Studio and is not an API, UI, daemon, database, RAG system, autonomous agent platform, or training pipeline.
+This v0.1 is deliberately file-based. It has profiles, a model registry, hardware facts, safe apply/rollback, drift detection, resource checks, JSONL telemetry, small eval definitions, a minimal Agent Runtime with a bounded Tool Runtime, and learning dataset schemas. It is not a runtime dependency of Content Studio and is not an API, UI, daemon, database, RAG system, autonomous agent platform, or training pipeline.
 
 ## Quick start
 
@@ -79,6 +79,24 @@ Providers are configured in [`config/runtime.yaml`](config/runtime.yaml) and
 resolved through a small registry, so DeepSeek/Codex providers and routing can be
 added later without changing the execution flow. Tests use a deterministic fake
 provider and need no live model. See [Agent runtime](docs/AGENT_RUNTIME.md).
+
+## Tool runtime v0.1
+
+Tools give the agent bounded, observable hands for coding workflows without
+autonomy. Every call is confined to an explicit workspace root, bounded by
+configured limits, cancellable, and records a `tool` span automatically.
+
+```bash
+./scripts/agent-run --tool file.read --workspace /path/to/project \
+  --params '{"path":"src/app.ts","start_line":1,"end_line":40}' --confirm-run --json
+./scripts/agent-run --tool shell.exec --workspace . \
+  --params '{"command":"python3 -m unittest discover -s tests"}' --confirm-run --json
+```
+
+Tools: `file.read`, `file.search`, `file.write`, `shell.exec`, `test.run`. They
+share one `Trace`/session with inference, so `trace-report` shows per-tool timing,
+tool calls, file reads, repeated reads, and shell failures. See
+[Tool runtime](docs/TOOL_RUNTIME.md).
 
 ## Agent guidance
 

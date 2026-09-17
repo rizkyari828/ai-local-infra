@@ -12,5 +12,13 @@
     "max_attempts": 5,
     "context_utilization_warn": 0.85
   },
-  "notes": "Single place for conservative local defaults and anomaly thresholds. model_timeout_seconds bounds one inference attempt; max_runtime_seconds bounds the whole task across attempts; anomaly_thresholds drive warnings in scripts/trace-report. Values are not secrets. The agent runtime reads these instead of hard-coding limits."
+  "tools": {
+    "tool_timeout_seconds": 120,
+    "max_tool_calls": 50,
+    "max_file_read_bytes": 262144,
+    "max_file_write_bytes": 1048576,
+    "max_shell_output_bytes": 65536,
+    "max_search_results": 200
+  },
+  "notes": "Single place for conservative local defaults and anomaly thresholds. model_timeout_seconds bounds one inference attempt; max_runtime_seconds bounds the whole task across attempts; tools bounds tool execution (timeout, call budget, read/write/output/search sizes); anomaly_thresholds drive warnings in scripts/trace-report. Values are not secrets. The agent runtime reads these instead of hard-coding limits."
 }

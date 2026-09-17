@@ -26,6 +26,7 @@ from typing import Any, Callable, Optional
 import infra
 import providers
 import telemetry
+import tools
 from providers import (
     ModelProvider,
     ProviderCancelled,
@@ -34,6 +35,7 @@ from providers import (
     ProviderResponse,
     ProviderTimeout,
 )
+from tool_runtime import ToolResult, ToolRuntime
 
 RUNTIME_VERSION = "0.1.0"
 
@@ -108,6 +110,36 @@ class RuntimeResult:
         }
 
 
+@dataclass
+class TaskSession:
+    """Shared run/trace/budget/cancellation context for one task.
+
+    Inference and tool calls within one session keep a single ``trace_id`` and a
+    single runtime budget, and share one tool-call counter so the tool budget is
+    enforced across the whole task rather than per tool.
+    """
+
+    run_id: str
+    trace_id: str
+    started: float
+    budget: float
+    cancel: Optional[threading.Event] = None
+    role: str = "student"
+    tool_calls: int = 0
+
+    def remaining(self, clock: Callable[[], float]) -> float:
+        return max(0.0, self.budget - (clock() - self.started))
+
+    def describe(self) -> dict:
+        return {
+            "run_id": self.run_id,
+            "trace_id": self.trace_id,
+            "budget_seconds": self.budget,
+            "role": self.role,
+            "tool_calls": self.tool_calls,
+        }
+
+
 class AgentRuntime:
     """Execute local-model tasks through one resolved provider."""
 
@@ -119,6 +151,7 @@ class AgentRuntime:
         role: str = "student",
         record_spans: bool = True,
         clock: Optional[Callable[[], float]] = None,
+        tools: Optional[ToolRuntime] = None,
     ) -> None:
         if not isinstance(provider, ModelProvider):
             raise providers.ProviderConfigurationError("invalid_provider", "runtime requires a ModelProvider")
@@ -128,6 +161,7 @@ class AgentRuntime:
         self.role = role
         self.record_spans = record_spans
         self._clock = clock or time.perf_counter
+        self.tools = tools
 
     @classmethod
     def from_config(
@@ -137,10 +171,11 @@ class AgentRuntime:
         limits: Optional[dict] = None,
         span_output: Optional[Any] = None,
         role: str = "student",
+        tools: Optional[ToolRuntime] = None,
     ) -> "AgentRuntime":
         runtime_config = config if config is not None else providers.load_runtime_config()
         provider = providers.build_provider(runtime_config, provider_name)
-        return cls(provider=provider, limits=limits, span_output=span_output, role=role)
+        return cls(provider=provider, limits=limits, span_output=span_output, role=role, tools=tools)
 
     def health_check(self) -> dict:
         """Read-only readiness check; never downloads a model."""
@@ -149,20 +184,78 @@ class AgentRuntime:
     def execute(self, prompt: str, **task_fields: Any) -> RuntimeResult:
         return self.run(AgentTask(prompt=prompt, **task_fields))
 
-    def run(self, task: AgentTask) -> RuntimeResult:
+    def open_session(self, task: AgentTask) -> TaskSession:
+        """Create the shared run/trace/budget/cancellation context for one task."""
         run_id = task.run_id or str(uuid.uuid4())
         trace_id = task.trace_id or run_id
-        started = self._clock()
+        per_attempt_timeout = self._per_attempt_timeout(task)
+        max_attempts = self._allowed_attempts(task)
+        budget = self._runtime_budget(task, per_attempt_timeout, max_attempts)
+        return TaskSession(
+            run_id=run_id,
+            trace_id=trace_id,
+            started=self._clock(),
+            budget=budget,
+            cancel=task.cancel,
+            role=task.role or self.role,
+        )
+
+    def call_tool(
+        self,
+        session: TaskSession,
+        tool_name: str,
+        params: Optional[dict] = None,
+        timeout_seconds: Optional[float] = None,
+    ) -> ToolResult:
+        """Execute a registered tool inside an existing session.
+
+        The call shares the session's trace_id/run_id, runtime budget, and
+        cancellation event, and counts against the session tool-call budget.
+        """
+        if self.tools is None:
+            return ToolResult(
+                tool_name=tool_name,
+                success=False,
+                duration_ms=0.0,
+                trace_id=session.trace_id,
+                run_id=session.run_id,
+                error_category="configuration_failure",
+                error_code="tools_not_configured",
+            )
+        attempt = 1
+        if session.tool_calls >= int(self.tools.tool_limits["max_tool_calls"]):
+            error = tools.ToolResourceLimit("max_tool_calls_exceeded", "tool-call budget exhausted")
+            return self.tools.reject(tool_name, error, trace_id=session.trace_id,
+                                     run_id=session.run_id, attempt=attempt)
+        if session.cancel is not None and session.cancel.is_set():
+            error = tools.ToolCancelled("cancelled", "session was cancelled")
+            return self.tools.reject(tool_name, error, trace_id=session.trace_id,
+                                     run_id=session.run_id, attempt=attempt)
+        remaining = session.remaining(self._clock)
+        if remaining <= 0:
+            error = tools.ToolResourceLimit("max_runtime_exceeded", "runtime budget exhausted")
+            return self.tools.reject(tool_name, error, trace_id=session.trace_id,
+                                     run_id=session.run_id, attempt=attempt)
+        session.tool_calls += 1
+        try:
+            timeout = remaining if timeout_seconds is None else min(float(timeout_seconds), remaining)
+        except (TypeError, ValueError):
+            timeout = remaining
+        return self.tools.call(tool_name, params, trace_id=session.trace_id, run_id=session.run_id,
+                               cancel=session.cancel, timeout_seconds=timeout, attempt=attempt)
+
+    def run(self, task: AgentTask, session: Optional[TaskSession] = None) -> RuntimeResult:
+        session = session or self.open_session(task)
+        run_id, trace_id, started, budget = session.run_id, session.trace_id, session.started, session.budget
         model = task.model or self.provider.model
 
         if not isinstance(task.prompt, str) or not task.prompt.strip():
             return self._fail_early(run_id, trace_id, started, 0, "validation_failure", "empty_prompt", False, model)
-        if task.cancel is not None and task.cancel.is_set():
+        if session.cancel is not None and session.cancel.is_set():
             return self._fail_early(run_id, trace_id, started, 0, "user_cancelled", "cancelled", False, model)
 
         max_attempts = self._allowed_attempts(task)
         per_attempt_timeout = self._per_attempt_timeout(task)
-        budget = self._runtime_budget(task, per_attempt_timeout, max_attempts)
 
         attempt = 0
         while attempt < max_attempts:
@@ -183,7 +276,7 @@ class AgentRuntime:
             )
             attempt_started = self._clock()
             try:
-                response = self._supervise(task.cancel, internal_cancel, timeout,
+                response = self._supervise(session.cancel, internal_cancel, timeout,
                                            lambda: self.provider.execute(request))
             except ProviderError as exc:
                 duration_ms = round((self._clock() - attempt_started) * 1000, 3)
@@ -354,6 +447,7 @@ class AgentRuntime:
             except (infra.InfraError, OSError):
                 written = False
         return span_id, written
+
     def _fail_early(
         self,
         run_id: str,

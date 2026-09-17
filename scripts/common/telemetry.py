@@ -74,6 +74,10 @@ SPAN_FIELDS = SPAN_REQUIRED + (
     "tool_outcome",
     "target_hash",
     "repeated",
+    "bytes_read",
+    "bytes_written",
+    "exit_code",
+    "result_count",
     "error_category",
     "error_code",
     "limits_version",
@@ -124,6 +128,9 @@ _SPAN_NON_NEGATIVE_INT_FIELDS = (
     "output_tokens",
     "cached_input_tokens",
     "reasoning_tokens",
+    "bytes_read",
+    "bytes_written",
+    "result_count",
 )
 _SPAN_NON_NEGATIVE_NUMBER_FIELDS = ("duration_ms", "context_size")
 _AI_RUN_NON_NEGATIVE_INT_FIELDS = (
@@ -138,6 +145,15 @@ _AI_RUN_NON_NEGATIVE_NUMBER_FIELDS = ("duration_ms", "prompt_tokens_per_second",
 
 TARGET_HASH_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 
+TOOL_LIMIT_KEYS = (
+    "tool_timeout_seconds",
+    "max_tool_calls",
+    "max_file_read_bytes",
+    "max_file_write_bytes",
+    "max_shell_output_bytes",
+    "max_search_results",
+)
+
 DEFAULT_LIMITS: dict[str, Any] = {
     "schema_version": 1,
     "limits_version": "0.1.0",
@@ -148,7 +164,27 @@ DEFAULT_LIMITS: dict[str, Any] = {
         "max_attempts": 5,
         "context_utilization_warn": 0.85,
     },
+    "tools": {
+        "tool_timeout_seconds": 120,
+        "max_tool_calls": 50,
+        "max_file_read_bytes": 262144,
+        "max_file_write_bytes": 1048576,
+        "max_shell_output_bytes": 65536,
+        "max_search_results": 200,
+    },
 }
+
+DEFAULT_TOOL_LIMITS: dict[str, Any] = dict(DEFAULT_LIMITS["tools"])
+
+
+def load_tool_limits(limits: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Return tool limits merged over conservative defaults."""
+    policy = limits if limits is not None else load_limits()
+    merged = dict(DEFAULT_TOOL_LIMITS)
+    configured = policy.get("tools")
+    if isinstance(configured, dict):
+        merged.update(configured)
+    return merged
 
 
 def _present(value: Any) -> bool:
@@ -262,6 +298,17 @@ def _validate_limits(limits: dict[str, Any]) -> None:
     warn = thresholds.get("context_utilization_warn")
     if isinstance(warn, bool) or not isinstance(warn, (int, float)) or not 0 <= warn <= 1:
         raise infra.InfraError("anomaly_thresholds.context_utilization_warn must be a number in [0, 1]")
+    tools = limits.get("tools")
+    if tools is not None:
+        if not isinstance(tools, dict):
+            raise infra.InfraError("limits.tools must be an object")
+        unknown = sorted(set(tools) - set(TOOL_LIMIT_KEYS))
+        if unknown:
+            raise infra.InfraError(f"limits.tools has unknown fields: {', '.join(unknown)}")
+        for key in TOOL_LIMIT_KEYS:
+            value = tools.get(key)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise infra.InfraError(f"limits.tools.{key} must be a positive integer")
 
 
 def load_limits(path: pathlib.Path | None = None) -> dict[str, Any]:
@@ -302,6 +349,9 @@ def validate_span_event(record: dict[str, Any]) -> dict[str, Any]:
         if isinstance(utilization, bool) or not isinstance(utilization, (int, float)) or not 0 <= utilization <= 1:
             raise infra.InfraError("context_utilization must be a number in [0, 1]")
     _check_bool(record.get("repeated"), "repeated")
+    exit_code = record.get("exit_code")
+    if exit_code is not None and (isinstance(exit_code, bool) or not isinstance(exit_code, int)):
+        raise infra.InfraError("exit_code must be an integer")
     attempt = record.get("attempt")
     if attempt is not None and attempt < 1:
         raise infra.InfraError("attempt must be at least 1")
@@ -443,6 +493,9 @@ def summarize_trace(
         warnings.append(f"attempts {attempts} exceeds {thresholds.get('max_attempts')}")
     if max_context_utilization is not None and max_context_utilization > thresholds.get("context_utilization_warn", 0.85):
         warnings.append(f"context_utilization {max_context_utilization:.2f} exceeds warning threshold")
+    max_tool_calls = (policy.get("tools") or {}).get("max_tool_calls")
+    if isinstance(max_tool_calls, int) and not isinstance(max_tool_calls, bool) and tool_calls > max_tool_calls:
+        warnings.append(f"tool_calls {tool_calls} exceeds {max_tool_calls}")
 
     return {
         "trace_id": trace_id,
