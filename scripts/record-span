@@ -1,0 +1,111 @@
+#!/usr/bin/env python3
+"""Append one sanitized runtime span for bottleneck observability.
+
+Spans are completed measurements: each carries a duration and a completion
+timestamp. Never pass raw prompts, source, secrets, or file paths; use --target
+so only a digest is stored.
+"""
+
+from __future__ import annotations
+
+import argparse
+import pathlib
+import sys
+import uuid
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "common"))
+import infra  # noqa: E402
+import telemetry  # noqa: E402
+
+
+def _uuid(value: str) -> str:
+    try:
+        uuid.UUID(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a UUID: {value}")
+    return value
+
+
+def _tristate(value: str) -> bool | None:
+    return {"yes": True, "no": False, "unknown": None}[value]
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--trace-id", required=True, type=_uuid)
+    parser.add_argument("--span-id", type=_uuid)
+    parser.add_argument("--parent-span-id", type=_uuid)
+    parser.add_argument("--run-id", type=_uuid)
+    parser.add_argument("--stage", required=True, choices=telemetry.SPAN_STAGES)
+    parser.add_argument("--duration-ms", required=True, type=float)
+    parser.add_argument("--model")
+    parser.add_argument("--provider")
+    parser.add_argument("--role")
+    parser.add_argument("--attempt", type=int)
+    parser.add_argument("--retry-count", type=int)
+    parser.add_argument("--input-tokens", type=int)
+    parser.add_argument("--output-tokens", type=int)
+    parser.add_argument("--cached-input-tokens", type=int)
+    parser.add_argument("--reasoning-tokens", type=int)
+    parser.add_argument("--context-size", type=float)
+    parser.add_argument("--context-utilization", type=float)
+    parser.add_argument("--tool-name")
+    parser.add_argument("--tool-kind", choices=telemetry.TOOL_KINDS)
+    parser.add_argument("--tool-outcome", choices=telemetry.TOOL_OUTCOMES)
+    parser.add_argument("--target", help="Target path; stored only as --target-hash")
+    parser.add_argument("--target-hash", help="Pre-computed hash_target value")
+    parser.add_argument("--repeated", type=_tristate, choices=(True, False, None), default=None)
+    parser.add_argument("--error-category", choices=telemetry.RUNTIME_ERROR_CATEGORIES)
+    parser.add_argument("--error-code")
+    parser.add_argument("--note", help="Optional sanitized note; never paste prompts, source, paths, or secrets")
+    parser.add_argument("--output", type=pathlib.Path, default=infra.ROOT / "telemetry/spans/runs.jsonl")
+    args = parser.parse_args()
+    if args.target and args.target_hash:
+        parser.error("use either --target or --target-hash, not both")
+    target_hash = args.target_hash
+    if args.target:
+        try:
+            target_hash = telemetry.hash_target(args.target)
+        except infra.InfraError as exc:
+            parser.error(str(exc))
+    record = {
+        "schema_version": telemetry.SPAN_SCHEMA_VERSION,
+        "trace_id": args.trace_id,
+        "span_id": args.span_id or str(uuid.uuid4()),
+        "timestamp_utc": infra.utc_now(),
+        "parent_span_id": args.parent_span_id,
+        "run_id": args.run_id,
+        "stage": args.stage,
+        "duration_ms": args.duration_ms,
+        "model": args.model,
+        "provider": args.provider,
+        "role": args.role,
+        "attempt": args.attempt,
+        "retry_count": args.retry_count,
+        "input_tokens": args.input_tokens,
+        "output_tokens": args.output_tokens,
+        "cached_input_tokens": args.cached_input_tokens,
+        "reasoning_tokens": args.reasoning_tokens,
+        "context_size": args.context_size,
+        "context_utilization": args.context_utilization,
+        "tool_name": args.tool_name,
+        "tool_kind": args.tool_kind,
+        "tool_outcome": args.tool_outcome,
+        "target_hash": target_hash,
+        "repeated": args.repeated,
+        "error_category": args.error_category,
+        "error_code": args.error_code,
+        "limits_version": telemetry.load_limits().get("limits_version"),
+        "sanitized_note": args.note,
+    }
+    try:
+        telemetry.validate_span_event(record)
+    except infra.InfraError as exc:
+        parser.error(str(exc))
+    infra.append_jsonl(args.output, record)
+    print(f"Span appended to {args.output}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

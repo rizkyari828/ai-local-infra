@@ -47,6 +47,21 @@ The teacher/student escalation foundation adds logical model roles, escalation t
 
 See [Teacher/student learning loop](docs/TEACHER_STUDENT_LOOP.md) and [Eval promotion](docs/EVAL_PROMOTION.md).
 
+## Runtime observability
+
+Structured stage/span telemetry, a central limits policy, and a per-trace report make
+runtime bottlenecks measurable instead of guessed:
+
+```bash
+./scripts/record-span --trace-id <uuid> --stage inference --duration-ms 18100 \
+  --model qwen3.6:27b-coding --provider ollama --role student --attempt 1
+./scripts/trace-report
+./scripts/trace-report --json
+```
+
+See [Runtime observability](docs/RUNTIME_OBSERVABILITY.md) and
+[`telemetry/schemas/span-event.schema.json`](telemetry/schemas/span-event.schema.json).
+
 ## Agent guidance
 
 Stable operating rules for this solution live in [`AGENTS.md`](AGENTS.md). Task

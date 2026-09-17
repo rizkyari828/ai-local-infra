@@ -33,6 +33,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-id", required=True, type=_uuid)
     parser.add_argument("--parent-run-id", type=_uuid)
+    parser.add_argument("--trace-id", type=_uuid, help="Correlation id; defaults to --run-id")
     parser.add_argument("--task-class", required=True)
     parser.add_argument("--student-model", required=True)
     parser.add_argument("--student-profile")
@@ -62,11 +63,12 @@ def main() -> int:
                         default=infra.ROOT / "telemetry/escalations/runs.jsonl")
     args = parser.parse_args()
     record = {
-        "schema_version": "1.0.0",
+        "schema_version": "1.1.0",
         "run_id": args.run_id,
         "event_id": str(uuid.uuid4()),
         "timestamp_utc": infra.utc_now(),
         "parent_run_id": args.parent_run_id,
+        "trace_id": args.trace_id or args.run_id,
         "task_class": args.task_class,
         "student_role": "student",
         "student_model": args.student_model,

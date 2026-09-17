@@ -13,6 +13,7 @@ import urllib.request
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "common"))
 import infra  # noqa: E402
+import telemetry  # noqa: E402
 
 
 def main() -> int:
@@ -31,6 +32,7 @@ def main() -> int:
     conflicts = infra.resource_conflicts(profile)
     if conflicts:
         parser.error("resource guard found another loaded model: " + ", ".join(conflicts))
+    timeout_seconds = telemetry.load_limits()["timeouts"]["model_timeout_seconds"]
     prompt = args.prompt_file.read_text(encoding="utf-8") if args.prompt_file else "Return exactly the word READY."
     payload = {
         "model": args.model,
@@ -45,7 +47,7 @@ def main() -> int:
             profile["ollama"]["endpoint"].rstrip("/") + "/api/generate",
             data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"}, method="POST",
         )
-        with urllib.request.urlopen(request, timeout=900) as raw:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as raw:
             response = json.load(raw)
         status = "succeeded"
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
@@ -67,6 +69,11 @@ def main() -> int:
                            if error_code else None),
         profile_version=profile["version"], hardware_profile=profile["hardware_profile"], config_version="v0.1",
     )
+    try:
+        telemetry.validate_ai_run_event(event)
+    except infra.InfraError as exc:
+        print(f"error: refusing to persist malformed telemetry: {exc}", file=sys.stderr)
+        return 1
     destination = infra.ROOT / "benchmarks/results/runs.jsonl"
     infra.append_jsonl(destination, event)
     print(json.dumps(event, indent=2))

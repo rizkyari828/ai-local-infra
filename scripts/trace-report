@@ -1,0 +1,93 @@
+#!/usr/bin/env python3
+"""Summarize runtime spans and escalations per trace to locate bottlenecks.
+
+Read-only. Local JSONL only; no database, network, or analytics service.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import pathlib
+import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "common"))
+import infra  # noqa: E402
+import learning  # noqa: E402
+import telemetry  # noqa: E402
+
+
+def _load(paths: list[pathlib.Path], explicit: bool, label: str) -> list[dict] | None:
+    records: list[dict] = []
+    for path in paths:
+        if not path.exists():
+            if explicit:
+                print(f"error: missing {label} file: {path}", file=sys.stderr)
+                return None
+            continue
+        try:
+            records.extend(learning.load_jsonl(path))
+        except infra.InfraError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return None
+    return records
+
+
+def _ms(value: float | None) -> str:
+    return "n/a" if value is None else f"{value:.0f}ms"
+
+
+def _print_trace(trace: dict) -> None:
+    escalation = trace["escalation"]
+    print(f"Trace {trace['trace_id']}  spans={trace['span_count']} duplicates={trace['duplicate_span_count']}")
+    print(f"  instrumented total: {_ms(trace['instrumented_duration_ms'])}")
+    for stage in sorted(trace["duration_by_stage"]):
+        print(f"    {stage}: {_ms(trace['duration_by_stage'][stage])}")
+    print(f"  tools: calls={trace['tool_calls']} failures={trace['tool_failures']} timeouts={trace['tool_timeouts']} "
+          f"reads={trace['file_reads']} writes={trace['file_writes']} shells={trace['shell_commands']} "
+          f"repeated_reads={trace['repeated_reads']}")
+    print(f"  attempts={trace['attempts']} retries={trace['retries']}")
+    print(f"  tokens: input={trace['input_tokens']} output={trace['output_tokens']} "
+          f"cached={trace['cached_input_tokens']} reasoning={trace['reasoning_tokens']}")
+    print(f"  context: size={trace['max_context_size']} utilization={trace['max_context_utilization']}")
+    if escalation:
+        chain = f"{escalation['student_model']} -> {escalation['teacher_provider']}:{escalation['teacher_model']}"
+        print(f"  escalation: {chain} reason={escalation['teacher_reason']} "
+              f"outcome={escalation['teacher_outcome']} human={escalation['human_review_outcome']} "
+              f"failure={escalation['failure_category']}")
+    if trace["warnings"]:
+        print("  warnings: " + "; ".join(trace["warnings"]))
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--spans", type=pathlib.Path, action="append", dest="spans",
+                        help="Span JSONL; repeatable (default: telemetry/spans/runs.jsonl)")
+    parser.add_argument("--escalations", type=pathlib.Path, action="append", dest="escalations",
+                        help="Escalation JSONL; repeatable (default: telemetry/escalations/runs.jsonl)")
+    parser.add_argument("--trace-id", help="Only report this trace")
+    parser.add_argument("--json", action="store_true", help="Emit the report object only")
+    args = parser.parse_args()
+    span_paths = args.spans or [infra.ROOT / "telemetry/spans/runs.jsonl"]
+    escalation_paths = args.escalations or [infra.ROOT / "telemetry/escalations/runs.jsonl"]
+    spans = _load(span_paths, args.spans is not None, "span")
+    if spans is None:
+        return 1
+    escalations = _load(escalation_paths, args.escalations is not None, "escalation")
+    if escalations is None:
+        return 1
+    report = telemetry.build_trace_report(spans, escalations, telemetry.load_limits())
+    if args.trace_id:
+        report["traces"] = [t for t in report["traces"] if t["trace_id"] == args.trace_id]
+        report["trace_count"] = len(report["traces"])
+    if args.json:
+        print(json.dumps(report, indent=2))
+        return 0
+    print(f"traces: {report['trace_count']} (uncorrelated spans: {report['uncorrelated_span_count']})")
+    for trace in report["traces"]:
+        _print_trace(trace)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

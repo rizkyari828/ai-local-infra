@@ -13,6 +13,7 @@ import urllib.request
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "common"))
 import infra  # noqa: E402
+import telemetry  # noqa: E402
 
 
 def discover_suites() -> dict[str, pathlib.Path]:
@@ -41,6 +42,7 @@ def main() -> int:
     }
     if request_body["format"] is None:
         request_body.pop("format")
+    timeout_seconds = telemetry.load_limits()["timeouts"]["model_timeout_seconds"]
     started = time.perf_counter()
     response, status, error_category, error_code = {}, "failed", None, None
     compliant, score = False, 0.0
@@ -49,7 +51,7 @@ def main() -> int:
             profile["ollama"]["endpoint"].rstrip("/") + "/api/generate",
             data=json.dumps(request_body).encode(), headers={"Content-Type": "application/json"}, method="POST",
         )
-        with urllib.request.urlopen(request, timeout=900) as raw:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as raw:
             response = json.load(raw)
         text = response.get("response", "")
         if definition["assertions"].get("valid_json"):
@@ -77,6 +79,11 @@ def main() -> int:
         test_status="passed" if compliant else "failed", profile_version=profile["version"],
         hardware_profile=profile["hardware_profile"], config_version="v0.1",
     )
+    try:
+        telemetry.validate_ai_run_event(event)
+    except infra.InfraError as exc:
+        print(f"error: refusing to persist malformed telemetry: {exc}", file=sys.stderr)
+        return 1
     destination = infra.ROOT / "evals/results/runs.jsonl"
     infra.append_jsonl(destination, event)
     print(json.dumps(event, indent=2))

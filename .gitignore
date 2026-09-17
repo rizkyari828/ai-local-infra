@@ -12,6 +12,7 @@ backups/
 telemetry/runs/*.jsonl
 telemetry/errors/*.jsonl
 telemetry/escalations/*.jsonl
+telemetry/spans/*.jsonl
 benchmarks/results/*.json
 benchmarks/results/*.jsonl
 evals/results/*.jsonl
@@ -21,6 +22,7 @@ datasets/candidates/*.jsonl
 !telemetry/runs/.gitkeep
 !telemetry/errors/.gitkeep
 !telemetry/escalations/.gitkeep
+!telemetry/spans/.gitkeep
 !benchmarks/results/.gitkeep
 !evals/results/.gitkeep
 !datasets/accepted/.gitkeep

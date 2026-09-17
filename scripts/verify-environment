@@ -14,6 +14,7 @@ import urllib.request
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts/common"))
 import infra  # noqa: E402
+import telemetry  # noqa: E402
 
 
 def version(command: list[str]) -> str:
@@ -35,13 +36,19 @@ def main() -> int:
             failures.append(str(exc))
     for relative in ("models/registry.yaml", "models/roles.yaml", "hardware/current-machine.yaml",
                      "telemetry/schemas/ai-run.schema.json", "telemetry/schemas/error-event.schema.json",
-                     "telemetry/schemas/escalation-run.schema.json", "telemetry/taxonomy/failure-categories.yaml",
+                     "telemetry/schemas/escalation-run.schema.json", "telemetry/schemas/span-event.schema.json",
+                     "telemetry/taxonomy/failure-categories.yaml", "config/limits.yaml",
                      "datasets/schemas/accepted-task.schema.json", "datasets/schemas/learning-candidate.schema.json"):
         try:
             infra.load_json(ROOT / relative)
             print(f"PASS syntax {relative}")
         except infra.InfraError as exc:
             failures.append(str(exc))
+    try:
+        telemetry.load_limits()
+        print("PASS limits config/limits.yaml")
+    except infra.InfraError as exc:
+        failures.append(str(exc))
     for name, command in {
         "python": ["python3", "--version"], "ollama": ["ollama", "--version"],
         "qwen": ["qwen", "--version"], "node": ["node", "--version"], "npm": ["npm", "--version"],

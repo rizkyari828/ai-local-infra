@@ -77,6 +77,7 @@ ESCALATION_REQUIRED = (
 
 ESCALATION_FIELDS = ESCALATION_REQUIRED + (
     "parent_run_id",
+    "trace_id",
     "student_role",
     "student_profile",
     "failure_category",
@@ -239,11 +240,13 @@ def validate_escalation_record(record: dict[str, Any]) -> dict[str, Any]:
         raise infra.InfraError("Escalation record must be an object")
     _reject_unknown(record, ESCALATION_FIELDS, "Escalation record")
     _require(record, ESCALATION_REQUIRED, "Escalation record")
-    if record["schema_version"] != "1.0.0":
+    if record["schema_version"] not in ("1.0.0", "1.1.0"):
         raise infra.InfraError("Unsupported escalation schema_version")
     _reject_secrets(record, "Escalation record")
-    for field in ("run_id", "event_id", "parent_run_id"):
+    for field in ("run_id", "event_id", "parent_run_id", "trace_id"):
         _check_uuid(record.get(field), f"Escalation record {field}")
+    if record["schema_version"] == "1.1.0" and not record.get("trace_id"):
+        raise infra.InfraError("Escalation schema 1.1.0 requires trace_id")
     _check_timestamp(record.get("timestamp_utc"), "Escalation record timestamp_utc")
     _check_enum(record.get("student_outcome"), STUDENT_OUTCOMES, "student_outcome")
     _check_enum(record.get("teacher_outcome"), TEACHER_OUTCOMES, "teacher_outcome")

@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "limits_version": "0.1.0",
+  "updated": "2026-09-17",
+  "timeouts": {
+    "model_timeout_seconds": 900
+  },
+  "anomaly_thresholds": {
+    "max_repeated_reads": 3,
+    "max_retries": 2,
+    "max_attempts": 5,
+    "context_utilization_warn": 0.85
+  },
+  "notes": "Single place for conservative local defaults and anomaly thresholds. model_timeout_seconds bounds inference CLI calls; anomaly_thresholds drive warnings in scripts/trace-report. Values are not secrets. The future agent runtime should read these instead of hard-coding limits."
+}
