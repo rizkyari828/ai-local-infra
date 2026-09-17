@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+"""Append one reviewed learning candidate.
+
+Never writes to lessons or datasets automatically. Promotion requires human
+acceptance, a reviewer, validation evidence, and (for training data) explicit
+project consent.
+"""
+
+from __future__ import annotations
+
+import argparse
+import pathlib
+import sys
+import uuid
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "common"))
+import infra  # noqa: E402
+import learning  # noqa: E402
+
+
+def _uuid(value: str) -> str:
+    try:
+        uuid.UUID(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a UUID: {value}")
+    return value
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--source-run", required=True, action="append", type=_uuid, dest="source_runs",
+                        help="Source run_id; repeat for multiple runs")
+    parser.add_argument("--task-class", required=True)
+    parser.add_argument("--observed-failure", required=True)
+    parser.add_argument("--failure-category", required=True, choices=learning.FAILURE_CATEGORIES)
+    parser.add_argument("--reviewed-root-cause")
+    parser.add_argument("--validated-correction")
+    parser.add_argument("--validation-evidence", action="append", default=[], dest="evidence",
+                        help="Evidence reference (test, eval, commit); repeatable")
+    parser.add_argument("--teacher-provider")
+    parser.add_argument("--teacher-model")
+    parser.add_argument("--destination", required=True, choices=learning.PROMOTION_DESTINATIONS)
+    parser.add_argument("--status", required=True, choices=learning.CANDIDATE_LIFECYCLE)
+    parser.add_argument("--reviewer")
+    parser.add_argument("--human-accepted", action="store_true")
+    parser.add_argument("--project-consent", action="store_true")
+    parser.add_argument("--note", help="Optional sanitized note; never paste prompts, source, paths, or secrets")
+    parser.add_argument("--output", type=pathlib.Path,
+                        default=infra.ROOT / "datasets/candidates/candidates.jsonl")
+    args = parser.parse_args()
+    candidate = {
+        "schema_version": "1.0.0",
+        "candidate_id": str(uuid.uuid4()),
+        "timestamp_utc": infra.utc_now(),
+        "source_run_ids": args.source_runs,
+        "task_class": args.task_class,
+        "observed_failure": args.observed_failure,
+        "failure_category": args.failure_category,
+        "reviewed_root_cause": args.reviewed_root_cause,
+        "validated_correction": args.validated_correction,
+        "validation_evidence": args.evidence,
+        "teacher_provider": args.teacher_provider,
+        "teacher_model": args.teacher_model,
+        "human_accepted": args.human_accepted,
+        "reviewer": args.reviewer,
+        "proposed_destination": args.destination,
+        "promotion_status": args.status,
+        "project_consent": args.project_consent,
+        "sanitized_note": args.note,
+    }
+    try:
+        learning.validate_learning_candidate(candidate)
+    except infra.InfraError as exc:
+        parser.error(str(exc))
+    infra.append_jsonl(args.output, candidate)
+    print(f"Learning candidate appended to {args.output}")
+    print("Human approval remains required before any lesson, eval, or training promotion")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

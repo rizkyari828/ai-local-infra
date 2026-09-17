@@ -11,17 +11,21 @@ backups/
 # Runtime output: schemas/examples are versioned, machine runs are not.
 telemetry/runs/*.jsonl
 telemetry/errors/*.jsonl
+telemetry/escalations/*.jsonl
 benchmarks/results/*.json
 benchmarks/results/*.jsonl
 evals/results/*.jsonl
 datasets/accepted/*.jsonl
 datasets/rejected/*.jsonl
+datasets/candidates/*.jsonl
 !telemetry/runs/.gitkeep
 !telemetry/errors/.gitkeep
+!telemetry/escalations/.gitkeep
 !benchmarks/results/.gitkeep
 !evals/results/.gitkeep
 !datasets/accepted/.gitkeep
 !datasets/rejected/.gitkeep
+!datasets/candidates/.gitkeep
 
 # Tooling artifacts
 __pycache__/

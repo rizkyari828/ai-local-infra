@@ -1,0 +1,107 @@
+#!/usr/bin/env python3
+"""Append one sanitized teacher/student escalation telemetry record.
+
+Records an observation. It never captures prompts, source, secrets, or
+credentials, and it never promotes a lesson, eval, or training candidate.
+"""
+
+from __future__ import annotations
+
+import argparse
+import pathlib
+import sys
+import uuid
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "common"))
+import infra  # noqa: E402
+import learning  # noqa: E402
+
+
+def _uuid(value: str) -> str:
+    try:
+        uuid.UUID(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a UUID: {value}")
+    return value
+
+
+def _tristate(value: str) -> bool | None:
+    return {"yes": True, "no": False, "unknown": None}[value]
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--run-id", required=True, type=_uuid)
+    parser.add_argument("--parent-run-id", type=_uuid)
+    parser.add_argument("--task-class", required=True)
+    parser.add_argument("--student-model", required=True)
+    parser.add_argument("--student-profile")
+    parser.add_argument("--student-outcome", required=True, choices=learning.STUDENT_OUTCOMES)
+    parser.add_argument("--failure-category", choices=learning.FAILURE_CATEGORIES,
+                        help="Required when the local outcome is not succeeded")
+    parser.add_argument("--teacher-provider")
+    parser.add_argument("--teacher-model")
+    parser.add_argument("--teacher-reason", choices=learning.TEACHER_REASONS)
+    parser.add_argument("--teacher-outcome", choices=learning.TEACHER_OUTCOMES)
+    parser.add_argument("--human-review-outcome", choices=learning.HUMAN_REVIEW_OUTCOMES, default="unreviewed")
+    parser.add_argument("--correction-required", type=_tristate, choices=(True, False, None), default=None)
+    parser.add_argument("--human-correction-count", type=int)
+    parser.add_argument("--tests", type=_tristate, choices=(True, False, None), default=None)
+    parser.add_argument("--lesson-candidate", action="store_true")
+    parser.add_argument("--eval-candidate", action="store_true")
+    parser.add_argument("--training-candidate", action="store_true")
+    parser.add_argument("--duration-ms", type=float)
+    parser.add_argument("--cost-input-tokens", type=int)
+    parser.add_argument("--cost-output-tokens", type=int)
+    parser.add_argument("--cost-cache-hit-tokens", type=int)
+    parser.add_argument("--estimated-cost-usd", type=float)
+    parser.add_argument("--pricing-source")
+    parser.add_argument("--recorded-by")
+    parser.add_argument("--note", help="Optional sanitized note; never paste prompts, source, paths, or secrets")
+    parser.add_argument("--output", type=pathlib.Path,
+                        default=infra.ROOT / "telemetry/escalations/runs.jsonl")
+    args = parser.parse_args()
+    record = {
+        "schema_version": "1.0.0",
+        "run_id": args.run_id,
+        "event_id": str(uuid.uuid4()),
+        "timestamp_utc": infra.utc_now(),
+        "parent_run_id": args.parent_run_id,
+        "task_class": args.task_class,
+        "student_role": "student",
+        "student_model": args.student_model,
+        "student_profile": args.student_profile,
+        "student_outcome": args.student_outcome,
+        "failure_category": args.failure_category,
+        "teacher_provider": args.teacher_provider,
+        "teacher_model": args.teacher_model,
+        "teacher_reason": args.teacher_reason,
+        "teacher_outcome": args.teacher_outcome,
+        "human_review_outcome": args.human_review_outcome,
+        "correction_required": args.correction_required,
+        "human_correction_count": args.human_correction_count,
+        "tests_passed": args.tests,
+        "lesson_candidate": args.lesson_candidate,
+        "eval_candidate": args.eval_candidate,
+        "training_candidate": args.training_candidate,
+        "duration_ms": args.duration_ms,
+        "cost_input_tokens": args.cost_input_tokens,
+        "cost_output_tokens": args.cost_output_tokens,
+        "cost_cache_hit_tokens": args.cost_cache_hit_tokens,
+        "estimated_cost_usd": args.estimated_cost_usd,
+        "pricing_source": args.pricing_source,
+        "recorded_by": args.recorded_by,
+        "sanitized_note": args.note,
+    }
+    try:
+        learning.validate_escalation_record(record)
+    except infra.InfraError as exc:
+        parser.error(str(exc))
+    infra.append_jsonl(args.output, record)
+    print(f"Escalation observation appended to {args.output}")
+    print("This is an observation, not a lesson; promotion requires review and evidence")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

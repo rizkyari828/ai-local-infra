@@ -33,8 +33,10 @@ def main() -> int:
             print(f"PASS profile {path.stem}")
         except infra.InfraError as exc:
             failures.append(str(exc))
-    for relative in ("models/registry.yaml", "hardware/current-machine.yaml", "telemetry/schemas/ai-run.schema.json",
-                     "telemetry/schemas/error-event.schema.json", "datasets/schemas/accepted-task.schema.json"):
+    for relative in ("models/registry.yaml", "models/roles.yaml", "hardware/current-machine.yaml",
+                     "telemetry/schemas/ai-run.schema.json", "telemetry/schemas/error-event.schema.json",
+                     "telemetry/schemas/escalation-run.schema.json", "telemetry/taxonomy/failure-categories.yaml",
+                     "datasets/schemas/accepted-task.schema.json", "datasets/schemas/learning-candidate.schema.json"):
         try:
             infra.load_json(ROOT / relative)
             print(f"PASS syntax {relative}")

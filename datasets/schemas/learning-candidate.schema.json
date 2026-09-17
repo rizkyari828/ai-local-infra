@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "local-ai-infra/datasets/learning-candidate/1.0.0",
+  "title": "Reviewed learning candidate",
+  "description": "Structured record for one reviewed learning candidate. Observation is not promotion. A candidate may reference runs, but human approval is always required before lesson/eval/training promotion.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "candidate_id", "timestamp_utc", "source_run_ids", "task_class", "observed_failure", "failure_category", "proposed_destination", "promotion_status"],
+  "properties": {
+    "schema_version": {"const": "1.0.0"},
+    "candidate_id": {"type": "string", "format": "uuid"},
+    "timestamp_utc": {"type": "string", "format": "date-time"},
+    "source_run_ids": {"type": "array", "minItems": 1, "items": {"type": "string", "format": "uuid"}},
+    "task_class": {"type": "string"},
+    "observed_failure": {"type": "string"},
+    "failure_category": {"type": "string"},
+    "reviewed_root_cause": {"type": ["string", "null"]},
+    "validated_correction": {"type": ["string", "null"]},
+    "validation_evidence": {"type": "array", "items": {"type": "string"}},
+    "teacher_provider": {"type": ["string", "null"]},
+    "teacher_model": {"type": ["string", "null"]},
+    "human_accepted": {"type": "boolean"},
+    "reviewer": {"type": ["string", "null"]},
+    "proposed_destination": {"enum": ["lesson", "eval", "training-candidate"]},
+    "promotion_status": {"enum": ["observation", "reviewed", "validated", "promoted", "rejected"]},
+    "project_consent": {"type": "boolean"},
+    "sanitized_note": {"type": ["string", "null"]}
+  }
+}

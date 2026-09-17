@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "taxonomy_version": "0.1.0",
+  "updated": "2026-09-17",
+  "note": "Small, practical initial failure taxonomy. Add categories through a reviewed edit; keep the id list in sync with scripts/common/learning.py. Unknown categories must not break readers.",
+  "categories": [
+    {"id": "syntax_or_compile", "summary": "Output does not parse or compile."},
+    {"id": "test_failure", "summary": "Output runs but existing or new tests fail."},
+    {"id": "missed_existing_pattern", "summary": "Ignored an established repository convention or pattern."},
+    {"id": "wrong_api_usage", "summary": "Misused a library, framework, or internal API."},
+    {"id": "tool_loop", "summary": "Repeated the same tool call without progress."},
+    {"id": "excessive_reread", "summary": "Re-read the same files or context more than necessary."},
+    {"id": "context_loss", "summary": "Lost or contradicted earlier task context."},
+    {"id": "invalid_structured_output", "summary": "Structured output was malformed or failed schema."},
+    {"id": "environment_issue", "summary": "Local environment, dependency, or runtime blocked the task."},
+    {"id": "architecture_uncertainty", "summary": "Could not choose a safe architectural approach."},
+    {"id": "security_uncertainty", "summary": "Could not decide safely on a security-relevant change."},
+    {"id": "persistence_uncertainty", "summary": "Could not safely decide a data, schema, or migration change."},
+    {"id": "human_rejected", "summary": "A human reviewer rejected the result for a reason not captured above."},
+    {"id": "unknown", "summary": "Not yet classified; classification is deferred to review."}
+  ]
+}

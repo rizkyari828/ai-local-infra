@@ -12,7 +12,7 @@ Backups are timestamped beneath `~/.local/state/local-ai-infra/backups/`. `rollb
 
 ## Telemetry storage and hygiene
 
-v0.1 writes append-only JSONL. Each event is a flat, typed record with stable IDs, UTC time, event type, dimensions (project/client/model/profile/operation), numeric measures, outcome fields, and explicit runtime/config versions. This shape is intentionally friendly to columnar conversion:
+v0.1 writes append-only JSONL. Each event is a flat, typed record with stable IDs, UTC time, event type, dimensions (project/client/model/profile/operation), numeric measures, outcome fields, and explicit runtime/config versions. The teacher/student extension adds `telemetry/escalations/runs.jsonl` with the same flat, null-capable shape, defined by `telemetry/schemas/escalation-run.schema.json`. See [Teacher/student learning loop](TEACHER_STUDENT_LOOP.md). This shape is intentionally friendly to columnar conversion:
 
 ```text
 JSONL (capture/source of truth for v0.1) -> Parquet (later compact analytics files) -> DuckDB (local ad-hoc analytics)

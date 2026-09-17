@@ -1,0 +1,57 @@
+#!/usr/bin/env python3
+"""Compute teacher/student escalation metrics from local JSONL telemetry.
+
+Read-only. No database, analytics service, or network access is used.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import pathlib
+import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "common"))
+import infra  # noqa: E402
+import learning  # noqa: E402
+
+RATE_LABELS = (
+    ("paid_escalation_rate", "paid escalation rate (teacher / total tasks)"),
+    ("local_success_rate", "local success rate (Qwen success / total tasks)"),
+    ("teacher_acceptance_rate", "teacher acceptance rate (accepted / escalations)"),
+    ("first_pass_local_success_rate", "first-pass local success rate (no correction / total)"),
+)
+
+
+def _percent(value: float | None) -> str:
+    return "unknown" if value is None else f"{value * 100:.1f}%"
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--input", type=pathlib.Path, action="append", dest="inputs",
+                        help="JSONL input; repeatable (default: telemetry/escalations/runs.jsonl)")
+    parser.add_argument("--json", action="store_true", help="Emit the metric object only")
+    args = parser.parse_args()
+    inputs = args.inputs or [infra.ROOT / "telemetry/escalations/runs.jsonl"]
+    records: list[dict] = []
+    for path in inputs:
+        try:
+            records.extend(learning.load_jsonl(path))
+        except infra.InfraError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+    metrics = learning.compute_metrics(records)
+    if args.json:
+        print(json.dumps(metrics, indent=2))
+        return 0
+    print(f"records: {metrics['total_tasks']} (escalated: {metrics['escalated_tasks']})")
+    for key, label in RATE_LABELS:
+        print(f"{label}: {_percent(metrics[key])}")
+    corrections = metrics["mean_human_corrections_per_task"]
+    print("mean human corrections per task: " + ("unknown" if corrections is None else f"{corrections:.3f}"))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

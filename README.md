@@ -32,6 +32,21 @@ Both append sanitized run records to ignored JSONL files. Full prompts and sourc
 
 Learning follows `RUN -> TELEMETRY -> EVAL/TEST -> REVIEW -> LEARNING CANDIDATE -> HUMAN APPROVAL -> PROMOTE`. Only reviewed, accepted, consented data may become positive training candidates. See [Learning loop](docs/LEARNING_LOOP.md) and [Operations](docs/OPERATIONS.md).
 
+The teacher/student escalation foundation adds logical model roles, escalation telemetry, a failure taxonomy, a learning-candidate schema, eval promotion, and lightweight metrics. It implements no router, fallback, or training:
+
+```bash
+./scripts/record-escalation --run-id <uuid> --task-class <class> \
+  --student-model qwen3.6:27b-coding --student-outcome failed \
+  --failure-category missed_existing_pattern \
+  --teacher-provider deepseek --teacher-model deepseek-coder --teacher-reason failure
+./scripts/record-learning-candidate --source-run <uuid> --task-class <class> \
+  --observed-failure "..." --failure-category missed_existing_pattern \
+  --destination lesson --status reviewed
+./scripts/learning-metrics
+```
+
+See [Teacher/student learning loop](docs/TEACHER_STUDENT_LOOP.md) and [Eval promotion](docs/EVAL_PROMOTION.md).
+
 ## Why files only?
 
 One WSL2 workstation and one substantial GPU workload at a time do not justify PostgreSQL, Redis, a vector database, HTTP service, dashboard, or scheduler. JSON/JSONL keeps v0.1 inspectable, portable, and easy to replace when evidence supports a larger system.

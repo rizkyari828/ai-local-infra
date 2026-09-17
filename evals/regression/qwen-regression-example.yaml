@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "id": "qwen-regression-example",
+  "version": "0.1.0",
+  "task_type": "synthetic-regression",
+  "prompt": "Return only minified JSON with key answer. What is 6 multiplied by 7?",
+  "assertions": {"valid_json": true, "required_keys": ["answer"]},
+  "notes": "Synthetic demonstration of the eval-promotion mechanism. Generalized from a taxonomy category, not copied from any project source. See docs/EVAL_PROMOTION.md.",
+  "source_failure_category": "invalid_structured_output",
+  "sanitized": true
+}

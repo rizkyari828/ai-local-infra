@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "roles_version": "0.2.0",
+  "updated": "2026-09-17",
+  "note": "Logical model roles for the teacher/student learning loop. Hosted teacher entries describe intent only: no secrets, no runtime routing, and no automatic fallback are implemented here.",
+  "roles": [
+    {
+      "id": "student",
+      "tier": "local",
+      "provider": "ollama",
+      "model_family": "qwen",
+      "model_reference": "qwen3.6:27b-coding",
+      "intent": "Attempt every coding task locally first and produce the primary patch or answer.",
+      "escalation_trigger": "Local failure, uncertainty, or explicit policy; never automatic.",
+      "required_for_operation": true
+    },
+    {
+      "id": "teacher-cheap",
+      "tier": "hosted",
+      "provider": "deepseek",
+      "model_family": "deepseek",
+      "model_reference": "deepseek-coder",
+      "intent": "First paid escalation for bounded, clearly classified local failures.",
+      "escalation_trigger": "Reviewed or recurring local failure where a cheaper hosted model is likely sufficient.",
+      "required_for_operation": false,
+      "secrets": "Provided out-of-band; API keys are never stored in this repository."
+    },
+    {
+      "id": "teacher-premium",
+      "tier": "hosted",
+      "provider": "codex",
+      "model_family": "codex",
+      "model_reference": "codex",
+      "intent": "Second paid escalation for hard, high-uncertainty, or high-criticality tasks.",
+      "escalation_trigger": "Cheap teacher is insufficient, or task criticality and uncertainty justify it.",
+      "required_for_operation": false,
+      "secrets": "Provided out-of-band; API keys are never stored in this repository."
+    }
+  ]
+}

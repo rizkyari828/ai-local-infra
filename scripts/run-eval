@@ -15,16 +15,22 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "common"))
 import infra  # noqa: E402
 
 
+def discover_suites() -> dict[str, pathlib.Path]:
+    """Map every eval id under evals/<group>/<id>.yaml to its definition path."""
+    return {path.stem: path for path in sorted((infra.ROOT / "evals").glob("*/*.yaml"))}
+
+
 def main() -> int:
+    suites = discover_suites()
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("suite", choices=("coding-small", "studio-structured-output"))
+    parser.add_argument("suite", choices=sorted(suites))
     parser.add_argument("--model", required=True)
     parser.add_argument("--profile", required=True)
     parser.add_argument("--confirm-run", action="store_true")
     args = parser.parse_args()
     if not args.confirm_run:
         parser.error("--confirm-run is required; eval inference never runs implicitly")
-    definition = infra.load_json(infra.ROOT / f"evals/{'coding' if args.suite == 'coding-small' else 'studio'}/{args.suite}.yaml")
+    definition = infra.load_json(suites[args.suite])
     profile = infra.load_profile(args.profile)
     if args.model != profile["model"]["id"]:
         parser.error("model must match the selected profile")
