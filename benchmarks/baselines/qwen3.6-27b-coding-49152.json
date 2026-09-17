@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "recorded": "2026-09-17",
+  "source": "previously observed direct local benchmark",
+  "model": "qwen3.6:27b-coding",
+  "profile_equivalent": "coding-large",
+  "context_configured": 49152,
+  "prompt_tokens_per_second_approx": 103.66,
+  "generation_tokens_per_second_approx": 12.34,
+  "output_tokens": 773,
+  "duration_seconds_approx": 63,
+  "qualification": "One observed run on current-machine-v1; not a universal capability claim and not an agent-level benchmark."
+}

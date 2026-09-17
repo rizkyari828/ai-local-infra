@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "id": "studio",
+  "version": "0.1.0",
+  "stability": "candidate",
+  "purpose": "Content Studio local product workload",
+  "hardware_profile": "current-machine-v1",
+  "model": {"id": "qwen3.8:27b-q4_K_M", "heavy": true},
+  "ollama": {
+    "endpoint": "http://127.0.0.1:11434",
+    "environment": {
+      "OLLAMA_CONTEXT_LENGTH": "16384",
+      "OLLAMA_FLASH_ATTENTION": "1",
+      "OLLAMA_KV_CACHE_TYPE": "q8_0",
+      "OLLAMA_NUM_PARALLEL": "1",
+      "OLLAMA_MAX_LOADED_MODELS": "1"
+    }
+  },
+  "qwen": {
+    "manage_developer_client": false,
+    "reason": "Studio runtime selection must not change the Qwen Code developer model"
+  },
+  "notes": [
+    "16384 matches the existing provider entry and is a conservative task-oriented starting point.",
+    "Benchmark this context with representative Studio tasks before promotion to stable."
+  ]
+}

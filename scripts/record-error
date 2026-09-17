@@ -1,0 +1,46 @@
+#!/usr/bin/env python3
+"""Append one sanitized error observation with a deterministic fingerprint."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import pathlib
+import sys
+import uuid
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "common"))
+import infra  # noqa: E402
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--run-id", required=True)
+    parser.add_argument("--client", required=True)
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--operation", required=True)
+    parser.add_argument("--category", required=True)
+    parser.add_argument("--code", required=True)
+    parser.add_argument("--note", help="Optional sanitized note; never paste prompts, source, paths, or credentials")
+    args = parser.parse_args()
+    try:
+        uuid.UUID(args.run_id)
+    except ValueError:
+        parser.error("--run-id must be a UUID")
+    event = {
+        "schema_version": "1.0.0", "event_id": str(uuid.uuid4()), "run_id": args.run_id,
+        "timestamp_utc": infra.utc_now(), "lifecycle": "observation", "client": args.client,
+        "model": args.model, "operation": args.operation, "error_category": args.category,
+        "error_code": args.code,
+        "fingerprint": infra.error_fingerprint(args.client, args.model, args.operation, args.category, args.code),
+        "occurrence_count": 1, "review_status": "unreviewed", "sanitized_note": args.note,
+    }
+    destination = infra.ROOT / "telemetry/errors/events.jsonl"
+    infra.append_jsonl(destination, event)
+    print(json.dumps(event, indent=2))
+    print(f"Observation appended to {destination}; it is not a lesson or promoted rule")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "id": "coding-routine",
+  "version": "0.1.0",
+  "stability": "stable",
+  "purpose": "Routine bounded developer coding tasks",
+  "hardware_profile": "current-machine-v1",
+  "model": {"id": "qwen3.6:27b-coding", "heavy": true},
+  "ollama": {
+    "endpoint": "http://127.0.0.1:11434",
+    "environment": {
+      "OLLAMA_CONTEXT_LENGTH": "32768",
+      "OLLAMA_FLASH_ATTENTION": "1",
+      "OLLAMA_KV_CACHE_TYPE": "q8_0",
+      "OLLAMA_NUM_PARALLEL": "1",
+      "OLLAMA_MAX_LOADED_MODELS": "1"
+    }
+  },
+  "qwen": {
+    "manage_developer_client": true,
+    "provider": "anthropic",
+    "base_url": "http://127.0.0.1:11434",
+    "model": "qwen3.6:27b-coding",
+    "context_window": 32768,
+    "memory": {
+      "enableManagedAutoMemory": false,
+      "enableManagedAutoDream": false,
+      "enableAutoSkill": false,
+      "autoSkillConfirm": true
+    }
+  }
+}

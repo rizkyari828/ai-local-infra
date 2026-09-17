@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "id": "coding-small",
+  "version": "0.1.0",
+  "task_type": "small-code-transformation",
+  "prompt": "Return only minified JSON with key result. Transform the Python expression [x*x for x in range(4)] into its evaluated value.",
+  "assertions": {"valid_json": true, "required_keys": ["result"]},
+  "notes": "Harmless transformation; no repository source or project knowledge."
+}

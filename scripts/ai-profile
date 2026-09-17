@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+"""Safely inspect, apply, verify, and roll back local AI profiles."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import pathlib
+import subprocess
+import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "common"))
+import infra  # noqa: E402
+
+
+def print_report(profile: dict, report: dict) -> None:
+    marker = infra.active_marker()
+    print(f"Active profile: {marker['id']}@{marker['version']}" if marker else "Active profile: UNKNOWN (no marker)")
+    print(f"Desired profile: {profile['id']}@{profile['version']} ({profile['stability']})")
+    print(f"Overall: {report['overall']}")
+    for area in ("ollama", "qwen"):
+        section = report[area]
+        print(f"{area.upper()}: {section['status']}")
+        print("  desired: " + json.dumps(section["desired"], sort_keys=True))
+        print("  actual:  " + json.dumps(section["actual"], sort_keys=True))
+
+
+def selected_profile(explicit: str | None) -> dict:
+    if explicit:
+        return infra.load_profile(explicit)
+    marker = infra.active_marker()
+    if not marker:
+        raise infra.InfraError("No active profile marker; pass --profile or apply a profile")
+    return infra.load_profile(marker["id"])
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    try:
+        profile = selected_profile(args.profile)
+    except infra.InfraError as exc:
+        print(f"Active profile: UNKNOWN ({exc})")
+        print("Available profiles: " + ", ".join(path.stem for path in sorted(infra.PROFILE_DIR.glob("*.yaml"))))
+        return 0
+    print_report(profile, infra.compare(profile))
+    return 0
+
+
+def plan(profile: dict) -> tuple[dict, list[pathlib.Path], str, dict]:
+    current_qwen = infra.load_json(infra.QWEN_PATH) if infra.QWEN_PATH.exists() else {}
+    wanted_qwen = infra.desired_qwen(current_qwen, profile)
+    wanted_ollama = infra.render_ollama(profile)
+    changed: list[pathlib.Path] = []
+    if profile["qwen"].get("manage_developer_client") and current_qwen != wanted_qwen:
+        changed.append(infra.QWEN_PATH)
+    current_override = infra.OLLAMA_PATH.read_text(encoding="utf-8") if infra.OLLAMA_PATH.exists() else ""
+    if current_override != wanted_ollama:
+        changed.append(infra.OLLAMA_PATH)
+    return current_qwen, changed, wanted_ollama, wanted_qwen
+
+
+def cmd_use(args: argparse.Namespace) -> int:
+    profile = infra.load_profile(args.profile_id)
+    current_qwen, changed, wanted_ollama, wanted_qwen = plan(profile)
+    report = infra.compare(profile)
+    conflicts = infra.resource_conflicts(profile)
+    restart = infra.OLLAMA_PATH in changed
+    print_report(profile, report)
+    print("Files that would change: " + (", ".join(str(path) for path in changed) if changed else "none"))
+    print(f"Ollama restart required: {'yes' if restart else 'no'}")
+    if conflicts:
+        print("Resource guard: conflicting loaded model(s): " + ", ".join(conflicts))
+        if args.unload and not args.dry_run:
+            for model in conflicts:
+                subprocess.run(["ollama", "stop", model], check=True)
+        elif not args.dry_run:
+            raise infra.InfraError("Stop conflicting models or rerun with --unload")
+    if args.dry_run:
+        print("DRY RUN: no files changed; no service restarted")
+        return 0
+    active = infra.active_marker()
+    marker_matches = bool(active and active.get("id") == profile["id"] and active.get("version") == profile["version"])
+    if not changed and report["overall"] == "MATCH" and marker_matches:
+        print("Already active and matching; no action taken")
+        return 0
+    backup_path = infra.backup(changed, profile)
+    try:
+        if infra.QWEN_PATH in changed:
+            infra.atomic_json(infra.QWEN_PATH, wanted_qwen)
+        if infra.OLLAMA_PATH in changed:
+            infra.install_ollama(wanted_ollama)
+            infra.restart_ollama()
+            if not infra.health_check(profile["ollama"]["endpoint"]):
+                raise infra.InfraError("Ollama health check failed after restart")
+        marker = {"id": profile["id"], "version": profile["version"], "applied_at": infra.utc_now()}
+        infra.atomic_json(infra.ACTIVE_PATH, marker)
+        final = infra.compare(profile)
+        if final["overall"] != "MATCH":
+            raise infra.InfraError(f"Post-apply verification returned {final['overall']}")
+        infra.mark_known_good(backup_path)
+        print(f"Applied {profile['id']}@{profile['version']}; backup: {backup_path}")
+        return 0
+    except Exception:
+        print("Apply failed; attempting restoration from the new backup", file=sys.stderr)
+        infra.restore_backup(backup_path)
+        raise
+
+
+def cmd_verify(args: argparse.Namespace) -> int:
+    for path in sorted(infra.PROFILE_DIR.glob("*.yaml")):
+        infra.load_profile(path.stem)
+    infra.load_json(infra.ROOT / "models/registry.yaml")
+    infra.load_json(infra.ROOT / "hardware/current-machine.yaml")
+    profile = selected_profile(args.profile)
+    report = infra.compare(profile)
+    print_report(profile, report)
+    endpoint_ok = infra.health_check(profile["ollama"]["endpoint"], timeout=3)
+    print(f"Ollama health: {'OK' if endpoint_ok else 'UNAVAILABLE'}")
+    return 0 if report["overall"] == "MATCH" and endpoint_ok else 1
+
+
+def cmd_rollback(args: argparse.Namespace) -> int:
+    target = infra.latest_backup()
+    manifest = infra.load_json(target / "manifest.json")
+    print(f"Latest backup: {target}")
+    for item in manifest["files"]:
+        print(f"  restore {item['path']} ({'file' if item['existed'] else 'remove newly created file'})")
+    if args.dry_run:
+        print("DRY RUN: no files changed; no service restarted")
+        return 0
+    infra.restore_backup(target)
+    print("Rollback completed")
+    return 0
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(description=__doc__)
+    sub = result.add_subparsers(dest="command", required=True)
+    status = sub.add_parser("status", help="report active profile and drift without changes")
+    status.add_argument("--profile", help="compare a specific profile")
+    status.set_defaults(func=cmd_status)
+    use = sub.add_parser("use", help="safely apply a profile")
+    use.add_argument("profile_id")
+    use.add_argument("--dry-run", action="store_true")
+    use.add_argument("--unload", action="store_true", help="stop conflicting loaded models before apply")
+    use.set_defaults(func=cmd_use)
+    verify = sub.add_parser("verify", help="validate repository config and actual active state")
+    verify.add_argument("--profile", help="verify a specific profile")
+    verify.set_defaults(func=cmd_verify)
+    rollback = sub.add_parser("rollback", help="restore the latest backup")
+    rollback.add_argument("--dry-run", action="store_true")
+    rollback.set_defaults(func=cmd_rollback)
+    return result
+
+
+def main() -> int:
+    try:
+        args = parser().parse_args()
+        return args.func(args)
+    except (infra.InfraError, OSError, subprocess.CalledProcessError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

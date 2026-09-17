@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "local-ai-infra/telemetry/error-event/1.0.0",
+  "title": "Error observation",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "event_id", "run_id", "timestamp_utc", "lifecycle", "client", "model", "operation", "error_category", "error_code", "fingerprint"],
+  "properties": {
+    "schema_version": {"const": "1.0.0"},
+    "event_id": {"type": "string", "format": "uuid"},
+    "run_id": {"type": "string", "format": "uuid"},
+    "timestamp_utc": {"type": "string", "format": "date-time"},
+    "lifecycle": {"enum": ["observation", "recurring-pattern", "reviewed-root-cause", "validated-improvement-candidate"]},
+    "client": {"type": "string"},
+    "model": {"type": "string"},
+    "operation": {"type": "string"},
+    "error_category": {"type": "string"},
+    "error_code": {"type": "string"},
+    "fingerprint": {"type": "string", "pattern": "^sha256:[0-9a-f]{24}$"},
+    "occurrence_count": {"type": "integer", "minimum": 1},
+    "review_status": {"enum": ["unreviewed", "reviewed", "rejected", "promoted"]},
+    "sanitized_note": {"type": ["string", "null"]}
+  }
+}

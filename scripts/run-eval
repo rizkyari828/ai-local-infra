@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+"""Run a versioned, explicit, small Ollama eval definition."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import pathlib
+import sys
+import time
+import urllib.error
+import urllib.request
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "common"))
+import infra  # noqa: E402
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("suite", choices=("coding-small", "studio-structured-output"))
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--profile", required=True)
+    parser.add_argument("--confirm-run", action="store_true")
+    args = parser.parse_args()
+    if not args.confirm_run:
+        parser.error("--confirm-run is required; eval inference never runs implicitly")
+    definition = infra.load_json(infra.ROOT / f"evals/{'coding' if args.suite == 'coding-small' else 'studio'}/{args.suite}.yaml")
+    profile = infra.load_profile(args.profile)
+    if args.model != profile["model"]["id"]:
+        parser.error("model must match the selected profile")
+    request_body = {
+        "model": args.model, "prompt": definition["prompt"], "stream": False,
+        "format": "json" if definition["assertions"].get("valid_json") else None,
+        "options": {"num_ctx": int(profile["ollama"]["environment"]["OLLAMA_CONTEXT_LENGTH"])},
+    }
+    if request_body["format"] is None:
+        request_body.pop("format")
+    started = time.perf_counter()
+    response, status, error_category, error_code = {}, "failed", None, None
+    compliant, score = False, 0.0
+    try:
+        request = urllib.request.Request(
+            profile["ollama"]["endpoint"].rstrip("/") + "/api/generate",
+            data=json.dumps(request_body).encode(), headers={"Content-Type": "application/json"}, method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=900) as raw:
+            response = json.load(raw)
+        text = response.get("response", "")
+        if definition["assertions"].get("valid_json"):
+            parsed = json.loads(text)
+            compliant = all(key in parsed for key in definition["assertions"]["required_keys"])
+        else:
+            compliant = definition["assertions"]["expected_exact"] == text.strip()
+        score = 1.0 if compliant else 0.0
+        status = "succeeded" if compliant else "failed"
+        if not compliant:
+            error_category, error_code = "evaluation", "assertion_failed"
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        error_category, error_code = "runtime", type(exc).__name__
+    duration_ms = round((time.perf_counter() - started) * 1000, 3)
+    event = infra.base_event(
+        agent_client="run-eval", model=args.model, profile=args.profile, operation_tool="ollama.generate",
+        task_type=definition["task_type"], duration_ms=duration_ms,
+        input_tokens=response.get("prompt_eval_count"), output_tokens=response.get("eval_count"),
+        context_configured=int(profile["ollama"]["environment"]["OLLAMA_CONTEXT_LENGTH"]),
+        status=status, error_category=error_category, error_code=error_code,
+        error_fingerprint=(infra.error_fingerprint("run-eval", args.model, args.suite, error_category, error_code)
+                           if error_code else None),
+        eval_suite=args.suite, eval_version=definition["version"], eval_score=score,
+        structured_output_compliant=compliant if definition["assertions"].get("valid_json") else None,
+        test_status="passed" if compliant else "failed", profile_version=profile["version"],
+        hardware_profile=profile["hardware_profile"], config_version="v0.1",
+    )
+    destination = infra.ROOT / "evals/results/runs.jsonl"
+    infra.append_jsonl(destination, event)
+    print(json.dumps(event, indent=2))
+    print("Prompt and model output were not stored")
+    return 0 if compliant else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,17 @@
+{
+  "$version": 4,
+  "env": {
+    "OLLAMA_ANTHROPIC_KEY": "${OLLAMA_ANTHROPIC_KEY}",
+    "OLLAMA_API_KEY": "${OLLAMA_API_KEY}"
+  },
+  "model": {
+    "name": "{{QWEN_MODEL}}",
+    "baseUrl": "{{OLLAMA_ENDPOINT}}"
+  },
+  "memory": {
+    "enableManagedAutoMemory": false,
+    "enableManagedAutoDream": false,
+    "enableAutoSkill": false,
+    "autoSkillConfirm": true
+  }
+}

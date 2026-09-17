@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "registry_version": "0.1.0",
+  "updated": "2026-09-17",
+  "lifecycle_values": ["experimental", "candidate", "validated", "default", "retired"],
+  "models": [
+    {
+      "id": "qwen3.6:27b-coding",
+      "role": ["developer-coding"],
+      "quantization_or_tag": "27b-coding",
+      "lifecycle": "default",
+      "validated_capabilities": ["direct local coding inference", "bounded code transformations"],
+      "known_limitations": ["Qwen Code context compaction and tool orchestration have shown delays; root cause not proven"],
+      "recommended_context": {"routine": 32768, "large_bounded": 49152},
+      "hardware_notes": "Validated on the current RTX 4060 Ti 16 GB machine; one substantial GPU workload at a time."
+    },
+    {
+      "id": "qwen3.6:27b-q4_K_M",
+      "role": ["general", "secondary"],
+      "quantization_or_tag": "q4_K_M",
+      "lifecycle": "candidate",
+      "validated_capabilities": ["local general inference"],
+      "known_limitations": ["Strict GenerateIdea structured JSON was unreliable in the observed Content Studio flow"],
+      "recommended_context": {"observed_configuration": 49152},
+      "hardware_notes": "Heavy model; avoid concurrent residency with another 27B model on 16 GB VRAM."
+    },
+    {
+      "id": "qwen3.8:27b-q4_K_M",
+      "role": ["content-studio-runtime", "structured-output"],
+      "quantization_or_tag": "q4_K_M",
+      "lifecycle": "validated",
+      "validated_capabilities": ["Content Studio GenerateIdea structured output completed through the existing retry policy"],
+      "known_limitations": ["One timeout and one malformed response preceded success", "Qwen Code multi-step tool use previously showed compatibility issues"],
+      "recommended_context": {"studio_candidate": 16384, "status": "requires representative benchmarking"},
+      "hardware_notes": "Validated as a product runtime model, not the default coding-agent model."
+    },
+    {
+      "id": "qwen3.5:9b",
+      "role": ["legacy-coding"],
+      "quantization_or_tag": "9b",
+      "lifecycle": "retired",
+      "validated_capabilities": [],
+      "known_limitations": ["Retired from active coding use"],
+      "recommended_context": null,
+      "hardware_notes": "Retained only for historical registry continuity."
+    }
+  ]
+}

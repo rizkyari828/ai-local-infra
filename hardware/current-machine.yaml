@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "id": "current-machine-v1",
+  "captured": "2026-09-17",
+  "platform": {"kind": "WSL2", "kernel": "5.15.167.4-microsoft-standard-WSL2"},
+  "gpu": {"name": "NVIDIA GeForce RTX 4060 Ti", "vram_mib": 16380, "driver": "616.92"},
+  "memory": {
+    "host_gib_reported": 32,
+    "wsl_visible_gib_observed": 15,
+    "note": "Host capacity was supplied as verified environment data; WSL visibility was measured separately and may be limited by WSL configuration."
+  },
+  "runtime_versions": {
+    "ollama": "0.34.1",
+    "qwen_code": "0.24.0",
+    "node": "24.21.0",
+    "npm": "11.19.0",
+    "dotnet_sdk_expected": "10.0.401",
+    "dotnet_sdk_current_shell": "unavailable via project global.json during capture"
+  },
+  "ollama_endpoint": "http://127.0.0.1:11434",
+  "constraints": ["One substantial 27B GPU workload at a time", "Profiles are portable; do not infer these limits for other machines"]
+}

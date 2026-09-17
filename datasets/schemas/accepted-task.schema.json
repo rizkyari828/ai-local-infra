@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "local-ai-infra/datasets/accepted-task/1.0.0",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "candidate_id", "timestamp_utc", "task_type", "model", "profile", "accepted", "review", "project_consent", "final_outcome"],
+  "properties": {
+    "schema_version": {"const": "1.0.0"},
+    "candidate_id": {"type": "string", "format": "uuid"},
+    "timestamp_utc": {"type": "string", "format": "date-time"},
+    "project": {"type": ["string", "null"]},
+    "task_type": {"type": "string"},
+    "model": {"type": "string"},
+    "model_digest": {"type": ["string", "null"]},
+    "profile": {"type": "string"},
+    "profile_version": {"type": ["string", "null"]},
+    "output_reference": {"type": ["string", "null"]},
+    "sanitized_content": {"type": ["string", "null"]},
+    "accepted": {"const": true},
+    "review": {"enum": ["human-approved", "human-and-codex-approved"]},
+    "corrections": {"type": ["string", "null"]},
+    "tests": {"type": "array", "items": {"type": "object"}},
+    "project_consent": {"const": true},
+    "isolation_scope": {"enum": ["project-only", "shareable-sanitized"]},
+    "final_outcome": {"type": "string"}
+  }
+}

@@ -1,0 +1,31 @@
+# Local state and secrets
+.env
+.env.*
+!.env.example
+*.secret
+*.pem
+*.key
+backups/
+.local/
+
+# Runtime output: schemas/examples are versioned, machine runs are not.
+telemetry/runs/*.jsonl
+telemetry/errors/*.jsonl
+benchmarks/results/*.json
+benchmarks/results/*.jsonl
+evals/results/*.jsonl
+datasets/accepted/*.jsonl
+datasets/rejected/*.jsonl
+!telemetry/runs/.gitkeep
+!telemetry/errors/.gitkeep
+!benchmarks/results/.gitkeep
+!evals/results/.gitkeep
+!datasets/accepted/.gitkeep
+!datasets/rejected/.gitkeep
+
+# Tooling artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.tmp
+*.log

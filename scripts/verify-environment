@@ -1,0 +1,63 @@
+#!/usr/bin/env python3
+"""Read-only environment and repository validation."""
+
+from __future__ import annotations
+
+import json
+import pathlib
+import shutil
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts/common"))
+import infra  # noqa: E402
+
+
+def version(command: list[str]) -> str:
+    executable = shutil.which(command[0])
+    if not executable:
+        return "UNAVAILABLE"
+    result = subprocess.run(command, capture_output=True, text=True)
+    text = (result.stdout or result.stderr).strip().splitlines()
+    return text[0] if result.returncode == 0 and text else "UNAVAILABLE"
+
+
+def main() -> int:
+    failures = []
+    for path in sorted(infra.PROFILE_DIR.glob("*.yaml")):
+        try:
+            infra.load_profile(path.stem)
+            print(f"PASS profile {path.stem}")
+        except infra.InfraError as exc:
+            failures.append(str(exc))
+    for relative in ("models/registry.yaml", "hardware/current-machine.yaml", "telemetry/schemas/ai-run.schema.json",
+                     "telemetry/schemas/error-event.schema.json", "datasets/schemas/accepted-task.schema.json"):
+        try:
+            infra.load_json(ROOT / relative)
+            print(f"PASS syntax {relative}")
+        except infra.InfraError as exc:
+            failures.append(str(exc))
+    for name, command in {
+        "python": ["python3", "--version"], "ollama": ["ollama", "--version"],
+        "qwen": ["qwen", "--version"], "node": ["node", "--version"], "npm": ["npm", "--version"],
+        "dotnet": ["dotnet", "--version"],
+    }.items():
+        print(f"{name}: {version(command)}")
+    endpoint = "http://127.0.0.1:11434/api/tags"
+    try:
+        with urllib.request.urlopen(endpoint, timeout=3) as response:
+            print(f"Ollama health: HTTP {response.status}")
+    except (urllib.error.URLError, TimeoutError) as exc:
+        failures.append(f"Ollama health unavailable: {exc}")
+    if failures:
+        for failure in failures:
+            print(f"FAIL {failure}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

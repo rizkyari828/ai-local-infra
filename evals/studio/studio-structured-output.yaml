@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "id": "studio-structured-output",
+  "version": "0.1.0",
+  "task_type": "strict-structured-output",
+  "prompt": "Return one JSON object only. Create a generic local-AI tutorial idea with non-empty string fields: title, hook, summary, angle, targetAudience, suggestedFormat. Do not include markdown.",
+  "assertions": {"valid_json": true, "required_keys": ["title", "hook", "summary", "angle", "targetAudience", "suggestedFormat"]},
+  "notes": "Represents the shape of strict idea-generation output without project implementation details."
+}
