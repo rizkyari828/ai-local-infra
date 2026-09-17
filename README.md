@@ -121,6 +121,10 @@ Stable operating rules for this solution live in [`AGENTS.md`](AGENTS.md). Task
 prompts can stay minimal by following
 [`docs/AGENT_TASK_TEMPLATE.md`](docs/AGENT_TASK_TEMPLATE.md).
 
+For the local Qwen Code developer runtime — measured performance, verified
+settings, diagnosed bottlenecks, and the recommended workflow — see
+[`docs/QWEN_WORKFLOW.md`](docs/QWEN_WORKFLOW.md).
+
 ## Why files only?
 
 One WSL2 workstation and one substantial GPU workload at a time do not justify PostgreSQL, Redis, a vector database, HTTP service, dashboard, or scheduler. JSON/JSONL keeps v0.1 inspectable, portable, and easy to replace when evidence supports a larger system.
