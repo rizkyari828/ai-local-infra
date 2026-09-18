@@ -570,7 +570,8 @@ class EscalationCliTests(unittest.TestCase):
             result = self._run("--provider", "fake", "--prompt", "hello", "--confirm-run",
                                "--escalate", "--escalation-mode", "automatic", "--hosted",
                                "--json", "--span-output", str(base / "spans.jsonl"),
-                               "--escalation-output", str(base / "escalations.jsonl"))
+                               "--escalation-output", str(base / "escalations.jsonl"),
+                               "--outcome-output", str(base / "outcomes.jsonl"))
             self.assertEqual(0, result.returncode, result.stderr)
             payload = json.loads(result.stdout)
             self.assertEqual("succeeded", payload["result"]["status"])

@@ -133,6 +133,38 @@ blocked (`hosted_secret_detected`) and nothing is sent. Only the task prompt is
 forwarded; environment variables, credentials, telemetry payloads, and unrelated
 repository content are never attached. No new DLP system is added.
 
+## Shared escalation context pack (v1)
+
+Escalation carries a **provider-neutral context pack** so distilled task state can
+move between providers/models without copying a conversation or any provider's
+prompt/KV cache. Provider caches remain provider-specific; only the summarized
+state is shared.
+
+- Module: `scripts/common/context_pack.py` (stdlib only, `ContextPack`).
+- Stored in the *existing* escalation telemetry row as the optional
+  `context_pack` object (schema `1.2.0`); no new store, database, or file.
+- Fields: goal, task type, current state, relevant files, constraints, attempts,
+  failure category/summary, failed tests, evidence/observations, relevant
+  lessons, recommended next action, and source provider/model/variant. All are
+  optional except goal.
+- `render_context_pack` is deterministic and deterministic-first: stable sections
+  (goal, constraints, lessons, files, state) precede volatile ones (attempts,
+  failure, tests, next action), with no ids or timestamps, so each provider can
+  build its own cache from the same text.
+- Growth is bounded: list fields keep the most recent unique entries and free
+  text is truncated. No tokenizer is added.
+- Security: only concise factual summaries are stored. Chain-of-thought, full
+  prompts, full responses, source contents, and credentials are rejected by the
+  existing secret guard before persistence or transmission.
+- Learning stays separate: the pack may reference lessons selected from existing
+  reviewed learning candidates (`select_lessons`), but it never writes to or
+  duplicates the learning store. New candidates still use the existing pipeline.
+
+`maybe_escalate` builds/updates the pack from the failed student result, attaches
+it to the escalation row, and appends the rendered pack to the teacher prompt. It
+returns the updated pack (`EscalationOutcome.context_pack`) so a later hop can
+accumulate evidence instead of starting over.
+
 ## Learning attribution safety
 
 Escalation is recorded through the existing escalation schema with
@@ -164,7 +196,11 @@ normalization, missing key, token metadata present/missing, timeout/failure,
 cancellation, hosted secret protection, disabled/blocked/manual/automatic
 policy, non-eligible failures, depth and cancellation protection, remaining
 budget, both teacher outcomes, escalation telemetry, and learning attribution.
-An opt-in live smoke test runs only with `LAI_DEEPSEEK_INTEGRATION=1`. It sends
+`tests/test_context_pack.py` adds focused pack tests: minimal creation, LOW ->
+HIGH handoff, accumulation after another failure, bounded/deduplicated growth,
+deterministic stable-first rendering, filenames without source contents, failure
+and test summaries, learning references, optional/missing fields, and secret
+rejection. An opt-in live smoke test runs only with `LAI_DEEPSEEK_INTEGRATION=1`. It sends
 one tiny prompt (`Reply with the single word READY.`) with a bounded
 `max_tokens` (reasoning consumes output tokens before the answer, so the cap must
 leave room for a short reply), prints only the provider-reported model/token

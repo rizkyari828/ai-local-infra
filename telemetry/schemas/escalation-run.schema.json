@@ -7,7 +7,7 @@
   "additionalProperties": false,
   "required": ["schema_version", "run_id", "event_id", "timestamp_utc", "task_class", "student_model", "student_outcome"],
   "properties": {
-    "schema_version": {"enum": ["1.0.0", "1.1.0"]},
+    "schema_version": {"enum": ["1.0.0", "1.1.0", "1.2.0"]},
     "run_id": {"type": "string", "format": "uuid"},
     "event_id": {"type": "string", "format": "uuid"},
     "timestamp_utc": {"type": "string", "format": "date-time"},
@@ -37,6 +37,32 @@
     "estimated_cost_usd": {"type": ["number", "null"], "minimum": 0},
     "pricing_source": {"type": ["string", "null"]},
     "recorded_by": {"type": ["string", "null"]},
-    "sanitized_note": {"type": ["string", "null"]}
+    "sanitized_note": {"type": ["string", "null"]},
+    "context_pack": {
+      "type": ["object", "null"],
+      "description": "Optional provider-neutral shared escalation context pack (schema scripts/common/context_pack.py). Distilled task state only: no prompts, chain-of-thought, source contents, or credentials. Schema 1.2.0 adds this null-capable column; 1.0.0/1.1.0 rows remain valid.",
+      "additionalProperties": false,
+      "required": ["context_pack_version", "goal"],
+      "properties": {
+        "context_pack_version": {"const": "1.0.0"},
+        "goal": {"type": "string"},
+        "task_type": {"type": ["string", "null"]},
+        "current_state": {"type": ["string", "null"]},
+        "relevant_files": {"type": "array", "items": {"type": "string"}},
+        "constraints": {"type": "array", "items": {"type": "string"}},
+        "changes_attempted": {"type": "array", "items": {"type": "string"}},
+        "approaches_tried": {"type": "array", "items": {"type": "string"}},
+        "failure_category": {"type": ["string", "null"]},
+        "error_summary": {"type": ["string", "null"]},
+        "failed_tests": {"type": "array", "items": {"type": "string"}},
+        "test_results": {"type": "array", "items": {"type": "string"}},
+        "observations": {"type": "array", "items": {"type": "string"}},
+        "lessons": {"type": "array", "items": {"type": "string"}},
+        "recommended_next_action": {"type": ["string", "null"]},
+        "source_provider": {"type": ["string", "null"]},
+        "source_model": {"type": ["string", "null"]},
+        "source_variant": {"type": ["string", "null"]}
+      }
+    }
   }
 }

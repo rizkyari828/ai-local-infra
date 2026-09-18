@@ -24,10 +24,11 @@ import hashlib
 import pathlib
 import re
 import uuid
-from typing import Any
+from typing import Any, Optional
 
 import infra
 import learning
+import pricing
 
 SPAN_SCHEMA_VERSION = "1.0.0"
 
@@ -130,6 +131,43 @@ AI_RUN_FIELDS = AI_RUN_REQUIRED + (
 
 AI_RUN_STATUSES = ("started", "succeeded", "failed", "cancelled", "unknown")
 REVIEW_STATUSES = ("unreviewed", "accepted", "rejected", "needs-review")
+
+# One compact outcome record per completed task. It aggregates the existing
+# runtime results and escalation outcome for a trace; it is metadata only and
+# never stores prompts, responses, source, reasoning, or credentials.
+TASK_OUTCOME_SCHEMA_VERSION = "1.0.0"
+TASK_OUTCOME_STATUSES = ("succeeded", "failed", "cancelled", "unknown")
+TASK_OUTCOME_REQUIRED = ("schema_version", "task_id", "event_id", "completed_at")
+TASK_OUTCOME_FIELDS = TASK_OUTCOME_REQUIRED + (
+    "started_at",
+    "run_id",
+    "task_type",
+    "status",
+    "success",
+    "tests_passed",
+    "escalated",
+    "escalation_count",
+    "attempt_count",
+    "initial_provider",
+    "initial_model",
+    "initial_variant",
+    "final_provider",
+    "final_model",
+    "final_variant",
+    "total_latency_ms",
+    "provider_reported_cost",
+    "estimated_total_cost",
+    "pricing_currency",
+    "error_category",
+    "error_code",
+)
+_TASK_OUTCOME_BOOL_FIELDS = ("success", "tests_passed", "escalated")
+_TASK_OUTCOME_NON_NEGATIVE_INT_FIELDS = ("escalation_count", "attempt_count")
+_TASK_OUTCOME_NON_NEGATIVE_NUMBER_FIELDS = (
+    "total_latency_ms",
+    "provider_reported_cost",
+    "estimated_total_cost",
+)
 
 # OpenCode `stats --json` aggregate rows, normalized into the same usage
 # vocabulary as runtime spans. OpenCode's ``tokens.input`` is the *uncached*
@@ -505,6 +543,33 @@ def validate_opencode_stats_event(record: dict[str, Any]) -> dict[str, Any]:
     return record
 
 
+def validate_task_outcome(record: dict[str, Any]) -> dict[str, Any]:
+    """Validate one completed-task outcome event before it is persisted."""
+    if not isinstance(record, dict):
+        raise infra.InfraError("Task outcome record must be an object")
+    _reject_unknown(record, TASK_OUTCOME_FIELDS, "Task outcome record")
+    _require(record, TASK_OUTCOME_REQUIRED, "Task outcome record")
+    if record["schema_version"] != TASK_OUTCOME_SCHEMA_VERSION:
+        raise infra.InfraError("Unsupported task outcome schema_version")
+    _reject_secrets(record, "Task outcome record")
+    for field in ("task_id", "event_id", "run_id"):
+        _check_uuid(record.get(field), f"Task outcome record {field}")
+    _check_timestamp(record.get("completed_at"), "Task outcome record completed_at")
+    if record.get("started_at") is not None:
+        _check_timestamp(record.get("started_at"), "Task outcome record started_at")
+    _check_enum(record.get("status"), TASK_OUTCOME_STATUSES, "status")
+    _check_enum(record.get("error_category"), RUNTIME_ERROR_CATEGORIES, "error_category")
+    for field in _TASK_OUTCOME_BOOL_FIELDS:
+        _check_bool(record.get(field), field)
+    for field in _TASK_OUTCOME_NON_NEGATIVE_INT_FIELDS:
+        _check_non_negative(record.get(field), field, integer=True)
+    for field in _TASK_OUTCOME_NON_NEGATIVE_NUMBER_FIELDS:
+        _check_non_negative(record.get(field), field, integer=False)
+    if record.get("escalated") is False and record.get("escalation_count") not in (None, 0):
+        raise infra.InfraError("Task outcome escalation_count must be 0 when escalated is false")
+    return record
+
+
 def _dedupe_spans(spans: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
     """Drop duplicate span_ids (for example from an accidental double append)."""
     seen: set[str] = set()
@@ -659,6 +724,239 @@ def summarize_opencode_usage(records: list[dict[str, Any]]) -> dict[str, Any]:
         "cache_hit_ratio": overall["cache_hit_ratio"],
         "provider_reported_cost": overall["provider_reported_cost"],
         "by_provider_model_variant": breakdown,
+    }
+
+
+def _outcome_attr(obj: Any, name: str) -> Any:
+    return getattr(obj, name, None) if obj is not None else None
+
+
+def _outcome_int(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _outcome_number(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return value
+
+
+def _sum_if_all_known(values: list) -> float | None:
+    """Sum values only when every component is known; never invent a partial total."""
+    total = 0.0
+    for value in values:
+        if value is None:
+            return None
+        total += value
+    return round(total, 8)
+
+
+def _outcome_mean(total: float | None, denominator: int, digits: int = 6) -> float | None:
+    if total is None or denominator <= 0:
+        return None
+    return round(total / denominator, digits)
+
+
+def _result_estimated_cost(result: Any, pricing_config: dict) -> dict:
+    if result is None:
+        return pricing.empty_cost()
+    return pricing.estimate_usage_cost(
+        _outcome_attr(result, "provider"),
+        _outcome_attr(result, "model"),
+        input_tokens=_outcome_attr(result, "input_tokens"),
+        cached_input_tokens=_outcome_attr(result, "cached_input_tokens"),
+        cache_miss_tokens=_outcome_attr(result, "cache_miss_tokens"),
+        output_tokens=_outcome_attr(result, "output_tokens"),
+        pricing=pricing_config,
+    )
+
+
+def build_task_outcome(
+    student_result: Any,
+    *,
+    escalation: Any = None,
+    task_id: Optional[str] = None,
+    task_type: Optional[str] = None,
+    tests_passed: Optional[bool] = None,
+    started_at: Optional[str] = None,
+    completed_at: Optional[str] = None,
+    initial_variant: Optional[str] = None,
+    final_variant: Optional[str] = None,
+    provider_reported_cost: Optional[float] = None,
+    pricing_config: Optional[dict] = None,
+    event_id: Optional[str] = None,
+    success_known: bool = True,
+) -> dict[str, Any]:
+    """Build one task outcome from the runtime result and optional escalation.
+
+    Success is taken from the final runtime result's ``status`` (the teacher
+    result when the task escalated and the teacher ran, otherwise the student
+    result); ``tests_passed`` is only what the caller already knows and is never
+    inferred from model text. Costs reuse ``pricing.estimate_usage_cost`` per
+    attempt and are summed only when every attempt cost is known. Unknown values
+    stay ``None``.
+
+    ``success_known=False`` keeps ``status`` (execution state) but leaves
+    ``success``/``error_category``/``error_code`` ``None``. Callers use it when
+    the source only proves execution completion, not semantic task success.
+    """
+    teacher_result = _outcome_attr(escalation, "teacher_result")
+    escalated = bool(_outcome_attr(escalation, "escalated"))
+    uses_teacher = escalated and teacher_result is not None
+    final_result = teacher_result if uses_teacher else student_result
+
+    resolved_task_id = task_id or _outcome_attr(student_result, "trace_id") or _outcome_attr(escalation, "trace_id")
+    if not isinstance(resolved_task_id, str) or not resolved_task_id:
+        raise infra.InfraError("Task outcome requires a task_id (trace_id)")
+
+    status = _outcome_attr(final_result, "status")
+    if status not in ("succeeded", "failed", "cancelled"):
+        status = "unknown"
+    if success_known:
+        success = None if status == "unknown" else status == "succeeded"
+    else:
+        success = None
+
+    student_attempts = _outcome_int(_outcome_attr(student_result, "attempts"))
+    attempt_count = student_attempts
+    if uses_teacher and student_attempts is not None:
+        teacher_attempts = _outcome_int(_outcome_attr(teacher_result, "attempts"))
+        attempt_count = None if teacher_attempts is None else student_attempts + teacher_attempts
+
+    latencies = [_outcome_number(_outcome_attr(student_result, "duration_ms"))]
+    if uses_teacher:
+        latencies.append(_outcome_number(_outcome_attr(teacher_result, "duration_ms")))
+    total_latency_ms = _sum_if_all_known(latencies)
+
+    resolved_pricing = pricing_config if pricing_config is not None else pricing.load_pricing()
+    student_cost = _result_estimated_cost(student_result, resolved_pricing)
+    teacher_cost = _result_estimated_cost(teacher_result, resolved_pricing) if uses_teacher else None
+    cost_parts = [student_cost["estimated_total_cost"]]
+    if uses_teacher:
+        cost_parts.append(teacher_cost["estimated_total_cost"])
+    estimated_total_cost = _sum_if_all_known(cost_parts)
+    currency = student_cost.get("pricing_currency") or (teacher_cost or {}).get("pricing_currency")
+
+    if initial_variant is None:
+        initial_variant = _outcome_attr(_outcome_attr(escalation, "context_pack"), "source_variant")
+
+    record = {
+        "schema_version": TASK_OUTCOME_SCHEMA_VERSION,
+        "task_id": resolved_task_id,
+        "event_id": event_id or str(uuid.uuid4()),
+        "completed_at": completed_at or infra.utc_now(),
+        "started_at": started_at,
+        "run_id": _outcome_attr(final_result, "run_id"),
+        "task_type": task_type,
+        "status": status,
+        "success": success,
+        "tests_passed": tests_passed,
+        "escalated": escalated,
+        "escalation_count": 1 if escalated else 0,
+        "attempt_count": attempt_count,
+        "initial_provider": _outcome_attr(student_result, "provider"),
+        "initial_model": _outcome_attr(student_result, "model"),
+        "initial_variant": initial_variant,
+        "final_provider": _outcome_attr(final_result, "provider"),
+        "final_model": _outcome_attr(final_result, "model"),
+        "final_variant": final_variant,
+        "total_latency_ms": total_latency_ms,
+        "provider_reported_cost": provider_reported_cost,
+        "estimated_total_cost": estimated_total_cost,
+        "pricing_currency": currency,
+        "error_category": None if (success or not success_known) else _outcome_attr(final_result, "error_category"),
+        "error_code": None if (success or not success_known) else _outcome_attr(final_result, "error_code"),
+    }
+    return validate_task_outcome(record)
+
+
+def dedupe_task_outcomes(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep the latest outcome per ``task_id`` so repeated recording stays idempotent.
+
+    Files stay append-only; like the span and OpenCode aggregators, duplicates
+    are collapsed at read time rather than rewritten on disk.
+    """
+    latest: dict[str, dict[str, Any]] = {}
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        task_id = record.get("task_id")
+        if not isinstance(task_id, str) or not task_id:
+            continue
+        latest[task_id] = record
+    return list(latest.values())
+
+
+def _rate(numerator: int, denominator: int) -> float | None:
+    return (numerator / denominator) if denominator else None
+
+
+def _task_outcome_group(records: list[dict[str, Any]]) -> dict[str, Any]:
+    tasks = len(records)
+    known_success = [record for record in records if isinstance(record.get("success"), bool)]
+    succeeded = sum(1 for record in records if record.get("success") is True)
+    escalated = sum(1 for record in records if record.get("escalated") is True)
+    attempts = [record["attempt_count"] for record in records if _known_int(record.get("attempt_count"))]
+    latencies = [record["total_latency_ms"] for record in records
+                 if _known_number(record.get("total_latency_ms"))]
+    costs = [record["estimated_total_cost"] for record in records
+             if _known_number(record.get("estimated_total_cost"))]
+    success_costs = [record["estimated_total_cost"] for record in records
+                     if record.get("success") is True and _known_number(record.get("estimated_total_cost"))]
+    return {
+        "tasks": tasks,
+        "succeeded": succeeded,
+        "tasks_with_known_success": len(known_success),
+        "escalated": escalated,
+        "success_rate": _rate(succeeded, len(known_success)),
+        "escalation_rate": _rate(escalated, tasks),
+        "tasks_with_known_attempts": len(attempts),
+        "avg_attempts": _outcome_mean(sum(attempts), len(attempts), 3),
+        "tasks_with_known_latency": len(latencies),
+        "avg_latency_ms": _outcome_mean(sum(latencies), len(latencies), 3),
+        "tasks_with_known_cost": len(costs),
+        "avg_cost_per_task": _outcome_mean(sum(costs), len(costs)),
+        "successful_tasks_with_known_cost": len(success_costs),
+        "avg_cost_per_successful_task": _outcome_mean(sum(success_costs), len(success_costs)),
+    }
+
+
+def summarize_task_outcomes(records: list[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate one outcome per task into success/escalation/latency/cost metrics.
+
+    Unknown values are excluded from the averages that need them rather than
+    treated as zero; rates are ``None`` when their denominator is empty.
+    """
+    unique = dedupe_task_outcomes(records)
+    overall = _task_outcome_group(unique)
+    model_keys = sorted(
+        {(record.get("final_provider"), record.get("final_model"), record.get("final_variant"))
+         for record in unique},
+        key=lambda key: tuple(str(part) for part in key),
+    )
+    by_model: list[dict[str, Any]] = []
+    for key in model_keys:
+        group = _task_outcome_group([
+            record for record in unique
+            if (record.get("final_provider"), record.get("final_model"), record.get("final_variant")) == key
+        ])
+        group.update({"provider": key[0], "model": key[1], "variant": key[2]})
+        by_model.append(group)
+    task_types = sorted({record.get("task_type") for record in unique}, key=lambda value: str(value))
+    by_task_type: list[dict[str, Any]] = []
+    for task_type in task_types:
+        group = _task_outcome_group([record for record in unique if record.get("task_type") == task_type])
+        group["task_type"] = task_type
+        by_task_type.append(group)
+    return {
+        "record_count": len(records),
+        "duplicate_count": max(0, len(records) - len(unique)),
+        "task_count": len(unique),
+        **overall,
+        "by_final_provider_model_variant": by_model,
+        "by_task_type": by_task_type,
     }
 
 

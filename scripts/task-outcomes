@@ -1,0 +1,86 @@
+#!/usr/bin/env python3
+"""Aggregate completed-task outcomes from local JSONL telemetry.
+
+Read-only. Local JSONL only; no database, network, dashboard, or analytics
+service. One task is one trace_id; duplicate rows collapse to the latest so
+repeated recording stays idempotent. Unknown values are reported as unknown and
+are never counted as success or zero cost.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import pathlib
+import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "common"))
+import infra  # noqa: E402
+import learning  # noqa: E402
+import telemetry  # noqa: E402
+
+
+def _percent(value: object) -> str:
+    return "unknown" if value is None else f"{value * 100:.1f}%"
+
+
+def _number(value: object, digits: int = 2) -> str:
+    return "unknown" if value is None else f"{value:.{digits}f}"
+
+
+def _print_group(label: str, group: dict) -> None:
+    print(label)
+    print(f"  tasks             {group['tasks']} (succeeded: {group['succeeded']}, escalated: {group['escalated']})")
+    print(f"  success rate      {_percent(group['success_rate'])} "
+          f"(known: {group['tasks_with_known_success']}/{group['tasks']})")
+    print(f"  escalation rate   {_percent(group['escalation_rate'])}")
+    print(f"  avg attempts      {_number(group['avg_attempts'])} "
+          f"(known: {group['tasks_with_known_attempts']}/{group['tasks']})")
+    print(f"  avg latency ms    {_number(group['avg_latency_ms'], 0)} "
+          f"(known: {group['tasks_with_known_latency']}/{group['tasks']})")
+    print(f"  avg cost / task   {_number(group['avg_cost_per_task'], 6)} "
+          f"(known: {group['tasks_with_known_cost']}/{group['tasks']})")
+    print(f"  avg cost / success {_number(group['avg_cost_per_successful_task'], 6)} "
+          f"(known: {group['successful_tasks_with_known_cost']}/{group['succeeded']})")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--input", type=pathlib.Path, action="append", dest="inputs",
+                        help="Outcome JSONL; repeatable (default: telemetry/outcomes/runs.jsonl)")
+    parser.add_argument("--json", action="store_true", help="Emit the metric object only")
+    args = parser.parse_args()
+    inputs = args.inputs or [infra.ROOT / "telemetry/outcomes/runs.jsonl"]
+    records: list[dict] = []
+    for path in inputs:
+        if not path.exists():
+            if args.inputs:
+                print(f"error: missing outcome file: {path}", file=sys.stderr)
+                return 1
+            continue
+        try:
+            records.extend(learning.load_jsonl(path))
+        except infra.InfraError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+    metrics = telemetry.summarize_task_outcomes(records)
+    if args.json:
+        print(json.dumps(metrics, indent=2))
+        return 0
+    print("Task Outcome Metrics")
+    print("--------------------")
+    print(f"records: {metrics['record_count']} (duplicates: {metrics['duplicate_count']})")
+    _print_group("overall", metrics)
+    if not metrics["by_final_provider_model_variant"]:
+        print("\nno task outcomes found")
+    for group in metrics["by_final_provider_model_variant"]:
+        label = (f"\n{group['provider'] or 'unknown'} / {group['model'] or 'unknown'}"
+                 f"#{group['variant'] or 'default'}")
+        _print_group(label, group)
+    for group in metrics["by_task_type"]:
+        _print_group(f"\ntask_type={group['task_type'] or 'unknown'}", group)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

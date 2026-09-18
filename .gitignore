@@ -14,6 +14,7 @@ telemetry/errors/*.jsonl
 telemetry/escalations/*.jsonl
 telemetry/spans/*.jsonl
 telemetry/opencode/*.jsonl
+telemetry/outcomes/*.jsonl
 benchmarks/results/*.json
 benchmarks/results/*.jsonl
 evals/results/*.jsonl
@@ -25,6 +26,7 @@ datasets/candidates/*.jsonl
 !telemetry/escalations/.gitkeep
 !telemetry/spans/.gitkeep
 !telemetry/opencode/.gitkeep
+!telemetry/outcomes/.gitkeep
 !benchmarks/results/.gitkeep
 !evals/results/.gitkeep
 !datasets/accepted/.gitkeep

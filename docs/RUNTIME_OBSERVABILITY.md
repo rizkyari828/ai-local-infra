@@ -76,6 +76,90 @@ For cross-trace provider usage, cache effectiveness, latency, and estimated cost
 the read-only `./scripts/cache-metrics` report (see
 [Provider usage and cache telemetry](CACHE_TELEMETRY.md)).
 
+## Task outcome
+
+Schema: [`../telemetry/schemas/task-outcome.schema.json`](../telemetry/schemas/task-outcome.schema.json).
+One compact row per completed task, written by `scripts/agent-run` and, for one-shot
+`oc run`, by `scripts/record-opencode-outcome`, to
+`telemetry/outcomes/runs.jsonl` (append-only, ignored by Git; `--outcome-output`
+redirects it). It aggregates the runtime result and, when present, the escalation
+outcome for the same `trace_id`; it is metadata only.
+
+- Identity: `task_id` (the `trace_id`, the dedupe key) and `run_id` of the run that
+  finished the task.
+- Providers: `initial_*` describe the attempt that started the task; `final_*`
+  describe the result that ended it (the teacher when an escalation ran, otherwise
+  the student). Variants are best-effort and stay `null` when unknown.
+- Outcome: `status`, `success`, `tests_passed`, `escalated`, `escalation_count`,
+  `attempt_count`, `error_category`/`error_code`, `started_at`/`completed_at`, and
+  `total_latency_ms`.
+- Cost: `estimated_total_cost` sums each attempt's locally estimated cost
+  (`pricing.estimate_usage_cost`, the same normalization spans use) and stays
+  `null` unless every attempt cost is known. `provider_reported_cost` is separate
+  and usually `null` for runtime-driven tasks.
+
+Success semantics (never inferred from model text):
+
+- `success` is `true` only when the final runtime result's `status` is `succeeded`
+  (the teacher result when escalation ran, otherwise the student result);
+  `failed`/`cancelled` are `false`, and an unknown status is `null`.
+- `tests_passed` is only what the caller already passed in; the runtime does not
+  parse output or run tests to populate it, so it is normally `null`.
+- `escalated`/`escalation_count` reuse the existing escalation outcome; failed,
+  blocked, and non-escalated tasks keep the student as the final provider.
+
+Idempotency: files are append-only and duplicate `task_id` rows collapse to the
+latest at read time, matching the span and OpenCode aggregators, so re-recording a
+task never double-counts.
+
+Report:
+
+```bash
+./scripts/task-outcomes
+./scripts/task-outcomes --json
+./scripts/task-outcomes --input telemetry/outcomes/runs.jsonl
+```
+
+It reports task count, success rate, escalation rate, average attempts, average
+latency, average cost per task, and average cost per successful task, broken down
+by final provider/model/variant and by task type. Unknown values are excluded from
+rates and averages that need them; rates are `null` when their denominator is empty,
+so an unknown `success` is never reported as a failure.
+
+## OpenCode one-shot outcomes
+
+The user-level `oc` wrapper auto-starts the gateway, imports OpenCode's aggregate
+stats, and — for a one-shot `oc run ...` only — calls
+`scripts/record-opencode-outcome` to append a Task Outcome V1 row. Interactive `oc`
+is **not** finalized: a whole interactive session is not one task. The bridge reads
+only structured session metadata from the OpenCode CLI; it never reads or stores
+prompts, titles, messages, responses, source, or credentials.
+
+OpenCode v2.0.x exposes execution status, not semantic task success, so the bridge
+never invents success:
+
+- Identity: the OpenCode session id, mapped to a deterministic UUIDv5
+  (`opencode:session:<id>`) to satisfy the existing UUID `task_id` contract and make
+  repeated finalization idempotent (a `task_id` already present is skipped). The raw
+  session id is not stored.
+- Execution state: `status` maps OpenCode's idle outcome
+  (`succeeded`/`failed`/`interrupted`) to `succeeded`/`failed`/`cancelled`; a missing
+  or unfamiliar outcome stays `unknown`.
+- `success` is **always `null`** (execution completion is not task success), and
+  `tests_passed` stays `null` because no per-run structured test signal exists.
+  `error_category`/`error_code` stay `null` too.
+- Providers: `initial_*`/`final_*` come from the session's model
+  (`providerID`/`modelID`/`variant`); `provider_reported_cost` is OpenCode's own
+  session cost. `estimated_total_cost` uses the shared pricing file only when a
+  price is configured, and stays `null` otherwise (no double counting).
+- `total_latency_ms` uses the session's `idle`/`updated` minus `created`; attempts,
+  run id, task type, and escalation stay `null`/`false`.
+
+This is the smallest reliable bridge: no OpenCode plugin, no second gateway, no
+database or daemon, no model-output sentinel, and no routing change. Correlating an
+outcome row to gateway inference spans is not done in V1 because OpenCode sends no
+UUID session correlation header, so those links stay `null`.
+
 ## Limits policy
 
 One place for conservative defaults: [`../config/limits.yaml`](../config/limits.yaml).

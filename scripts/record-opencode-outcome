@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+"""Record one OpenCode task outcome for a finished one-shot ``oc run``.
+
+Best-effort and privacy-preserving: it reads only structured session metadata
+through the OpenCode CLI, never prompts, titles, messages, or responses. It is
+called by the user-level ``oc`` wrapper after a ``run`` invocation; interactive
+sessions are deliberately not finalized because a whole interactive session is
+not one task.
+
+Identity is the OpenCode session id, mapped to a deterministic UUID by
+``opencode_outcome.task_id_for_session``. ``success`` is always ``null``: OpenCode
+exposes execution status, not semantic task success. Appending is idempotent per
+``task_id`` so repeated finalization never writes a duplicate row.
+
+Usage:
+    ./scripts/record-opencode-outcome --boundary run --since-ms 1789744015000
+    ./scripts/record-opencode-outcome --boundary run --since-ms <ms> --json
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import pathlib
+import subprocess
+import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "common"))
+import infra  # noqa: E402
+import learning  # noqa: E402
+import opencode_outcome  # noqa: E402
+
+DEFAULT_OUTPUT = infra.ROOT / "telemetry/outcomes/runs.jsonl"
+LIST_KEYS = ("data", "sessions", "items", "rows")
+
+
+def _run_json(command: list[str]):
+    try:
+        proc = subprocess.run(command, capture_output=True, text=True)
+    except (FileNotFoundError, OSError):
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        return json.loads(proc.stdout)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def list_sessions(opencode_path: str) -> list[dict]:
+    payload = _run_json([opencode_path, "session", "list", "--format", "json"])
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    if isinstance(payload, dict):
+        for key in LIST_KEYS:
+            value = payload.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+    return []
+
+
+def get_session(opencode_path: str, session_id: str):
+    payload = _run_json([opencode_path, "api", "session.get", "--param", f"sessionID={session_id}"])
+    if isinstance(payload, dict):
+        data = payload.get("data")
+        if isinstance(data, dict):
+            return data
+        if isinstance(payload.get("id"), str):
+            return payload
+    return None
+
+
+def _existing_task_ids(path: pathlib.Path) -> set:
+    if not path.exists():
+        return set()
+    try:
+        records = learning.load_jsonl(path)
+    except infra.InfraError:
+        return set()
+    return {record.get("task_id") for record in records
+            if isinstance(record, dict) and record.get("task_id")}
+
+
+def record(
+    *,
+    boundary: str,
+    since_ms: int,
+    directory: str,
+    output: pathlib.Path,
+    opencode_path: str = "opencode",
+    list_fn=list_sessions,
+    get_fn=get_session,
+) -> dict:
+    """Record the run's session outcome when one can be identified safely."""
+    summary = {"recorded": False, "reason": None, "task_id": None, "output": str(output)}
+    if boundary != "run":
+        summary["reason"] = "interactive sessions are not a task boundary"
+        return summary
+    if not isinstance(since_ms, int) or since_ms <= 0:
+        summary["reason"] = "no run start timestamp; nothing recorded"
+        return summary
+    selected = opencode_outcome.select_session(list_fn(opencode_path), directory, since_ms)
+    if selected is None:
+        summary["reason"] = "no session created by this run; nothing recorded"
+        return summary
+    detail = get_fn(opencode_path, selected["id"])
+    if detail is None:
+        summary["reason"] = "session detail unavailable; nothing recorded"
+        return summary
+    try:
+        record_obj = opencode_outcome.build_outcome(detail, session_id=selected["id"])
+    except infra.InfraError as exc:
+        summary["reason"] = f"session metadata unusable: {exc}"
+        return summary
+    task_id = record_obj["task_id"]
+    summary["task_id"] = task_id
+    if task_id in _existing_task_ids(output):
+        summary["reason"] = "already recorded; skipped"
+        return summary
+    infra.append_jsonl(output, record_obj)
+    summary["recorded"] = True
+    return summary
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--boundary", choices=("run", "interactive"), default="interactive",
+                        help="Task boundary; only 'run' is finalized (default: interactive)")
+    parser.add_argument("--since-ms", type=int, default=0,
+                        help="Unix epoch milliseconds captured before the run started")
+    parser.add_argument("--directory", default=os.getcwd(), help="Project directory of the run")
+    parser.add_argument("--opencode-path", default="opencode", help="opencode executable")
+    parser.add_argument("--output", type=pathlib.Path, default=DEFAULT_OUTPUT,
+                        help="Task outcome JSONL destination")
+    parser.add_argument("--json", action="store_true", help="Emit the result summary only")
+    args = parser.parse_args()
+
+    summary = record(
+        boundary=args.boundary,
+        since_ms=args.since_ms,
+        directory=os.path.realpath(args.directory),
+        output=args.output,
+        opencode_path=args.opencode_path,
+    )
+    if args.json:
+        print(json.dumps(summary, indent=2))
+    elif summary["recorded"]:
+        print(f"task outcome recorded for {summary['task_id']} in {summary['output']}")
+    else:
+        print(f"no task outcome recorded: {summary['reason']}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

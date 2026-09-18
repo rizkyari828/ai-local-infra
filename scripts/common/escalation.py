@@ -34,6 +34,12 @@ import pricing
 import providers
 import runtime
 import telemetry
+from context_pack import (
+    ContextPack,
+    build_context_pack,
+    record_attempt,
+    render_context_pack,
+)
 
 # Runtime error category -> learning failure taxonomy. Only model-capability
 # categories are eligible for escalation; the rest map to an environment or
@@ -137,6 +143,7 @@ class EscalationOutcome:
     teacher_run_id: Optional[str] = None
     teacher_result: Optional[Any] = None
     telemetry_written: bool = False
+    context_pack: Optional[ContextPack] = None
 
     def as_dict(self) -> dict:
         teacher = self.teacher_result
@@ -229,6 +236,8 @@ class EscalationController:
         task: runtime.AgentTask,
         student_result: runtime.RuntimeResult,
         task_class: str = "general",
+        context_pack: Optional[ContextPack] = None,
+        source_variant: Optional[str] = None,
     ) -> EscalationOutcome:
         decision = self.policy.evaluate(student_result, session)
         if decision.action != "escalate":
@@ -238,6 +247,30 @@ class EscalationController:
                                                     decision.fallback_provider, decision.failure_category),
                                  session, escalated=False)
         if not _hosted_request_safe(task.prompt):
+            return self._outcome(EscalationDecision(True, "blocked", "hosted_secret_detected",
+                                                    decision.fallback_provider, decision.failure_category),
+                                 session, escalated=False)
+
+        try:
+            pack = context_pack if isinstance(context_pack, ContextPack) else build_context_pack(
+                goal=task.prompt, task_type=task.task_type, limits=self.limits)
+            record_attempt(
+                pack,
+                failure_category=RUNTIME_TO_TAXONOMY.get(student_result.error_category, "unknown"),
+                error_summary=student_result.error_code,
+                current_state="attempt failed: %s" % (student_result.error_code or
+                                                      student_result.error_category or "unknown"),
+                source_provider=student_result.provider,
+                source_model=student_result.model,
+                source_variant=source_variant or _task_variant(task),
+                limits=self.limits,
+            )
+            rendered = render_context_pack(pack)
+        except infra.InfraError:
+            return self._outcome(EscalationDecision(True, "blocked", "hosted_secret_detected",
+                                                    decision.fallback_provider, decision.failure_category),
+                                 session, escalated=False)
+        if not _hosted_request_safe(rendered):
             return self._outcome(EscalationDecision(True, "blocked", "hosted_secret_detected",
                                                     decision.fallback_provider, decision.failure_category),
                                  session, escalated=False)
@@ -252,7 +285,7 @@ class EscalationController:
             clock=self._clock,
         )
         teacher_task = runtime.AgentTask(
-            prompt=task.prompt,
+            prompt="%s\n\n%s" % (task.prompt, rendered),
             trace_id=session.trace_id,
             run_id=child.run_id,
             role=self.role,
@@ -262,7 +295,7 @@ class EscalationController:
             parent_span_id=student_result.span_id,
         )
         teacher_result = teacher_agent.run(teacher_task, session=child)
-        written = self._record_escalation(student_result, teacher_result, session, child, task_class)
+        written = self._record_escalation(student_result, teacher_result, session, child, task_class, pack)
         return EscalationOutcome(
             action="escalate",
             reason="escalated",
@@ -274,6 +307,7 @@ class EscalationController:
             teacher_run_id=child.run_id,
             teacher_result=teacher_result,
             telemetry_written=written,
+            context_pack=pack,
         )
 
     def _outcome(self, decision: EscalationDecision, session: runtime.TaskSession, escalated: bool) -> EscalationOutcome:
@@ -294,6 +328,7 @@ class EscalationController:
         session: runtime.TaskSession,
         child: runtime.TaskSession,
         task_class: str,
+        context_pack: Optional[ContextPack] = None,
     ) -> bool:
         if not self.record_telemetry:
             return False
@@ -306,7 +341,7 @@ class EscalationController:
             output_tokens=teacher_result.output_tokens,
         )
         record = {
-            "schema_version": "1.1.0",
+            "schema_version": "1.2.0",
             "run_id": child.run_id,
             "event_id": str(uuid.uuid4()),
             "timestamp_utc": infra.utc_now(),
@@ -337,6 +372,7 @@ class EscalationController:
             "pricing_source": cost["pricing_profile"],
             "recorded_by": "escalation-controller",
             "sanitized_note": None,
+            "context_pack": context_pack.as_dict() if context_pack is not None else None,
         }
         try:
             learning.validate_escalation_record(record)
@@ -349,3 +385,13 @@ class EscalationController:
 def _hosted_request_safe(prompt: Any) -> bool:
     """Reuse the existing secret guard; do not send credential-like text to a host."""
     return isinstance(prompt, str) and bool(prompt.strip()) and not learning.contains_secret_like(prompt)
+
+
+def _task_variant(task: Any) -> Optional[str]:
+    """Best-effort provenance variant (for example a DeepSeek reasoning profile)."""
+    options = getattr(task, "options", None)
+    if isinstance(options, dict):
+        value = options.get("reasoning_effort")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None

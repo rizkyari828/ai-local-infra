@@ -17,8 +17,10 @@ import uuid
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "common"))
 import escalation  # noqa: E402
+import infra  # noqa: E402
 import providers  # noqa: E402
 import runtime  # noqa: E402
+import telemetry  # noqa: E402
 import tool_runtime  # noqa: E402
 
 
@@ -30,6 +32,24 @@ def _uuid(value: str) -> str:
     return value
 
 
+def _record_task_outcome(args, agent, result, outcome, fallback, started_at) -> None:
+    """Append one compact outcome for the completed task; never affects exit status."""
+    path = args.outcome_output or (infra.ROOT / "telemetry/outcomes/runs.jsonl")
+    try:
+        record = telemetry.build_task_outcome(
+            result,
+            escalation=outcome,
+            task_type=args.task_type,
+            started_at=started_at,
+            initial_variant=getattr(agent.provider, "reasoning_profile", None),
+            final_variant=getattr(fallback, "reasoning_profile", None) if fallback is not None else None,
+            pricing_config=agent.pricing,
+        )
+        infra.append_jsonl(path, record)
+    except (infra.InfraError, OSError):
+        return
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--health", action="store_true", help="Report provider readiness and exit")
@@ -38,6 +58,7 @@ def main() -> int:
     parser.add_argument("--provider", help="Provider name from config/runtime.yaml")
     parser.add_argument("--model", help="Override the configured model")
     parser.add_argument("--role", default="student", choices=("student", "teacher-cheap", "teacher-premium"))
+    parser.add_argument("--task-type", help="Optional task type recorded on the task outcome")
     parser.add_argument("--trace-id", type=_uuid, help="Reuse an existing trace for continuity")
     parser.add_argument("--timeout-seconds", type=float, help="Per-attempt timeout override")
     parser.add_argument("--max-attempts", type=int, help="Bounded attempts for retryable failures")
@@ -51,6 +72,7 @@ def main() -> int:
     parser.add_argument("--hosted", action="store_true", help="Allow hosted execution; may incur provider cost")
     parser.add_argument("--task-class", default="general", help="Escalation telemetry task class")
     parser.add_argument("--escalation-output", type=pathlib.Path, help="Escalation JSONL destination")
+    parser.add_argument("--outcome-output", type=pathlib.Path, help="Task outcome JSONL destination")
     parser.add_argument("--confirm-run", action="store_true", help="Required for execution, not for health")
     parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
     args = parser.parse_args()
@@ -110,12 +132,15 @@ def main() -> int:
         trace_id=args.trace_id,
         model=args.model,
         role=args.role,
+        task_type=args.task_type,
         timeout_seconds=args.timeout_seconds,
         max_attempts=args.max_attempts,
     )
+    started_at = infra.utc_now()
     session = agent.open_session(task)
     result = agent.run(task, session=session)
     outcome = None
+    fallback = None
     if args.escalate:
         policy = escalation.EscalationPolicy.from_config(config)
         policy.enabled = True
@@ -129,6 +154,8 @@ def main() -> int:
             escalation_output=args.escalation_output, role="teacher-cheap",
         )
         outcome = controller.maybe_escalate(session, task, result, task_class=args.task_class)
+
+    _record_task_outcome(args, agent, result, outcome, fallback, started_at)
 
     if args.json:
         payload = result.as_dict()

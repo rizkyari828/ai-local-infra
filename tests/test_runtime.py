@@ -523,9 +523,11 @@ class CliTests(unittest.TestCase):
 
     def test_execute_fake_writes_span(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
-            spans = pathlib.Path(temp) / "spans.jsonl"
+            base = pathlib.Path(temp)
+            spans = base / "spans.jsonl"
             result = self._run("--provider", "fake", "--prompt", "hello", "--confirm-run",
-                               "--json", "--span-output", str(spans))
+                               "--json", "--span-output", str(spans),
+                               "--outcome-output", str(base / "outcomes.jsonl"))
             self.assertEqual(0, result.returncode, result.stderr)
             payload = json.loads(result.stdout)
             self.assertEqual("succeeded", payload["status"])
@@ -540,7 +542,8 @@ class CliTests(unittest.TestCase):
             trace_id = str(uuid.uuid4())
             spans = pathlib.Path(temp) / "spans.jsonl"
             result = self._run("--provider", "fake", "--prompt", "hello", "--confirm-run",
-                               "--trace-id", trace_id, "--json", "--span-output", str(spans))
+                               "--trace-id", trace_id, "--json", "--span-output", str(spans),
+                               "--outcome-output", str(pathlib.Path(temp) / "outcomes.jsonl"))
             self.assertEqual(0, result.returncode, result.stderr)
             self.assertEqual(trace_id, read_spans(spans)[0]["trace_id"])
 

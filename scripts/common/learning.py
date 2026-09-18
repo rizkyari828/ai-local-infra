@@ -100,6 +100,7 @@ ESCALATION_FIELDS = ESCALATION_REQUIRED + (
     "pricing_source",
     "recorded_by",
     "sanitized_note",
+    "context_pack",
 )
 
 _NON_NEGATIVE_INT_FIELDS = (
@@ -216,6 +217,15 @@ def _reject_secrets(record: dict[str, Any], label: str) -> None:
             )
 
 
+def _validate_context_pack(pack: Any) -> None:
+    """Validate an optional nested context pack using its owning module."""
+    if pack is None:
+        return
+    import context_pack as context_pack_module
+
+    context_pack_module.validate_context_pack(pack)
+
+
 def _check_teacher_fields(record: dict[str, Any], label: str) -> None:
     if not any(record.get(field) for field in TEACHER_ATTEMPT_FIELDS):
         return
@@ -240,13 +250,14 @@ def validate_escalation_record(record: dict[str, Any]) -> dict[str, Any]:
         raise infra.InfraError("Escalation record must be an object")
     _reject_unknown(record, ESCALATION_FIELDS, "Escalation record")
     _require(record, ESCALATION_REQUIRED, "Escalation record")
-    if record["schema_version"] not in ("1.0.0", "1.1.0"):
+    if record["schema_version"] not in ("1.0.0", "1.1.0", "1.2.0"):
         raise infra.InfraError("Unsupported escalation schema_version")
     _reject_secrets(record, "Escalation record")
+    _validate_context_pack(record.get("context_pack"))
     for field in ("run_id", "event_id", "parent_run_id", "trace_id"):
         _check_uuid(record.get(field), f"Escalation record {field}")
-    if record["schema_version"] == "1.1.0" and not record.get("trace_id"):
-        raise infra.InfraError("Escalation schema 1.1.0 requires trace_id")
+    if record["schema_version"] in ("1.1.0", "1.2.0") and not record.get("trace_id"):
+        raise infra.InfraError("Escalation schema %s requires trace_id" % record["schema_version"])
     _check_timestamp(record.get("timestamp_utc"), "Escalation record timestamp_utc")
     _check_enum(record.get("student_outcome"), STUDENT_OUTCOMES, "student_outcome")
     _check_enum(record.get("teacher_outcome"), TEACHER_OUTCOMES, "teacher_outcome")
