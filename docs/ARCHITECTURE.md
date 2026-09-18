@@ -24,6 +24,13 @@
   most one Qwen -> DeepSeek hop for classified model-capability failures, keeping
   the original trace and the remaining runtime budget. See
   [Escalation](ESCALATION.md).
+- Inference spans carry normalized provider usage (cache hit/miss, total tokens),
+  a prefix fingerprint, and optional estimated cost from a data-only pricing file.
+  A read-only `cache-metrics` report aggregates cache effectiveness, latency, and
+  cost. This is observability only: no routing, scoring, or cost optimization. See
+  [Provider usage and cache telemetry](CACHE_TELEMETRY.md). `import-opencode-stats`
+  imports OpenCode's own aggregate stats into the same vocabulary without a plugin,
+  database access, or auth change.
 
 No server process exists. Commands are short-lived and state is inspectable. Active application files remain at `~/.qwen/settings.json` and `/etc/systemd/system/ollama.service.d/override.conf`; no symlinks are used.
 

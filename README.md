@@ -62,6 +62,29 @@ runtime bottlenecks measurable instead of guessed:
 See [Runtime observability](docs/RUNTIME_OBSERVABILITY.md) and
 [`telemetry/schemas/span-event.schema.json`](telemetry/schemas/span-event.schema.json).
 
+## Provider usage and cache telemetry
+
+Every inference span now also records normalized provider usage: cache-miss
+tokens, cache hit ratio, total tokens, and estimated cost (from
+[`config/pricing.yaml`](config/pricing.yaml), empty by default so no price is
+invented). A read-only report aggregates it:
+
+```bash
+./scripts/cache-metrics
+./scripts/cache-metrics --json
+```
+
+This is observability only: it does not route, retry, or change escalation. See
+[Provider usage and cache telemetry](docs/CACHE_TELEMETRY.md).
+
+OpenCode's own aggregate stats can be imported into the same vocabulary without
+touching its auth or database:
+
+```bash
+./scripts/import-opencode-stats
+./scripts/cache-metrics
+```
+
 ## Agent runtime v0.1
 
 The minimal runtime executes one local-model task through a provider while
@@ -114,6 +137,25 @@ DeepSeek reads `DEEPSEEK_API_KEY` from the environment only. The escalation keep
 the original `trace_id`, links runs through the existing escalation telemetry,
 inherits the remaining runtime budget, and blocks credential-like prompts. See
 [Escalation](docs/ESCALATION.md).
+
+## Runtime gateway (OpenCode -> Local AI Infra -> DeepSeek)
+
+A transparent OpenAI-compatible pass-through endpoint lets OpenCode keep using
+its own DeepSeek credential while Local AI Infra captures request-level usage.
+It forwards requests and responses unchanged; it never stores or logs the
+credential, and streaming responses are relayed chunk-by-chunk:
+
+```bash
+./scripts/oc-gateway            # listen on 127.0.0.1:8788 -> https://api.deepseek.com
+./scripts/oc-gateway --check    # print effective config
+```
+
+Point OpenCode's DeepSeek provider at it with a single
+`~/.config/opencode/opencode.json` override
+(`providers.deepseek.settings.baseURL = "http://127.0.0.1:8788/v1"`); delete that
+override to roll back. This is routing-free pass-through + telemetry only; the
+`import-opencode-stats` importer stays as the independent aggregate check. See
+[Runtime gateway](docs/RUNTIME_GATEWAY.md).
 
 ## Agent guidance
 

@@ -1,0 +1,81 @@
+#!/usr/bin/env python3
+"""Run the transparent OpenAI-compatible gateway used by OpenCode.
+
+The gateway adds inference telemetry on top of a pass-through to one configured
+upstream (DeepSeek by default). It forwards the caller's Authorization header;
+it never stores or logs credentials. Run it in the foreground, or background it
+for a session:
+
+    ./scripts/oc-gateway
+    ./scripts/oc-gateway --check
+    ./scripts/oc-gateway --upstream-base-url https://api.deepseek.com
+
+Rollback to a direct OpenCode -> DeepSeek path: remove the
+``providers.deepseek.settings.baseURL`` override from
+``~/.config/opencode/opencode.json`` (or set it back to
+``https://api.deepseek.com/v1``) and stop this process. The gateway is then out
+of the request path entirely.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import pathlib
+import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "common"))
+import gateway  # noqa: E402
+
+DEFAULT_UPSTREAM_ENV = "LAI_GATEWAY_UPSTREAM_BASE_URL"
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--host", default=gateway.DEFAULT_HOST, help="Bind address (default: 127.0.0.1)")
+    parser.add_argument("--port", type=int, default=gateway.DEFAULT_PORT, help="Bind port (default: 8788)")
+    parser.add_argument("--upstream-base-url",
+                        default=os.environ.get(DEFAULT_UPSTREAM_ENV) or gateway.DEFAULT_UPSTREAM_BASE_URL,
+                        help="Upstream base URL (default: %s or $%s)" % (gateway.DEFAULT_UPSTREAM_BASE_URL, DEFAULT_UPSTREAM_ENV))
+    parser.add_argument("--provider", default=gateway.DEFAULT_PROVIDER_NAME, help="Provider name recorded in telemetry")
+    parser.add_argument("--role", default=gateway.DEFAULT_ROLE, help="Role recorded in telemetry")
+    parser.add_argument("--timeout-seconds", type=float, default=gateway.DEFAULT_TIMEOUT_SECONDS,
+                        help="Upstream request timeout in seconds (default: 900)")
+    parser.add_argument("--span-output", type=pathlib.Path, help="Span JSONL destination")
+    parser.add_argument("--no-telemetry", action="store_true", help="Forward only; write no spans")
+    parser.add_argument("--debug", action="store_true", help="Log request lines only (never headers or bodies)")
+    parser.add_argument("--check", action="store_true", help="Print effective config and exit without serving")
+    args = parser.parse_args()
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+                        stream=sys.stderr)
+    engine = gateway.Gateway(
+        upstream_base_url=args.upstream_base_url,
+        provider_name=args.provider,
+        role=args.role,
+        timeout_seconds=args.timeout_seconds,
+        span_output=args.span_output,
+        record_telemetry=not args.no_telemetry,
+        debug=args.debug,
+    )
+    if args.check:
+        print(json.dumps(engine.describe(), indent=2))
+        return 0
+
+    server = gateway.create_server(engine, args.host, args.port)
+    print("oc-gateway listening on http://%s:%d -> %s (telemetry: %s)" % (
+        args.host, server.server_address[1], engine.upstream_base_url,
+        "on" if engine.record_telemetry else "off"), file=sys.stderr)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -28,8 +28,12 @@ Qwen Local
   scalar generation option `reasoning_effort`. This reuses the existing
   request/option handling and adds no new model abstraction.
 - Response normalization into `ProviderResponse`: content, provider/model,
-  duration, input/output tokens, cached input tokens, reasoning tokens, and
-  finish reason. Unavailable values stay `null`; they are never invented.
+  duration, input/output tokens, cached input tokens, cache-miss tokens,
+  reasoning tokens, total tokens, and finish reason. Unavailable values stay
+  `null`; they are never invented. See
+  [Provider usage and cache telemetry](CACHE_TELEMETRY.md) for the normalized
+  usage, prefix fingerprint, and estimated-cost columns persisted on every
+  inference span.
 - Errors map onto the existing runtime categories (`configuration_failure` for a
   missing key or rejected credentials, `provider_timeout`, `provider_failure` for
   rate limits/5xx/connection problems, `validation_failure` for a 400).

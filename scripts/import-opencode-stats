@@ -1,0 +1,230 @@
+#!/usr/bin/env python3
+"""Import `opencode stats --json` into normalized OpenCode usage telemetry.
+
+Snapshot-based and idempotent: the normalized model rows are hashed into a
+content-derived ``snapshot_id``, and a snapshot already present in the
+destination is not appended again. Aggregates only: no prompts, messages,
+source, credentials, or raw stats payloads are stored.
+
+Usage:
+    ./scripts/import-opencode-stats                 # runs `opencode stats --json`
+    ./scripts/import-opencode-stats --input stats.json
+    some-command | ./scripts/import-opencode-stats --stdin
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import pathlib
+import subprocess
+import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "common"))
+import infra  # noqa: E402
+import learning  # noqa: E402
+import telemetry  # noqa: E402
+
+DEFAULT_OUTPUT = infra.ROOT / "telemetry/opencode/stats.jsonl"
+SOURCE = "opencode stats --json"
+_ROW_KEYS = ("models", "stats", "rows", "data", "providers", "byModel", "by_model")
+
+
+def _canonical(value: object) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _first_str(*values: object) -> str | None:
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
+
+
+def _as_int(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int) and value >= 0:
+        return value
+    if isinstance(value, float) and value >= 0 and value.is_integer():
+        return int(value)
+    return None
+
+
+def _as_number(value: object) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)) and value >= 0:
+        return float(value)
+    return None
+
+
+def _extract_rows(payload: object) -> list[dict]:
+    """Return candidate model rows from the several plausible stats shapes."""
+    if isinstance(payload, list):
+        return [row for row in payload if isinstance(row, dict)]
+    if not isinstance(payload, dict):
+        return []
+    for key in _ROW_KEYS:
+        value = payload.get(key)
+        if isinstance(value, list):
+            return [row for row in value if isinstance(row, dict)]
+        if isinstance(value, dict):
+            return [row for row in value.values() if isinstance(row, dict)]
+    if isinstance(payload.get("model"), dict) or "tokens" in payload:
+        return [payload]
+    return []
+
+
+def _map_row(row: dict) -> dict:
+    """Map one OpenCode stats row into the normalized usage vocabulary."""
+    model_obj = row.get("model") if isinstance(row.get("model"), dict) else {}
+    tokens = row.get("tokens") if isinstance(row.get("tokens"), dict) else {}
+    cache = tokens.get("cache") if isinstance(tokens.get("cache"), dict) else {}
+    provider = _first_str(row.get("providerID"), row.get("provider"),
+                          model_obj.get("providerID"), model_obj.get("provider"))
+    model = _first_str(row.get("modelID"), row.get("model_id"), model_obj.get("id"), model_obj.get("modelID"))
+    variant = _first_str(row.get("variant"), model_obj.get("variant"))
+
+    uncached_input = _as_int(tokens.get("input"))
+    cached = _as_int(cache.get("read"))
+    cache_write = _as_int(cache.get("write"))
+    output = _as_int(tokens.get("output"))
+    reasoning = _as_int(tokens.get("reasoning"))
+
+    input_total = None
+    if uncached_input is not None or cached is not None:
+        input_total = (uncached_input or 0) + (cached or 0)
+    total_tokens = None
+    if input_total is not None and output is not None:
+        total_tokens = input_total + output
+
+    return {
+        "schema_version": telemetry.OPENCODE_STATS_SCHEMA_VERSION,
+        "snapshot_id": None,  # assigned after hashing the canonical rows
+        "captured_at": None,  # assigned by the caller
+        "provider": provider,
+        "model": model,
+        "variant": variant,
+        "input_tokens": input_total,
+        "output_tokens": output,
+        "reasoning_tokens": reasoning,
+        "cached_input_tokens": cached,
+        "cache_write_tokens": cache_write,
+        "cache_miss_tokens": uncached_input,
+        "total_tokens": total_tokens,
+        "cache_hit_ratio": telemetry.cache_hit_ratio(cached, uncached_input),
+        "provider_reported_cost": _as_number(row.get("cost")),
+        "estimated_total_cost": None,
+        "pricing_profile": None,
+        "pricing_currency": None,
+        "sessions": _as_int(row.get("sessions")),
+        "subagents": _as_int(row.get("subagents")),
+        "prompts": _as_int(row.get("prompts")),
+        "steps": _as_int(row.get("steps")),
+        "agent_client": "opencode",
+        "opencode_version": None,
+        "source": SOURCE,
+    }
+
+
+def _run_command(command: list[str]) -> tuple[str | None, str | None]:
+    try:
+        proc = subprocess.run(command, capture_output=True, text=True)
+    except FileNotFoundError:
+        return None, "command unavailable: %s" % command[0]
+    except OSError as exc:
+        return None, "command failed: %s" % exc
+    if proc.returncode != 0:
+        return None, "command exited %d" % proc.returncode
+    return proc.stdout, None
+
+
+def _existing_snapshot_ids(path: pathlib.Path) -> set:
+    if not path.exists():
+        return set()
+    return {record.get("snapshot_id") for record in learning.load_jsonl(path) if record.get("snapshot_id")}
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument("--input", type=pathlib.Path, help="Read stats JSON from a file instead of running opencode")
+    source.add_argument("--stdin", action="store_true", help="Read stats JSON from standard input")
+    parser.add_argument("--opencode-path", default="opencode", help="opencode executable (default: opencode)")
+    parser.add_argument("--output", type=pathlib.Path, default=DEFAULT_OUTPUT,
+                        help="Destination JSONL (default: telemetry/opencode/stats.jsonl)")
+    parser.add_argument("--dry-run", action="store_true", help="Validate and report without writing")
+    parser.add_argument("--json", action="store_true", help="Emit the import summary only")
+    args = parser.parse_args()
+
+    if args.input is not None:
+        try:
+            text: str | None = args.input.read_text(encoding="utf-8")
+        except OSError as exc:
+            print(f"error: cannot read {args.input}: {exc}", file=sys.stderr)
+            return 1
+    elif args.stdin:
+        text = sys.stdin.read()
+    else:
+        text, error = _run_command([args.opencode_path, "stats", "--json"])
+        if text is None:
+            print(f"error: {error}", file=sys.stderr)
+            return 1
+
+    try:
+        payload = json.loads(text)
+    except (json.JSONDecodeError, TypeError) as exc:
+        print(f"error: malformed stats JSON: {exc}", file=sys.stderr)
+        return 2
+
+    captured_at = infra.utc_now()
+    rows = [row for row in (_map_row(candidate) for candidate in _extract_rows(payload))
+            if row["provider"] and row["model"]]
+    if not rows:
+        print("error: no model rows with provider/model in stats output", file=sys.stderr)
+        return 1
+    for row in rows:
+        row["captured_at"] = captured_at
+
+    core = [{key: value for key, value in row.items() if key != "captured_at"} for row in rows]
+    snapshot_id = "sha256:" + hashlib.sha256(_canonical(core).encode("utf-8")).hexdigest()
+    for row in rows:
+        row["snapshot_id"] = snapshot_id
+
+    try:
+        for row in rows:
+            telemetry.validate_opencode_stats_event(row)
+        existing = _existing_snapshot_ids(args.output)
+    except infra.InfraError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    duplicate = snapshot_id in existing
+    written = False
+    if not duplicate and not args.dry_run:
+        for row in rows:
+            infra.append_jsonl(args.output, row)
+        written = True
+
+    summary = {
+        "snapshot_id": snapshot_id,
+        "rows": len(rows),
+        "appended": written,
+        "duplicate": duplicate,
+        "output": str(args.output),
+    }
+    if args.json:
+        print(json.dumps(summary, indent=2))
+    elif duplicate:
+        print(f"snapshot {snapshot_id} already imported; nothing appended")
+    elif args.dry_run:
+        print(f"snapshot {snapshot_id}: {len(rows)} model row(s) valid (dry run, not written)")
+    else:
+        print(f"snapshot {snapshot_id}: appended {len(rows)} model row(s) to {args.output}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

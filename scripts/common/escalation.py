@@ -30,6 +30,7 @@ from typing import Any, Callable, Optional
 
 import infra
 import learning
+import pricing
 import providers
 import runtime
 import telemetry
@@ -155,6 +156,7 @@ class EscalationOutcome:
             "teacher_input_tokens": getattr(teacher, "input_tokens", None),
             "teacher_output_tokens": getattr(teacher, "output_tokens", None),
             "teacher_cached_input_tokens": getattr(teacher, "cached_input_tokens", None),
+            "teacher_cache_miss_tokens": getattr(teacher, "cache_miss_tokens", None),
             "telemetry_written": self.telemetry_written,
         }
 
@@ -295,6 +297,14 @@ class EscalationController:
     ) -> bool:
         if not self.record_telemetry:
             return False
+        cost = pricing.estimate_usage_cost(
+            self.fallback_provider.name,
+            teacher_result.model or self.fallback_provider.model,
+            input_tokens=teacher_result.input_tokens,
+            cached_input_tokens=teacher_result.cached_input_tokens,
+            cache_miss_tokens=teacher_result.cache_miss_tokens,
+            output_tokens=teacher_result.output_tokens,
+        )
         record = {
             "schema_version": "1.1.0",
             "run_id": child.run_id,
@@ -323,8 +333,8 @@ class EscalationController:
             "cost_input_tokens": teacher_result.input_tokens,
             "cost_output_tokens": teacher_result.output_tokens,
             "cost_cache_hit_tokens": teacher_result.cached_input_tokens,
-            "estimated_cost_usd": None,
-            "pricing_source": None,
+            "estimated_cost_usd": cost["estimated_total_cost"],
+            "pricing_source": cost["pricing_profile"],
             "recorded_by": "escalation-controller",
             "sanitized_note": None,
         }

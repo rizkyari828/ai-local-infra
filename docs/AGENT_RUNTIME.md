@@ -82,13 +82,20 @@ validated `inference` span using the existing schema and secret guard:
 ```text
 trace_id, run_id, span_id, stage, provider, model, role, attempt, retry_count
 start/end (timestamp_utc + duration_ms), outcome error_category/error_code
-input_tokens, output_tokens, reasoning_tokens, context_size, context_utilization
+input_tokens, output_tokens, cached_input_tokens, cache_miss_tokens, reasoning_tokens,
+total_tokens, cache_hit_ratio, context_size, context_utilization
+estimated_input/cached_input/output/total_cost, pricing_profile, pricing_currency
+prompt_prefix_hash (digest of the first 2048 prompt characters)
 limits_version
 ```
 
 Prompts and response content are never persisted. One task keeps one `trace_id`
 across all attempts, and `RuntimeResult` carries it so future escalation inherits
 the same trace.
+
+Provider usage is normalized once in `providers.normalize_openai_usage()` and
+priced from [`../config/pricing.yaml`](../config/pricing.yaml) (empty by default,
+so cost stays unknown). See [Provider usage and cache telemetry](CACHE_TELEMETRY.md).
 
 ## Error classification
 

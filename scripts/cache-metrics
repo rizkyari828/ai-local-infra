@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+"""Aggregate provider usage, cache effectiveness, latency, and cost from spans.
+
+Read-only. Local span JSONL only; no database, network, dashboard, or analytics
+service. Costs come from what each inference span recorded at write time, so an
+old row keeps the price profile that produced it instead of being restated.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import pathlib
+import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "common"))
+import infra  # noqa: E402
+import learning  # noqa: E402
+import telemetry  # noqa: E402
+
+
+def _int(value: object) -> str:
+    return "unknown" if value is None else f"{value:,}"
+
+
+def _money(value: object, currency: object) -> str:
+    if value is None:
+        return "unknown"
+    label = currency if isinstance(currency, str) and currency else "cost units"
+    return f"{value:.6f} {label}"
+
+
+def _ms(value: object) -> str:
+    return "unknown" if value is None else f"{value:.0f}ms"
+
+
+def _percent(value: object) -> str:
+    return "unknown" if value is None else f"{value * 100:.2f}%"
+
+
+def _cost(value: object) -> str:
+    return "unknown" if value is None else f"{value:.6f}"
+
+
+def _print_group(label: str, group: dict, currency: object) -> None:
+    print(label)
+    print(f"  requests          {_int(group['requests'])} (successful: {_int(group['successful_requests'])})")
+    print(f"  input tokens      {_int(group['input_tokens'])}")
+    print(f"  cached tokens     {_int(group['cached_input_tokens'])}")
+    print(f"  cache miss        {_int(group['cache_miss_tokens'])}")
+    print(f"  cache hit ratio   {_percent(group['cache_hit_ratio'])}")
+    print(f"  output tokens     {_int(group['output_tokens'])}")
+    print(f"  avg latency       {_ms(group['avg_latency_ms'])}")
+    print(f"  estimated cost    {_money(group['estimated_total_cost'], currency)}")
+
+
+def _print_opencode_group(label: str, group: dict) -> None:
+    print(label)
+    print(f"  input tokens      {_int(group['input_tokens'])}")
+    print(f"  cached tokens     {_int(group['cached_input_tokens'])}")
+    print(f"  cache miss        {_int(group['cache_miss_tokens'])}")
+    print(f"  cache hit ratio   {_percent(group['cache_hit_ratio'])}")
+    print(f"  output tokens     {_int(group['output_tokens'])}")
+    print(f"  provider cost     {_cost(group['provider_reported_cost'])}")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--spans", type=pathlib.Path, action="append", dest="spans",
+                        help="Span JSONL; repeatable (default: telemetry/spans/runs.jsonl)")
+    parser.add_argument("--opencode", type=pathlib.Path, action="append", dest="opencode",
+                        help="OpenCode stats JSONL; repeatable "
+                             "(default: telemetry/opencode/stats.jsonl when present)")
+    parser.add_argument("--json", action="store_true", help="Emit the metric object only")
+    args = parser.parse_args()
+    span_paths = args.spans or [infra.ROOT / "telemetry/spans/runs.jsonl"]
+    spans: list[dict] = []
+    for path in span_paths:
+        if not path.exists():
+            if args.spans:
+                print(f"error: missing span file: {path}", file=sys.stderr)
+                return 1
+            continue
+        try:
+            spans.extend(learning.load_jsonl(path))
+        except infra.InfraError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+    default_opencode = infra.ROOT / "telemetry/opencode/stats.jsonl"
+    opencode_paths = args.opencode or ([default_opencode] if default_opencode.exists() else [])
+    opencode_records: list[dict] = []
+    for path in opencode_paths:
+        if not path.exists():
+            if args.opencode:
+                print(f"error: missing OpenCode stats file: {path}", file=sys.stderr)
+                return 1
+            continue
+        try:
+            opencode_records.extend(learning.load_jsonl(path))
+        except infra.InfraError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+    metrics = telemetry.summarize_usage(spans)
+    opencode_metrics = telemetry.summarize_opencode_usage(opencode_records) if opencode_records else None
+    currency = next(
+        (span.get("pricing_currency") for span in spans if span.get("pricing_currency")), None
+    )
+    if args.json:
+        if opencode_metrics is not None:
+            metrics["opencode"] = opencode_metrics
+        print(json.dumps(metrics, indent=2))
+        return 0
+    print("Provider Cache Metrics")
+    print("----------------------")
+    _print_group("overall", {**metrics, "requests": metrics["total_requests"]}, currency)
+    breakdown = metrics["by_provider_model"]
+    if not breakdown:
+        print("\nno inference spans found")
+    else:
+        for group in breakdown:
+            label = f"\n{group['provider'] or 'unknown'} / {group['model'] or 'unknown'}"
+            _print_group(label, group, currency)
+    if opencode_metrics is not None:
+        print(f"\nOpenCode stats (latest snapshot per model; snapshots: {opencode_metrics['snapshot_count']})")
+        for group in opencode_metrics["by_provider_model_variant"]:
+            label = (f"\n{group['provider'] or 'unknown'} / {group['model'] or 'unknown'}"
+                     f"#{group['variant'] or 'default'}")
+            _print_opencode_group(label, group)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -31,9 +31,16 @@ A span is a *completed* stage measurement with a duration and completion timesta
 
 - `stage`: `inference`, `tool`, `validation`, `review`, `escalation`, `retry`, `queue`, `other`.
 - Model attribution: `model`, `provider`, `role`, `attempt`, `retry_count`.
-- Usage: `input_tokens`, `output_tokens`, `cached_input_tokens`, `reasoning_tokens`,
-  `context_size`, `context_utilization`. Unavailable values stay `null`; they are never
-  invented.
+- Usage: `input_tokens`, `output_tokens`, `cached_input_tokens`, `cache_miss_tokens`,
+  `reasoning_tokens`, `total_tokens`, `cache_hit_ratio`, `context_size`,
+  `context_utilization`. Unavailable values stay `null`; they are never invented.
+- Provider cost (optional): `estimated_input_cost`, `estimated_cached_input_cost`,
+  `estimated_output_cost`, `estimated_total_cost`, `pricing_profile`,
+  `pricing_currency`, from [`../config/pricing.yaml`](../config/pricing.yaml)
+  (empty by default, so cost stays unknown). See
+  [Provider usage and cache telemetry](CACHE_TELEMETRY.md).
+- Cache-prefix observability: `prompt_prefix_hash` is a digest of the first 2048
+  prompt characters, never the prompt.
 - Tools: `tool_kind` (`read`, `write`, `search`, `shell`, `test`, `git`, `other`),
   `tool_name`, `tool_outcome`, `target_hash`, `repeated`, plus bounded tool metrics
   `bytes_read`, `bytes_written`, `exit_code`, `result_count`.
@@ -64,6 +71,10 @@ Record a span:
 Per trace it reports duration by stage, tool calls/failures/timeouts, file reads/writes,
 repeated reads, attempts, retries, token totals, peak context, the escalation chain, and
 warnings when configured thresholds are exceeded.
+
+For cross-trace provider usage, cache effectiveness, latency, and estimated cost, use
+the read-only `./scripts/cache-metrics` report (see
+[Provider usage and cache telemetry](CACHE_TELEMETRY.md)).
 
 ## Limits policy
 

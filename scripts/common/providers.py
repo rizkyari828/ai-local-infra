@@ -89,6 +89,49 @@ def _optional_int(value: Any) -> Optional[int]:
     return value
 
 
+def _nested_dict(source: Any, key: str) -> dict:
+    value = source.get(key) if isinstance(source, dict) else None
+    return value if isinstance(value, dict) else {}
+
+
+def normalize_openai_usage(usage: Any) -> dict:
+    """Normalize an OpenAI-compatible ``usage`` object into provider-neutral tokens.
+
+    Supports the DeepSeek cache fields (``prompt_cache_hit_tokens`` /
+    ``prompt_cache_miss_tokens``) and the OpenAI/Qwen
+    ``prompt_tokens_details.cached_tokens`` shape. Missing values stay ``None``.
+
+    A cache miss is derived from ``input - cached`` only when the API does not
+    report one and both numbers are known and the subtraction is valid; it is
+    never fabricated. This is the single normalization used by every
+    OpenAI-compatible provider in this repository.
+    """
+    usage = usage if isinstance(usage, dict) else {}
+    input_tokens = _optional_int(usage.get("prompt_tokens"))
+    output_tokens = _optional_int(usage.get("completion_tokens"))
+    prompt_details = _nested_dict(usage, "prompt_tokens_details")
+    completion_details = _nested_dict(usage, "completion_tokens_details")
+    cached = _optional_int(usage.get("prompt_cache_hit_tokens"))
+    if cached is None:
+        cached = _optional_int(prompt_details.get("cached_tokens"))
+    if cached is None:
+        cached = _optional_int(usage.get("cached_tokens"))
+    miss = _optional_int(usage.get("prompt_cache_miss_tokens"))
+    if miss is None and input_tokens is not None and cached is not None and input_tokens >= cached:
+        miss = input_tokens - cached
+    total = _optional_int(usage.get("total_tokens"))
+    if total is None and input_tokens is not None and output_tokens is not None:
+        total = input_tokens + output_tokens
+    return {
+        "input_tokens": input_tokens,
+        "cached_input_tokens": cached,
+        "cache_miss_tokens": miss,
+        "output_tokens": output_tokens,
+        "reasoning_tokens": _optional_int(completion_details.get("reasoning_tokens")),
+        "total_tokens": total,
+    }
+
+
 class ProviderError(Exception):
     """A classified provider/runtime failure.
 
@@ -181,7 +224,9 @@ class ProviderResponse:
     input_tokens: Optional[int] = None
     output_tokens: Optional[int] = None
     cached_input_tokens: Optional[int] = None
+    cache_miss_tokens: Optional[int] = None
     reasoning_tokens: Optional[int] = None
+    total_tokens: Optional[int] = None
     context_size: Optional[int] = None
     context_utilization: Optional[float] = None
     finish_reason: Optional[str] = None
@@ -482,6 +527,7 @@ class OllamaProvider(ModelProvider):
             finish_reason = "stop"
         if not isinstance(finish_reason, str):
             finish_reason = None
+        total_tokens = input_tokens + output_tokens if input_tokens is not None and output_tokens is not None else None
         return ProviderResponse(
             content=content,
             provider=self.name,
@@ -490,6 +536,7 @@ class OllamaProvider(ModelProvider):
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             reasoning_tokens=reasoning_tokens,
+            total_tokens=total_tokens,
             context_size=context_size,
             context_utilization=utilization,
             finish_reason=finish_reason,
@@ -588,19 +635,7 @@ class DeepSeekProvider(ModelProvider):
         return {"Content-Type": "application/json", "Authorization": "Bearer %s" % self._api_key}
 
     def _translate_http_error(self, status: int, body: bytes) -> ProviderError:
-        detail = _deepseek_error_detail(body)
-        if status in (401, 403):
-            return ProviderConfigurationError("auth_error", detail or "hosted endpoint rejected the credentials")
-        if status == 404:
-            return ProviderModelMissing("model_missing", detail or "configured model is not available")
-        if status == 429:
-            return ProviderUnavailable("rate_limited", detail or "hosted endpoint rate limited the request")
-        if status == 400:
-            return ProviderValidationError("bad_request", detail or "hosted endpoint rejected the request")
-        if status >= 500:
-            return ProviderUnavailable("http_%d" % status, detail or "hosted endpoint returned a server error")
-        return ProviderResponseError("http_%d" % status, detail or "hosted endpoint rejected the request",
-                                     retryable=False)
+        return translate_openai_http_error(status, body)
 
     def _request(self, path: str, payload: Optional[dict], timeout: Optional[float]) -> dict:
         url = self.base_url + path
@@ -666,8 +701,7 @@ class DeepSeekProvider(ModelProvider):
         content = message.get("content") if isinstance(message, dict) else None
         if not isinstance(content, str) or not content.strip():
             raise ProviderResponseError("invalid_response", "hosted endpoint returned an empty response")
-        usage = raw.get("usage") if isinstance(raw.get("usage"), dict) else {}
-        details = usage.get("completion_tokens_details") if isinstance(usage.get("completion_tokens_details"), dict) else {}
+        usage = normalize_openai_usage(raw.get("usage"))
         finish_reason = first.get("finish_reason")
         reported_model = raw.get("model")
         return ProviderResponse(
@@ -675,10 +709,12 @@ class DeepSeekProvider(ModelProvider):
             provider=self.name,
             model=reported_model if isinstance(reported_model, str) and reported_model else model,
             duration_ms=duration_ms,
-            input_tokens=_optional_int(usage.get("prompt_tokens")),
-            output_tokens=_optional_int(usage.get("completion_tokens")),
-            cached_input_tokens=_optional_int(usage.get("prompt_cache_hit_tokens")),
-            reasoning_tokens=_optional_int(details.get("reasoning_tokens")),
+            input_tokens=usage["input_tokens"],
+            output_tokens=usage["output_tokens"],
+            cached_input_tokens=usage["cached_input_tokens"],
+            cache_miss_tokens=usage["cache_miss_tokens"],
+            reasoning_tokens=usage["reasoning_tokens"],
+            total_tokens=usage["total_tokens"],
             context_size=None,
             context_utilization=None,
             finish_reason=finish_reason if isinstance(finish_reason, str) else None,
@@ -726,6 +762,28 @@ def _deepseek_error_detail(body: bytes) -> Optional[str]:
         elif isinstance(payload.get("message"), str):
             message = payload["message"]
     return _safe_detail(message) if message else None
+
+
+def translate_openai_http_error(status: int, body: bytes, *, label: str = "hosted endpoint") -> ProviderError:
+    """Map an OpenAI-compatible HTTP error status to a runtime-classified error.
+
+    This is the single status-to-category mapping shared by the DeepSeek provider
+    and the runtime gateway, so both classify 400/401/403/404/429/5xx identically
+    and never under-report a provider failure as an unknown error.
+    """
+    detail = _deepseek_error_detail(body)
+    if status in (401, 403):
+        return ProviderConfigurationError("auth_error", detail or "%s rejected the credentials" % label)
+    if status == 404:
+        return ProviderModelMissing("model_missing", detail or "configured model is not available")
+    if status == 429:
+        return ProviderUnavailable("rate_limited", detail or "%s rate limited the request" % label)
+    if status == 400:
+        return ProviderValidationError("bad_request", detail or "%s rejected the request" % label)
+    if status >= 500:
+        return ProviderUnavailable("http_%d" % status, detail or "%s returned a server error" % label)
+    return ProviderResponseError("http_%d" % status, detail or "%s rejected the request" % label,
+                                 retryable=False)
 
 
 def _deepseek_options(options: Any) -> dict:

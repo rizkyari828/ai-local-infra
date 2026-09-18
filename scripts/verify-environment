@@ -37,7 +37,8 @@ def main() -> int:
     for relative in ("models/registry.yaml", "models/roles.yaml", "hardware/current-machine.yaml",
                      "telemetry/schemas/ai-run.schema.json", "telemetry/schemas/error-event.schema.json",
                      "telemetry/schemas/escalation-run.schema.json", "telemetry/schemas/span-event.schema.json",
-                     "telemetry/taxonomy/failure-categories.yaml", "config/limits.yaml",
+                     "telemetry/schemas/opencode-stats.schema.json",
+                     "telemetry/taxonomy/failure-categories.yaml", "config/limits.yaml", "config/pricing.yaml",
                      "datasets/schemas/accepted-task.schema.json", "datasets/schemas/learning-candidate.schema.json"):
         try:
             infra.load_json(ROOT / relative)

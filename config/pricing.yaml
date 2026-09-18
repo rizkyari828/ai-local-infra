@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "pricing_version": "0.1.0",
+  "currency": null,
+  "providers": {},
+  "as_of": null,
+  "source": null,
+  "note": "Per-million-token provider prices for estimated cost telemetry. Empty by default so no cost is invented. To enable estimates, add providers.<provider>.models.<model> with normal_input_price_per_million, cached_input_price_per_million, and output_price_per_million (all three required). 'currency' labels the estimate. Prices are provider data and change often; keep as_of/source current. This file must never contain credentials."
+}

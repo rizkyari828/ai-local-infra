@@ -66,7 +66,17 @@ SPAN_FIELDS = SPAN_REQUIRED + (
     "input_tokens",
     "output_tokens",
     "cached_input_tokens",
+    "cache_miss_tokens",
     "reasoning_tokens",
+    "total_tokens",
+    "cache_hit_ratio",
+    "estimated_input_cost",
+    "estimated_cached_input_cost",
+    "estimated_output_cost",
+    "estimated_total_cost",
+    "pricing_profile",
+    "pricing_currency",
+    "prompt_prefix_hash",
     "context_size",
     "context_utilization",
     "tool_name",
@@ -121,18 +131,71 @@ AI_RUN_FIELDS = AI_RUN_REQUIRED + (
 AI_RUN_STATUSES = ("started", "succeeded", "failed", "cancelled", "unknown")
 REVIEW_STATUSES = ("unreviewed", "accepted", "rejected", "needs-review")
 
+# OpenCode `stats --json` aggregate rows, normalized into the same usage
+# vocabulary as runtime spans. OpenCode's ``tokens.input`` is the *uncached*
+# portion, so it maps to ``cache_miss_tokens``; ``input_tokens`` is the provider
+# total (uncached + cache.read). ``provider_reported_cost`` keeps OpenCode's own
+# cost separate from any locally estimated cost.
+OPENCODE_STATS_SCHEMA_VERSION = "1.0.0"
+OPENCODE_STATS_REQUIRED = ("schema_version", "snapshot_id", "captured_at", "provider", "model")
+OPENCODE_STATS_FIELDS = OPENCODE_STATS_REQUIRED + (
+    "variant",
+    "input_tokens",
+    "output_tokens",
+    "reasoning_tokens",
+    "cached_input_tokens",
+    "cache_write_tokens",
+    "cache_miss_tokens",
+    "total_tokens",
+    "cache_hit_ratio",
+    "provider_reported_cost",
+    "estimated_total_cost",
+    "pricing_profile",
+    "pricing_currency",
+    "sessions",
+    "subagents",
+    "prompts",
+    "steps",
+    "agent_client",
+    "opencode_version",
+    "source",
+)
+_OPENCODE_STATS_NON_NEGATIVE_INT_FIELDS = (
+    "input_tokens",
+    "output_tokens",
+    "reasoning_tokens",
+    "cached_input_tokens",
+    "cache_write_tokens",
+    "cache_miss_tokens",
+    "total_tokens",
+    "sessions",
+    "subagents",
+    "prompts",
+    "steps",
+)
+_OPENCODE_STATS_NON_NEGATIVE_NUMBER_FIELDS = ("provider_reported_cost", "estimated_total_cost")
+
 _SPAN_NON_NEGATIVE_INT_FIELDS = (
     "attempt",
     "retry_count",
     "input_tokens",
     "output_tokens",
     "cached_input_tokens",
+    "cache_miss_tokens",
     "reasoning_tokens",
+    "total_tokens",
     "bytes_read",
     "bytes_written",
     "result_count",
 )
-_SPAN_NON_NEGATIVE_NUMBER_FIELDS = ("duration_ms", "context_size")
+_SPAN_NON_NEGATIVE_NUMBER_FIELDS = (
+    "duration_ms",
+    "context_size",
+    "estimated_input_cost",
+    "estimated_cached_input_cost",
+    "estimated_output_cost",
+    "estimated_total_cost",
+)
 _AI_RUN_NON_NEGATIVE_INT_FIELDS = (
     "input_tokens",
     "output_tokens",
@@ -272,6 +335,34 @@ def hash_target(value: str) -> str:
     return "sha256:" + digest
 
 
+def hash_prompt_prefix(value: str, limit: int = 2048) -> str:
+    """Digest the stable prompt prefix for cache-reuse observability.
+
+    Only the digest of the first ``limit`` characters is persisted; the prompt
+    itself is never stored. Comparing digests across requests with the same
+    logical agent context detects a prefix that keeps changing, which prevents
+    provider prefix-cache reuse without exposing prompt content.
+    """
+    if not _present(value):
+        raise infra.InfraError("Prompt prefix must be a non-empty string")
+    digest = hashlib.sha256(("local-ai-infra:prefix\x1f" + value[:limit]).encode("utf-8")).hexdigest()
+    return "sha256:" + digest
+
+
+def cache_hit_ratio(cached_input_tokens: Any, cache_miss_tokens: Any) -> float | None:
+    """Return cached / (cached + miss) when both counts are known, else ``None``.
+
+    A zero-token request has no ratio (never 0% or 100% by assumption).
+    """
+    for value in (cached_input_tokens, cache_miss_tokens):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return None
+    total = cached_input_tokens + cache_miss_tokens
+    if total <= 0:
+        return None
+    return round(cached_input_tokens / total, 4)
+
+
 def _validate_limits(limits: dict[str, Any]) -> None:
     if limits.get("schema_version") != 1:
         raise infra.InfraError("Unsupported limits schema_version")
@@ -348,6 +439,10 @@ def validate_span_event(record: dict[str, Any]) -> dict[str, Any]:
     if utilization is not None:
         if isinstance(utilization, bool) or not isinstance(utilization, (int, float)) or not 0 <= utilization <= 1:
             raise infra.InfraError("context_utilization must be a number in [0, 1]")
+    ratio = record.get("cache_hit_ratio")
+    if ratio is not None:
+        if isinstance(ratio, bool) or not isinstance(ratio, (int, float)) or not 0 <= ratio <= 1:
+            raise infra.InfraError("cache_hit_ratio must be a number in [0, 1]")
     _check_bool(record.get("repeated"), "repeated")
     exit_code = record.get("exit_code")
     if exit_code is not None and (isinstance(exit_code, bool) or not isinstance(exit_code, int)):
@@ -358,6 +453,9 @@ def validate_span_event(record: dict[str, Any]) -> dict[str, Any]:
     target_hash = record.get("target_hash")
     if target_hash is not None and not TARGET_HASH_PATTERN.match(str(target_hash)):
         raise infra.InfraError("target_hash must be a hashed target (use hash_target), never a raw path")
+    prefix_hash = record.get("prompt_prefix_hash")
+    if prefix_hash is not None and not TARGET_HASH_PATTERN.match(str(prefix_hash)):
+        raise infra.InfraError("prompt_prefix_hash must be a digest (use hash_prompt_prefix), never a raw prompt")
     return record
 
 
@@ -383,6 +481,30 @@ def validate_ai_run_event(record: dict[str, Any]) -> dict[str, Any]:
     return record
 
 
+def validate_opencode_stats_event(record: dict[str, Any]) -> dict[str, Any]:
+    """Validate one normalized OpenCode stats snapshot row before it is persisted."""
+    if not isinstance(record, dict):
+        raise infra.InfraError("OpenCode stats record must be an object")
+    _reject_unknown(record, OPENCODE_STATS_FIELDS, "OpenCode stats record")
+    _require(record, OPENCODE_STATS_REQUIRED, "OpenCode stats record")
+    if record["schema_version"] != OPENCODE_STATS_SCHEMA_VERSION:
+        raise infra.InfraError("Unsupported OpenCode stats schema_version")
+    _reject_secrets(record, "OpenCode stats record")
+    _check_timestamp(record.get("captured_at"), "OpenCode stats record captured_at")
+    snapshot_id = record.get("snapshot_id")
+    if not isinstance(snapshot_id, str) or not TARGET_HASH_PATTERN.match(snapshot_id):
+        raise infra.InfraError("snapshot_id must be a content digest (sha256:...)")
+    for field in _OPENCODE_STATS_NON_NEGATIVE_INT_FIELDS:
+        _check_non_negative(record.get(field), field, integer=True)
+    for field in _OPENCODE_STATS_NON_NEGATIVE_NUMBER_FIELDS:
+        _check_non_negative(record.get(field), field, integer=False)
+    ratio = record.get("cache_hit_ratio")
+    if ratio is not None:
+        if isinstance(ratio, bool) or not isinstance(ratio, (int, float)) or not 0 <= ratio <= 1:
+            raise infra.InfraError("OpenCode stats cache_hit_ratio must be a number in [0, 1]")
+    return record
+
+
 def _dedupe_spans(spans: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
     """Drop duplicate span_ids (for example from an accidental double append)."""
     seen: set[str] = set()
@@ -397,6 +519,147 @@ def _dedupe_spans(spans: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], in
             seen.add(span_id)
         unique.append(span)
     return unique, duplicates
+
+
+def _known_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _known_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _sum_field(records: list[dict[str, Any]], field: str, *, integer: bool) -> Any:
+    total = 0
+    known = False
+    for record in records:
+        value = record.get(field)
+        if _known_int(value) if integer else _known_number(value):
+            total += value
+            known = True
+    return total if known else None
+
+
+def _average(total: Any, denominator: int) -> float | None:
+    if total is None or denominator <= 0:
+        return None
+    return round(total / denominator, 3)
+
+
+def _usage_group(spans: list[dict[str, Any]]) -> dict[str, Any]:
+    requests = len(spans)
+    requests_with_usage = sum(
+        1 for span in spans if _known_int(span.get("input_tokens")) or _known_int(span.get("output_tokens"))
+    )
+    input_tokens = _sum_field(spans, "input_tokens", integer=True)
+    cached = _sum_field(spans, "cached_input_tokens", integer=True)
+    miss = _sum_field(spans, "cache_miss_tokens", integer=True)
+    output = _sum_field(spans, "output_tokens", integer=True)
+    total_tokens = _sum_field(spans, "total_tokens", integer=True)
+    estimated_cost = _sum_field(spans, "estimated_total_cost", integer=False)
+    cost_requests = sum(1 for span in spans if _known_number(span.get("estimated_total_cost")))
+    provider_cost = _sum_field(spans, "provider_reported_cost", integer=False)
+    provider_cost_requests = sum(1 for span in spans if _known_number(span.get("provider_reported_cost")))
+    latencies = [span["duration_ms"] for span in spans if _known_number(span.get("duration_ms"))]
+    ratio = None
+    if cached is not None and miss is not None and (cached + miss) > 0:
+        ratio = round(cached / (cached + miss), 4)
+    return {
+        "requests": requests,
+        "successful_requests": sum(1 for span in spans if not span.get("error_category")),
+        "requests_with_usage": requests_with_usage,
+        "input_tokens": input_tokens,
+        "cached_input_tokens": cached,
+        "cache_miss_tokens": miss,
+        "output_tokens": output,
+        "total_tokens": total_tokens,
+        "cache_hit_ratio": ratio,
+        "avg_input_tokens_per_request": _average(input_tokens, requests_with_usage),
+        "avg_cached_tokens_per_request": _average(cached, requests_with_usage),
+        "avg_output_tokens_per_request": _average(output, requests_with_usage),
+        "avg_latency_ms": round(sum(latencies) / len(latencies), 3) if latencies else None,
+        "estimated_total_cost": estimated_cost,
+        "avg_estimated_cost_per_request": _average(estimated_cost, cost_requests),
+        "provider_reported_cost": provider_cost,
+        "provider_cost_observations": provider_cost_requests,
+    }
+
+
+def summarize_usage(spans: list[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate provider token/cache/latency/cost usage from inference spans.
+
+    Only ``inference`` spans count as provider requests. Averages use the number
+    of requests that actually reported usage (or cost), so a failed call without
+    token metadata never dilutes the result. Unavailable aggregates stay ``None``.
+    """
+    inference = [span for span in spans if span.get("stage") == "inference"]
+    overall = _usage_group(inference)
+    grouped: dict[tuple, list[dict[str, Any]]] = {}
+    for span in inference:
+        grouped.setdefault((span.get("provider"), span.get("model")), []).append(span)
+    breakdown: list[dict[str, Any]] = []
+    for provider, model in sorted(grouped, key=lambda key: (str(key[0]), str(key[1]))):
+        group = _usage_group(grouped[(provider, model)])
+        group["provider"] = provider
+        group["model"] = model
+        breakdown.append(group)
+    return {
+        "total_requests": overall["requests"],
+        "successful_requests": overall["successful_requests"],
+        "requests_with_usage": overall["requests_with_usage"],
+        "input_tokens": overall["input_tokens"],
+        "cached_input_tokens": overall["cached_input_tokens"],
+        "cache_miss_tokens": overall["cache_miss_tokens"],
+        "output_tokens": overall["output_tokens"],
+        "total_tokens": overall["total_tokens"],
+        "cache_hit_ratio": overall["cache_hit_ratio"],
+        "avg_input_tokens_per_request": overall["avg_input_tokens_per_request"],
+        "avg_cached_tokens_per_request": overall["avg_cached_tokens_per_request"],
+        "avg_output_tokens_per_request": overall["avg_output_tokens_per_request"],
+        "avg_latency_ms": overall["avg_latency_ms"],
+        "estimated_total_cost": overall["estimated_total_cost"],
+        "avg_estimated_cost_per_request": overall["avg_estimated_cost_per_request"],
+        "provider_reported_cost": overall["provider_reported_cost"],
+        "by_provider_model": breakdown,
+    }
+
+
+def summarize_opencode_usage(records: list[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate OpenCode stats snapshots by provider/model/variant.
+
+    OpenCode reports cumulative aggregates, so each key reports its *latest*
+    snapshot rather than summing every import (which would double count).
+    Provider-reported cost stays separate from locally estimated cost.
+    """
+    latest: dict[tuple, dict[str, Any]] = {}
+    snapshot_ids: set = set()
+    for record in records:
+        snapshot_ids.add(record.get("snapshot_id"))
+        key = (record.get("provider"), record.get("model"), record.get("variant"))
+        captured = record.get("captured_at") or ""
+        current = latest.get(key)
+        if current is None or captured >= (current.get("captured_at") or ""):
+            latest[key] = record
+    rows = list(latest.values())
+    overall = _usage_group(rows)
+    breakdown: list[dict[str, Any]] = []
+    for provider, model, variant in sorted(latest, key=lambda key: (str(key[0]), str(key[1]), str(key[2]))):
+        group = _usage_group([latest[(provider, model, variant)]])
+        group.update({"provider": provider, "model": model, "variant": variant})
+        breakdown.append(group)
+    return {
+        "snapshot_count": len(snapshot_ids),
+        "model_rows": len(rows),
+        "input_tokens": overall["input_tokens"],
+        "cached_input_tokens": overall["cached_input_tokens"],
+        "cache_miss_tokens": overall["cache_miss_tokens"],
+        "output_tokens": overall["output_tokens"],
+        "reasoning_tokens": _sum_field(rows, "reasoning_tokens", integer=True),
+        "cache_write_tokens": _sum_field(rows, "cache_write_tokens", integer=True),
+        "cache_hit_ratio": overall["cache_hit_ratio"],
+        "provider_reported_cost": overall["provider_reported_cost"],
+        "by_provider_model_variant": breakdown,
+    }
 
 
 def _escalation_summary(record: dict[str, Any]) -> dict[str, Any]:
@@ -435,7 +698,8 @@ def summarize_trace(
     file_reads = file_writes = shell_commands = 0
     retries = 0
     attempts = 0
-    token_totals = {"input_tokens": 0, "output_tokens": 0, "cached_input_tokens": 0, "reasoning_tokens": 0}
+    token_totals = {"input_tokens": 0, "output_tokens": 0, "cached_input_tokens": 0, "cache_miss_tokens": 0,
+                    "reasoning_tokens": 0, "total_tokens": 0}
     token_known = {key: False for key in token_totals}
     max_context_size = None
     max_context_utilization = None
@@ -515,7 +779,9 @@ def summarize_trace(
         "input_tokens": token_totals["input_tokens"] if token_known["input_tokens"] else None,
         "output_tokens": token_totals["output_tokens"] if token_known["output_tokens"] else None,
         "cached_input_tokens": token_totals["cached_input_tokens"] if token_known["cached_input_tokens"] else None,
+        "cache_miss_tokens": token_totals["cache_miss_tokens"] if token_known["cache_miss_tokens"] else None,
         "reasoning_tokens": token_totals["reasoning_tokens"] if token_known["reasoning_tokens"] else None,
+        "total_tokens": token_totals["total_tokens"] if token_known["total_tokens"] else None,
         "max_context_size": max_context_size,
         "max_context_utilization": max_context_utilization,
         "escalation": _escalation_summary(escalation) if escalation else None,
