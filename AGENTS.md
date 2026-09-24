@@ -10,8 +10,9 @@ in the linked docs; do not repeat these rules in every task prompt.
   learning-data conventions.
 - Product repositories own **what** an agent must know. Do not copy project memory,
   prompts, source, credentials, or private context here.
-- Do not modify `../ai-studio/` unless a task explicitly scopes it.
-- Keep changes inside `local-ai-infra/`; keep repository-wide files at the root.
+- Do not modify files outside this repository unless a task explicitly requires
+  integration work with a consuming application (for example AI Studio).
+- Keep changes inside this repository; repository-wide files stay at the root.
 
 ## Model roles
 
