@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "id": "home-wsl",
+  "platform": "linux",
+  "os": "linux",
+  "shell": "bash",
+  "repo_path": "~/ai-local-infra",
+  "graph_root": "~/.local/share/local-ai-infra/graphify",
+  "state_dir": "~/.local/state/local-ai-infra",
+  "bin": {
+    "oc": "~/.local/bin/oc"
+  },
+  "headroom": {
+    "bin": "~/.local/bin/headroom",
+    "lifecycle": "wrapper"
+  },
+  "lifecycle_capabilities": ["systemd"],
+  "provider_availability": {
+    "ollama": true,
+    "deepseek": true,
+    "codex": true
+  },
+  "feature": {
+    "rtk_auto": true,
+    "graphify_auto": true,
+    "headroom_proxy": true
+  }
+}

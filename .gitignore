@@ -7,6 +7,8 @@
 *.key
 backups/
 .local/
+# Multi-machine local override (never committed)
+machine.local.*
 
 # Runtime output: schemas/examples are versioned, machine runs are not.
 telemetry/runs/*.jsonl

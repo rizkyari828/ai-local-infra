@@ -167,6 +167,29 @@ For the local Qwen Code developer runtime — measured performance, verified
 settings, diagnosed bottlenecks, and the recommended workflow — see
 [`docs/QWEN_WORKFLOW.md`](docs/QWEN_WORKFLOW.md).
 
+## Multi-machine sync (v0.1 M2/M3)
+
+Git carries portable desired state; each machine applies it locally and keeps its
+own runtime state. Machine selection is explicit via `LAI_MACHINE`:
+
+```bash
+LAI_MACHINE=work-mac ./scripts/bootstrap status
+LAI_MACHINE=work-mac ./scripts/bootstrap graph status
+LAI_MACHINE=work-mac ./scripts/bootstrap graph rebuild   # explicit only; never automatic
+LAI_MACHINE=work-mac ./scripts/bootstrap apply --dry-run
+LAI_MACHINE=work-mac ./scripts/bootstrap apply
+LAI_MACHINE=work-mac ./scripts/bootstrap rollback
+```
+
+It owns only declared managed blocks/keys (Codex AGENTS block, Headroom MCP table,
+generated Headroom defaults), never whole config directories, and syncs no secrets
+or runtime state. Graphify freshness is classified read-only (CURRENT/STALE/
+MISSING/BLOCKED) from a local sidecar manifest; `status` and `apply` never rebuild.
+Only the explicit `graph rebuild` command rebuilds the external graph (staged,
+validated, atomically promoted, manifest written last). Components we do not manage
+(RTK, OpenCode) are reported `NOT_MANAGED`, not as errors. See
+[Multi-machine sync](docs/MULTI_MACHINE_SYNC_V0_1.md).
+
 ## Why files only?
 
 One WSL2 workstation and one substantial GPU workload at a time do not justify PostgreSQL, Redis, a vector database, HTTP service, dashboard, or scheduler. JSON/JSONL keeps v0.1 inspectable, portable, and easy to replace when evidence supports a larger system.

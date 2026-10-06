@@ -140,12 +140,11 @@ A machine profile is a small, non-secret declaration of **what may differ per
 machine**. It is not a copy of all config. Logical identities: `work-mac`,
 `home-wsl`.
 
-Identity resolution order (first match wins):
+Identity resolution is explicit (no hostname guessing):
 
-1. Explicit `LAI_MACHINE` environment value (authoritative, used in bootstrap/CI).
-2. Exact entry in `machines/` whose `match` block fits (OS + optional hostname
-   pattern), for interactive convenience.
-3. Refuse to guess: report `BLOCKED` and ask for `LAI_MACHINE`.
+1. `LAI_MACHINE` environment value (authoritative, used in bootstrap/CI), or the
+   equivalent explicit `--machine <id>` flag.
+2. If absent, refuse to guess: `status` reports `BLOCKED` and `apply` mutates nothing.
 
 Profiles live in `machines/<id>.yaml` and are SHARED because they carry no secrets.
 Per-machine secrets and true run-only values live in
@@ -157,21 +156,29 @@ Minimal profile shape (JSON-compatible YAML, matching repo style):
 {
   "schema_version": 1,
   "id": "work-mac",
-  "match": {"os": "darwin", "hostname_glob": "*-mac"},
+  "platform": "macos",
   "os": "darwin",
+  "shell": "zsh",
   "repo_path": "~/Developer/Back-End/ai-local-infra",
   "graph_root": "~/.local/share/local-ai-infra/graphify",
   "state_dir": "~/.local/state/local-ai-infra",
-  "shell": "zsh",
-  "lifecycle": {"headroom": "launchd", "ollama": "brew-services"},
   "bin": {"oc": "~/.local/bin/oc"},
+  "headroom": {"bin": "~/.local/bin/headroom", "lifecycle": "wrapper"},
+  "lifecycle_capabilities": ["launchd"],
   "provider_availability": {"ollama": true, "deepseek": true, "codex": true}
 }
 ```
 
+**Lifecycle correction (M3).** The desired Headroom lifecycle is `wrapper` on both
+machines: `~/.local/bin/oc` (or the Linux equivalent) checks and starts Headroom
+locally. `launchd`/`systemd` are recorded only as **future optional capabilities**
+under `lifecycle_capabilities`; they are never desired state. Bootstrap must not
+create, enable, or manage launchd plists, systemd units, cron, or any background
+daemon registration.
+
 Values that MAY differ per machine: OS, repo path, graph storage root, state dir,
-binary locations, lifecycle implementation, shell, provider availability, and
-optional capability flags. Values that MUST NOT differ conceptually are the policy
+binary locations, lifecycle **capability** flags, shell, provider availability, and
+optional feature flags. Values that MUST NOT differ conceptually are the policy
 files themselves (routing, telemetry, guidance); machines only point at them.
 
 ## 6. Configuration precedence and target repository structure
@@ -298,34 +305,55 @@ Modes:
   health check → verify actual state. Re-running with matching state performs no
   writes.
 
-Intended flow:
+Intended flow (repo-native `scripts/bootstrap`, matching the `ai-profile` CLI style):
 
 ```bash
 git pull
-./bootstrap/status
-./bootstrap/apply --dry-run
-./bootstrap/apply
-./bootstrap/verify
+LAI_MACHINE=work-mac ./scripts/bootstrap status
+LAI_MACHINE=work-mac ./scripts/bootstrap apply --dry-run
+LAI_MACHINE=work-mac ./scripts/bootstrap apply
+LAI_MACHINE=work-mac ./scripts/bootstrap status
 ```
+
+`status` is read-only. `apply` validates, backs up, mutates owned blocks/keys only,
+re-reads, and verifies. `rollback` restores the latest bootstrap backup.
 
 Boundaries: `sudo` only where the existing `ai-profile` already does (system Ollama
 drop-in). User-level configs never use `sudo`. Managed writes are atomic or
 merge/block-scoped. Failure after a write triggers restore of the just-created
 backup (existing behavior).
 
-## 9. Drift states
+## 9. Drift states and ownership
 
-Per managed unit, `status` reports exactly one:
+Drift state and ownership are separate concepts. Drift states apply only to units we
+manage or can classify. Ownership/capability says whether we manage a unit at all.
+
+Per managed unit, `status` reports exactly one drift state:
 
 - **ALIGNED** — actual matches the resolved desired value.
 - **DRIFTED** — present but differs; safely reconcilable.
 - **MISSING** — managed unit or required target absent.
-- **LOCAL-OVERRIDE** — a local value intentionally supersedes shared policy under
-  §6 layer 4; reported, not changed.
-- **STALE** — present and plausible, but its recorded provenance is older than the
-  desired revision (for example a generated graph from another HEAD).
-- **BLOCKED** — cannot decide or safely proceed (unknown machine identity,
-  unresolvable conflict, missing privilege, unmanaged divergence in a mixed file).
+- **LOCAL-OVERRIDE** — the final local-only layer (`machine.local.yaml`) intentionally
+  supersedes shared policy (§6 layer 4); reported, not changed. A committed machine
+  profile differing from common defaults is **not** a local override.
+- **STALE** — present and plausible, but its recorded provenance is older or
+  unverified (for example a generated graph from another HEAD or version).
+- **BLOCKED** — a real unsafe/unresolved condition: unknown machine identity,
+  unsupported machine/platform, parse failure, duplicate/malformed managed markers,
+  malformed ownership region, secret violation, unsafe ambiguity/path, unreadable
+  required target, invalid config.
+
+The frozen drift vocabulary stays exactly
+`ALIGNED / DRIFTED / MISSING / LOCAL-OVERRIDE / STALE / BLOCKED`. There is no
+`DEFERRED` drift state.
+
+Ownership capability is reported separately:
+
+- `MANAGED` — the unit has a drift state and may be applied or classified.
+- `NOT_MANAGED` — intentionally outside current ownership (RTK runtime/config,
+  OpenCode global config). Reported with a reason; **never** shown as `BLOCKED`.
+- Capability vs mutability: a `MANAGED` unit may still be `READ_ONLY`/`NONE`
+  (for example Graphify freshness is classified but never written by apply).
 
 Mapping to the existing `ai-profile` vocabulary so no parallel system is created:
 `ALIGNED`≈`MATCH`, `DRIFTED`≈`DRIFT`, `BLOCKED`/`MISSING`⊂`UNKNOWN`.
@@ -333,27 +361,55 @@ Mapping to the existing `ai-profile` vocabulary so no parallel system is created
 ## 10. Graphify freshness contract
 
 Graphs remain **generated locally** and are never committed. Freshness is judged
-from a locally stored manifest beside the graph (under `graph_root`), not from Git.
-Manifest fields:
+from a locally stored sidecar manifest beside the graph, not from Git and not from
+graph existence alone. Manifest file: `lai-freshness.json` in the graph directory.
 
-- `repository` — repo identity (remote URL or normalized absolute path).
+Manifest fields (schema_version 1):
+
+- `repository_identity` — `remote:<sanitized-url>` when a remote exists, else
+  `name:<repo-name>`. Path is diagnostics only; identity never depends on path.
+- `repository_name` / `repository_root` — diagnostics (root is local-only).
 - `git_head` — commit recorded at build time.
 - `graphify_version` — builder version.
-- `built_at_utc` — build timestamp.
-- `node_count` / `edge_count` — sanity signals.
+- `built_at` — build timestamp (UTC).
 - `graph_path` — location of the generated graph.
+- optional `node_count` / `edge_count` — only when cheaply and reliably available.
 
 Decision rule:
 
 ```text
-manifest missing or repository mismatch   -> MISSING
-manifest.git_head == current HEAD         -> CURRENT
-manifest.git_head != current HEAD         -> STALE
+graph dir resolves inside the repository            -> BLOCKED (unsafe)
+graph.json absent                                    -> MISSING
+sidecar manifest absent                              -> MISSING (provenance unverified)
+manifest unreadable / malformed / missing fields     -> BLOCKED
+identity mismatch or identity unresolved             -> BLOCKED
+manifest.git_head != current HEAD                    -> STALE
+installed graphify version unavailable/unparseable   -> STALE (unverified)
+manifest.graphify_version != installed version       -> STALE
+manifest.graph_path != located graph                 -> STALE
+working tree has uncommitted changes                 -> STALE (matches committed HEAD only)
+otherwise                                            -> CURRENT
 ```
 
-**V0.1 decision: WARN ONLY.** If the graph is `STALE`, report it and continue.
-No automatic rebuild on startup. An optional manual rebuild may be documented, but
-is never triggered automatically and never blocks a task.
+`CURRENT` requires a clean working tree: Graphify extracts from the working tree, so
+a manifest that matches committed HEAD is only `CURRENT` while the worktree is also
+clean. Uncommitted changes report `STALE` (warn-only, never `BLOCKED`, never
+rebuilt by status/apply).
+
+`CURRENT` is never claimed from graph existence alone, and the existing external
+graph is **not** adopted by writing a manifest with the current HEAD. Adoption would
+require a fresh rebuild or independently trustworthy build provenance. Graph
+provenance is valid only for a **clean Git working tree** at build time: Graphify
+extracts from the working tree, so HEAD plus uncommitted changes is not equivalent
+to HEAD, and `graph rebuild` refuses to write a manifest unless the worktree is
+clean (see §17).
+
+**V0.1 decision: WARN ONLY.** `status` and `apply` never rebuild the graph;
+`apply` never fails because the graph is `STALE`/`MISSING`. Graph freshness is
+classified by `scripts/bootstrap status` and `scripts/bootstrap graph status`.
+Rebuild happens only through the explicit `scripts/bootstrap graph rebuild`
+command (see §17); it writes the sidecar manifest atomically only after a
+successful generation and preserves the previous usable graph on failure.
 
 ## 11. Secret safety
 
@@ -376,16 +432,19 @@ is never triggered automatically and never blocks a task.
   value.
 - Portability is achieved by **placeholder + local reference**, never by copying a
   secret between machines or into the repository.
+- Repository identity written into the graph manifest is sanitized: credential
+  userinfo (for example `https://token@host/repo.git`) is stripped before it is
+  persisted, and the manifest is secret-scanned before an atomic write.
 
 ## 12. Update workflow
 
 ```text
 Machine A                          Machine B
   edit shared policy                 git pull
-  run status / dry-run               ./bootstrap/status
-  verify locally                     ./bootstrap/apply --dry-run
-  commit + push                      ./bootstrap/apply
-                                     ./bootstrap/verify
+  run status / dry-run               ./scripts/bootstrap status
+  verify locally                     ./scripts/bootstrap apply --dry-run
+  commit + push                      ./scripts/bootstrap apply
+                                     ./scripts/bootstrap status
 ```
 
 Explicitly rejected for v0.1: live two-way sync, auto push, automatic conflict
@@ -461,11 +520,15 @@ Entry criteria: M1 approved. Exit criteria:
 
 ### M3 — Graphify freshness + generalized drift detection
 
-- Local graph manifest written and read per §10.
-- `status` reports `CURRENT`/`STALE`/`MISSING` for the graph and never rebuilds.
-- Drift detection generalizes to all managed units (Codex/OpenCode/Headroom/RTK)
-  with per-key/block granularity.
-- `LOCAL-OVERRIDE` and `BLOCKED` are distinguished and tested.
+- Local graph sidecar manifest schema implemented per §10; never committed.
+- `status`/`graph status` report `CURRENT`/`STALE`/`MISSING`/`BLOCKED` for the graph
+  and never rebuild it.
+- Repository identity is remote-based (path-independent) and credential-sanitized.
+- Graph root resolving inside the repository (including via symlink) is `BLOCKED`.
+- No false `CURRENT` without provenance; an existing graph is not adopted.
+- Drift generalizes to managed units; `NOT_MANAGED` capability is separate from
+  drift; `LOCAL-OVERRIDE` only from the final local layer.
+- `STALE`/`MISSING` graph never blocks unrelated safe apply.
 
 ### M4 — Cross-machine verification + documentation
 
@@ -474,4 +537,132 @@ Entry criteria: M1 approved. Exit criteria:
 - Derived-learning sharing is documented as reviewed/consented-only (no raw data).
 - Operating docs updated; `verify-environment` still passes.
 
-Do not proceed to M2 until this contract is approved.
+## 16. M2 implementation (delivered)
+
+Repo-native CLI `scripts/bootstrap` (Python stdlib only), matching the
+`scripts/ai-profile` style. `bootstrap/status` in §8 is realized as
+`scripts/bootstrap status`.
+
+```bash
+LAI_MACHINE=work-mac ./scripts/bootstrap status
+LAI_MACHINE=work-mac ./scripts/bootstrap apply --dry-run
+LAI_MACHINE=work-mac ./scripts/bootstrap apply
+LAI_MACHINE=work-mac ./scripts/bootstrap rollback          # restore latest backup
+LAI_MACHINE=work-mac ./scripts/bootstrap rollback --dry-run
+./scripts/bootstrap secrets                                 # scan managed sources
+```
+
+`--machine <id>` is accepted as an explicit alternative to `LAI_MACHINE`; hostname
+is never used to guess. Without a machine, `status` reports `BLOCKED` and `apply`
+refuses to mutate anything.
+
+Source of truth and layout:
+
+- `config/bootstrap.yaml` — portable desired state (units + defaults). No secrets.
+- `config/platform/macos.yaml`, `config/platform/linux.yaml` — platform layer.
+- `machines/work-mac.yaml`, `machines/home-wsl.yaml` — committed, non-secret profiles.
+- `templates/codex/AGENTS.block.md`, `templates/headroom/mcp-server.toml` — managed
+  content.
+- `scripts/common/bootstrap.py` — load/precedence/plan/apply engine.
+- `scripts/common/secret_guard.py` — deny-by-default secret scanner.
+- Local override: `$LAI_STATE_DIR/machine.local.yaml` (git-ignored location), merged
+  last per key; `disabled_units` there yields `LOCAL-OVERRIDE`.
+- Backups: `$LAI_STATE_DIR/backups/bootstrap/<stamp>/manifest.json` (0700/0600),
+  distinct from `ai-profile` backups so the two rollbacks never cross.
+
+Owned vs not-managed in M2/M3 (see §9 for the ownership model):
+
+- Applied: `codex.guidance` (managed block in `~/.codex/AGENTS.md`),
+  `headroom.mcp` (owned `[mcp_servers.headroom]` table in `~/.codex/config.toml`),
+  `headroom.defaults` (generated desired-defaults file under the state dir).
+- Classified read-only: `graphify.freshness` (warn-only; never written by apply).
+- `NOT_MANAGED` (reported with a reason, never `BLOCKED`): `rtk.guidance`,
+  `opencode.config`. Runtime AUTO verification remains M4.
+
+No daemon, no network sync, no whole-directory replacement, and no file outside the
+owned blocks/keys is written.
+
+## 17. M3 implementation (delivered)
+
+Repository identity, freshness, and generalized status/ownership.
+
+```bash
+LAI_MACHINE=work-mac ./scripts/bootstrap status        # managed + not-managed, read-only
+LAI_MACHINE=work-mac ./scripts/bootstrap graph status  # graph freshness only
+```
+
+- Repository identity (`scripts/common/bootstrap.py:compute_repository`): sanitized
+  remote (`remote:<url>` with credentials stripped) when present, else
+  `name:<repo-name>`. Absolute path is diagnostics only; identity does not depend on
+  path equality.
+- Graphify version (`detect_graphify_version`): `graphify --version` parsed
+  conservatively; never installs anything. Missing/unparseable version yields
+  `STALE` (unverified), not a false `CURRENT`.
+- Freshness (`evaluate_graph_freshness`): rule in §10. Path safety rejects any graph
+  dir that resolves inside the repository, including via symlink, as `BLOCKED`.
+- Manifest writer (`write_graph_manifest`): atomic (`0600`), sanitized, secret-scanned;
+  used by a future rebuild step and by tests. It refuses to write inside the repo.
+- Ownership vs drift: each unit reports `ownership` (`MANAGED`/`NOT_MANAGED`),
+  `mutability` (`APPLY`/`NONE`), `capability`, and — only when managed — a drift
+  state. Deferred components are `NOT_MANAGED`, never `BLOCKED`. `status` prints a
+  `MANAGED` block (with states) and a separate `NOT MANAGED` block (no states).
+- Lifecycle: desired is `wrapper`; `launchd`/`systemd` appear only under
+  `lifecycle_capabilities`. No service registration is created or managed.
+- Apply safety: only hard `BLOCKED` units with `mutability=APPLY` abort an apply.
+  `STALE`/`MISSING` graph freshness never blocks unrelated config repair.
+
+### Status exit-code contract
+
+- `0` — report produced; `ALIGNED`/`DRIFTED`/`MISSING`/`LOCAL-OVERRIDE`/`STALE`
+  are all success (status is informational; CI can inspect the text/JSON later).
+- `1` — a true `BLOCKED` condition (unsafe/malformed/ambiguous).
+- `2` — command/config error (missing `LAI_MACHINE`, unreadable config, bad args).
+
+`apply`: `0` success or no-op; `1` hard `BLOCKED` refusal (no mutation); `2` error.
+`rollback`: `0` success; `2` error.
+
+### Graph rebuild (M3.1)
+
+Explicit, user-commanded only:
+
+```bash
+LAI_MACHINE=work-mac ./scripts/bootstrap graph rebuild
+```
+
+- Never automatic: `status`, `apply`, `apply --dry-run`, `oc`, OpenCode/Codex
+  startup, and shell startup never invoke a rebuild. Only this command does.
+- Invocation uses the installed Graphify CLI with local, key-free extraction:
+  `graphify extract <repo> --code-only --no-cluster --out <staging>`. No
+  LLM/network extraction; `GRAPHIFY_*` env vars are cleared for the child so no
+  external redirect/compare leaks in.
+- Staging/promotion: the graph is built in a sibling `.lai-staging-<id>` directory,
+  validated, then promoted by moving the previous `graphify-out` aside and renaming
+  the staged artifact into place (same filesystem). The previous graph and manifest
+  remain untouched until the new graph validates. On any failure the previous graph
+  is preserved, staging (owned by this run) is removed, and the command returns
+  non-zero.
+- Clean worktree required: before creating staging or invoking Graphify, rebuild runs
+  `git status --porcelain --untracked-files=normal` on the repository. Tracked,
+  staged, deleted, and untracked files all block; ignored local/runtime files do
+  not. On a dirty tree the rebuild refuses with a concise reason, invokes nothing,
+  changes neither the graph nor the manifest, and returns non-zero. Nothing is
+  committed, stashed, reset, or cleaned automatically. Provenance is therefore
+  valid only for a clean Git working tree at build time.
+- HEAD consistency: HEAD is captured before the build and re-checked after; if it
+  changed, promotion is refused and provenance is not written. Clean-worktree and
+  HEAD stability are both required.
+- Manifest written last: `lai-freshness.json` is written only after a non-empty,
+  parseable graph is promoted, and passes the secret gate. Counts
+  (`node_count`/`edge_count`/`source_count`) are captured only when present.
+- Lifecycle: after a successful rebuild `graph status` reports `CURRENT`; a later
+  HEAD or Graphify version change, or a dirty working tree, reports `STALE`; a
+  missing manifest is `MISSING`.
+
+M4 uses this explicit rebuild on each machine before final cross-machine
+verification. Nothing rebuilds automatically.
+
+### M4 boundary
+
+Cross-machine runtime verification (work-mac and home-wsl), RTK AUTO runtime
+verification, Graphify AUTO agent behavior, and Headroom health/integration are M4.
+M3 makes no home-wsl runtime claims.

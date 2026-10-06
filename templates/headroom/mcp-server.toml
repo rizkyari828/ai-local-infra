@@ -1,0 +1,3 @@
+[mcp_servers.headroom]
+command = "{{headroom.bin}}"
+args = ["mcp", "serve", "--proxy-url", "http://{{headroom.host}}:{{headroom.port}}"]

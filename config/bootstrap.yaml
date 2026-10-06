@@ -1,0 +1,88 @@
+{
+  "schema_version": 1,
+  "bootstrap_version": "0.2.0",
+  "notes": "Portable desired state for multi-machine sync v0.1. Owns only managed blocks and declared keys/tables; never replaces whole user config files. Must never contain secrets. Runtime state, credentials, sessions, and generated graphs are machine-local and never referenced here. Lifecycle is wrapper-managed; launchd/systemd are future optional capabilities, never desired state.",
+  "headroom": {
+    "host": "127.0.0.1",
+    "port": 8787,
+    "telemetry": "disabled",
+    "memory_policy": "bounded",
+    "flags": ["mcp", "serve"],
+    "bin": "~/.local/bin/headroom",
+    "lifecycle": "wrapper"
+  },
+  "codex": {
+    "agents_path": "~/.codex/AGENTS.md",
+    "config_path": "~/.codex/config.toml"
+  },
+  "opencode": {
+    "config_path": "~/.config/opencode/opencode.jsonc"
+  },
+  "graphify": {
+    "graph_dir": "{{graph_root}}/{{repository.name}}/graphify-out",
+    "graph_file": "graph.json",
+    "manifest_name": "lai-freshness.json",
+    "binary": "graphify",
+    "warn_only": true
+  },
+  "disabled_units": [],
+  "units": [
+    {
+      "id": "codex.guidance",
+      "component": "codex",
+      "mode": "managed-block",
+      "target": "{{codex.agents_path}}",
+      "block_id": "codex-guidance",
+      "comment": "html",
+      "create": true,
+      "template": "templates/codex/AGENTS.block.md"
+    },
+    {
+      "id": "headroom.mcp",
+      "component": "headroom",
+      "mode": "toml-table",
+      "target": "{{codex.config_path}}",
+      "table": "mcp_servers.headroom",
+      "create": false,
+      "template": "templates/headroom/mcp-server.toml"
+    },
+    {
+      "id": "headroom.defaults",
+      "component": "headroom",
+      "mode": "generated-json",
+      "target": "{{state_dir}}/headroom/desired.json",
+      "create": true,
+      "values": {
+        "schema_version": 1,
+        "component": "headroom",
+        "host": "{{headroom.host}}",
+        "port": "{{headroom.port}}",
+        "telemetry": "{{headroom.telemetry}}",
+        "memory_policy": "{{headroom.memory_policy}}",
+        "flags": "{{headroom.flags}}",
+        "lifecycle": "{{headroom.lifecycle}}"
+      }
+    },
+    {
+      "id": "graphify.freshness",
+      "component": "graphify",
+      "mode": "graph-freshness",
+      "graph_dir": "{{graphify.graph_dir}}",
+      "warn_only": true,
+      "reason": "warn-only in v0.1; status and apply never rebuild the graph"
+    },
+    {
+      "id": "rtk.guidance",
+      "component": "rtk",
+      "mode": "deferred",
+      "reason": "RTK config/runtime is machine-local; portable guidance is carried by the Codex managed block. Runtime AUTO verification is M4."
+    },
+    {
+      "id": "opencode.config",
+      "component": "opencode",
+      "mode": "deferred",
+      "target": "{{opencode.config_path}}",
+      "reason": "JSONC mixes provider credentials and local endpoints; ownership deferred rather than guessed (safety over completeness)."
+    }
+  ]
+}

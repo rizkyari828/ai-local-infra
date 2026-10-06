@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+"""Status, dry-run, apply, and roll back portable multi-machine config.
+
+Owns only declared managed blocks/keys, never whole user config directories.
+Reports Graphify freshness read-only (warn-only). Machine selection is explicit:
+set LAI_MACHINE (work-mac, home-wsl) or pass --machine. Status is read-only.
+See docs/MULTI_MACHINE_SYNC_V0_1.md.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import pathlib
+import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "common"))
+import bootstrap  # noqa: E402
+
+
+def with_machine(args: argparse.Namespace) -> dict[str, str]:
+    env = dict(os.environ)
+    if getattr(args, "machine", None):
+        env["LAI_MACHINE"] = args.machine
+    return env
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    return bootstrap.cmd_status(with_machine(args))
+
+
+def cmd_apply(args: argparse.Namespace) -> int:
+    return bootstrap.cmd_apply(with_machine(args), dry_run=args.dry_run)
+
+
+def cmd_rollback(args: argparse.Namespace) -> int:
+    return bootstrap.cmd_rollback(with_machine(args), dry_run=args.dry_run)
+
+
+def cmd_secrets(args: argparse.Namespace) -> int:
+    return bootstrap.cmd_secrets()
+
+
+def cmd_graph_status(args: argparse.Namespace) -> int:
+    return bootstrap.cmd_graph_status(with_machine(args))
+
+
+def cmd_graph_rebuild(args: argparse.Namespace) -> int:
+    return bootstrap.cmd_graph_rebuild(with_machine(args))
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(description=__doc__)
+    sub = result.add_subparsers(dest="command", required=True)
+
+    def add(name: str, help_text: str, func) -> argparse.ArgumentParser:
+        child = sub.add_parser(name, help=help_text)
+        child.add_argument("--machine", help="machine profile id (defaults to LAI_MACHINE)")
+        child.set_defaults(func=func)
+        return child
+
+    add("status", "read-only report of managed-unit states", cmd_status)
+    apply_parser = add("apply", "apply owned blocks/keys only", cmd_apply)
+    apply_parser.add_argument("--dry-run", action="store_true", help="preview without writing or backing up")
+    rollback_parser = add("rollback", "restore the latest bootstrap backup", cmd_rollback)
+    rollback_parser.add_argument("--dry-run", action="store_true", help="preview the restore")
+    add("secrets", "scan managed repo config/templates for obvious secrets", cmd_secrets)
+    graph = sub.add_parser("graph", help="graph freshness (read-only) and explicit rebuild")
+    graph_sub = graph.add_subparsers(dest="graph_command", required=True)
+    graph_status = graph_sub.add_parser("status", help="report graph freshness only")
+    graph_status.add_argument("--machine", help="machine profile id (defaults to LAI_MACHINE)")
+    graph_status.set_defaults(func=cmd_graph_status)
+    graph_rebuild = graph_sub.add_parser("rebuild", help="explicitly rebuild the graph and write provenance")
+    graph_rebuild.add_argument("--machine", help="machine profile id (defaults to LAI_MACHINE)")
+    graph_rebuild.set_defaults(func=cmd_graph_rebuild)
+    return result
+
+
+def main() -> int:
+    try:
+        args = parser().parse_args()
+        return args.func(args)
+    except (bootstrap.BootstrapError, OSError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
