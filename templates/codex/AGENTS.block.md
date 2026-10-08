@@ -6,7 +6,7 @@ source in `ai-local-infra/templates/codex/AGENTS.block.md`, not in this file.
 - RTK: prefix shell commands with `rtk` (`rtk git status`) and keep the prefix
   inside chains. The runtime AUTO state is owned by the tool, not by this block.
 - Graphify: answer architecture, dependency, and navigation questions from the
-  prebuilt graph first, then corroborate with reads. The graph is generated
-  locally and never committed.
+  canonical local graph at `{{graphify.graph_dir}}/{{graphify.graph_file}}`
+  (generated locally, never committed) before corroborating with reads.
 - Headroom: the MCP server declaration is owned as its own table in `config.toml`.
   Credentials, PID, logs, cache, and runtime state stay machine-local.

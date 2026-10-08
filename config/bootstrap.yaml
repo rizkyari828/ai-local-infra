@@ -74,6 +74,22 @@
       }
     },
     {
+      "id": "graphify.runtime",
+      "component": "graphify",
+      "mode": "generated-json",
+      "target": "{{state_dir}}/graphify/runtime.json",
+      "create": true,
+      "values": {
+        "schema_version": 1,
+        "component": "graphify",
+        "graph_dir": "{{graphify.graph_dir}}",
+        "graph_file": "{{graphify.graph_file}}",
+        "graph_path": "{{graphify.graph_dir}}/{{graphify.graph_file}}",
+        "manifest_name": "{{graphify.manifest_name}}",
+        "manifest_path": "{{graphify.graph_dir}}/{{graphify.manifest_name}}"
+      }
+    },
+    {
       "id": "graphify.freshness",
       "component": "graphify",
       "mode": "graph-freshness",
@@ -93,6 +109,14 @@
       "mode": "deferred",
       "target": "{{opencode.config_path}}",
       "reason": "JSONC mixes provider credentials and local endpoints; ownership deferred rather than guessed (safety over completeness)."
+    },
+    {
+      "id": "opencode.graphify",
+      "component": "opencode",
+      "mode": "managed-file",
+      "target": "~/.config/opencode/plugins/graphify.ts",
+      "create": true,
+      "template": "templates/opencode/plugins/graphify.ts"
     }
   ]
 }

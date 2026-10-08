@@ -624,6 +624,8 @@ def _unit_plan(unit: dict[str, Any], ctx: dict[str, Any], disabled: set[str],
         return _plan_toml_key(unit, ctx, base)
     if mode == "generated-json":
         return _plan_json(unit, ctx, base)
+    if mode == "managed-file":
+        return _plan_managed_file(unit, ctx, base)
     base.update(state="BLOCKED", hard=True, reason=f"unsupported mode: {mode}")
     return base
 
@@ -804,6 +806,33 @@ def _plan_json(unit: dict[str, Any], ctx: dict[str, Any], base: dict[str, Any]) 
         base.update(state="ALIGNED", reason="generated file matches")
     else:
         base.update(state="DRIFTED", reason="generated file differs", changes=True, write=desired)
+    return base
+
+
+def _plan_managed_file(unit: dict[str, Any], ctx: dict[str, Any], base: dict[str, Any]) -> dict[str, Any]:
+    """Own exactly one whole text file rendered from a template.
+
+    Used for a template-rendered Graphify runtime adapter (the OpenCode plugin),
+    bounded to the declared target. The file is created only when ``create`` is
+    true; every write is staged and backed up by ``apply`` like any other unit.
+    """
+    target = pathlib.Path(expand(str(resolve(unit["target"], ctx))))
+    create = bool(unit.get("create"))
+    desired = render_template(unit["template"], ctx)
+    base.update(target=str(target), create=create, desired=desired)
+    if not target.exists():
+        base.update(state="MISSING", reason="managed file absent",
+                    changes=create, write=desired if create else None)
+        return base
+    try:
+        current = target.read_text(encoding="utf-8")
+    except OSError as exc:
+        base.update(state="BLOCKED", hard=True, reason=f"unreadable file: {exc}")
+        return base
+    if current == desired:
+        base.update(state="ALIGNED", reason="managed file matches")
+    else:
+        base.update(state="DRIFTED", reason="managed file differs", changes=True, write=desired)
     return base
 
 
