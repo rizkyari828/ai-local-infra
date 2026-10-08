@@ -38,12 +38,22 @@
       "template": "templates/codex/AGENTS.block.md"
     },
     {
+      "id": "codex.model",
+      "component": "codex",
+      "mode": "toml-key",
+      "target": "{{codex.config_path}}",
+      "key": "model",
+      "value": "{{codex.model}}",
+      "create": true,
+      "requires": "codex.model"
+    },
+    {
       "id": "headroom.mcp",
       "component": "headroom",
       "mode": "toml-table",
       "target": "{{codex.config_path}}",
       "table": "mcp_servers.headroom",
-      "create": false,
+      "create": true,
       "template": "templates/headroom/mcp-server.toml"
     },
     {

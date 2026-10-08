@@ -7,6 +7,9 @@
   "repo_path": "~/ai-local-infra",
   "graph_root": "~/.local/share/local-ai-infra/graphify",
   "state_dir": "~/.local/state/local-ai-infra",
+  "codex": {
+    "model": "gpt-5.6-sol"
+  },
   "bin": {
     "oc": "~/.local/bin/oc"
   },

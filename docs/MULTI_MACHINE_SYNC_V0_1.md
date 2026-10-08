@@ -573,8 +573,14 @@ Source of truth and layout:
 Owned vs not-managed in M2/M3 (see §9 for the ownership model):
 
 - Applied: `codex.guidance` (managed block in `~/.codex/AGENTS.md`),
-  `headroom.mcp` (owned `[mcp_servers.headroom]` table in `~/.codex/config.toml`),
-  `headroom.defaults` (generated desired-defaults file under the state dir).
+  `codex.model` (owned top-level `model` key in `~/.codex/config.toml`, machine-scoped:
+  active only where the profile declares `codex.model`) and `headroom.mcp` (owned
+  `[mcp_servers.headroom]` table in the same file), `headroom.defaults` (generated
+  desired-defaults file under the state dir).
+- When `~/.codex/config.toml` is absent, the two `config.toml` units report `MISSING`
+  and never fabricate a whole file. When it exists, an absent table/key is created in
+  place and a drifted one is rewritten only within its owned table/key; unrelated
+  keys, tables, comments, and project-trust blocks are preserved.
 - Classified read-only: `graphify.freshness` (warn-only; never written by apply).
 - `NOT_MANAGED` (reported with a reason, never `BLOCKED`): `rtk.guidance`,
   `opencode.config`. Runtime AUTO verification remains M4.
@@ -610,6 +616,14 @@ LAI_MACHINE=work-mac ./scripts/bootstrap graph status  # graph freshness only
   `lifecycle_capabilities`. No service registration is created or managed.
 - Apply safety: only hard `BLOCKED` units with `mutability=APPLY` abort an apply.
   `STALE`/`MISSING` graph freshness never blocks unrelated config repair.
+- Placeholder resolution is recursive and deterministic: known placeholders expand
+  until none remain, bounded by `MAX_RESOLVE_DEPTH`; a cycle or an unresolved
+  placeholder is a config error (`BLOCKED`), never a silent guess. This is why the
+  portable `graphify.graph_dir` (`{{graph_root}}/{{repository.name}}/graphify-out`)
+  resolves for machines that do not override it (for example `home-wsl`).
+- Several owned units may share one file (both `codex.model` and `headroom.mcp`
+  target `config.toml`). Apply re-plans before writing each unit so the edits compose
+  instead of overwriting one another from a stale snapshot.
 
 ### Status exit-code contract
 

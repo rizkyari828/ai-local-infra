@@ -22,6 +22,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import tomllib
 import uuid
 from typing import Any
 
@@ -39,6 +40,7 @@ DEFAULT_MANIFEST_NAME = "lai-freshness.json"
 GRAPH_FILE = "graph.json"
 
 PLACEHOLDER_RE = re.compile(r"\{\{\s*([A-Za-z0-9_.\-]+)\s*\}\}")
+MAX_RESOLVE_DEPTH = 12
 MANAGED_SOURCE_GLOBS = (
     "config/*.yaml",
     "config/**/*.yaml",
@@ -121,12 +123,53 @@ def _lookup(ctx: dict[str, Any], dotted: str) -> Any:
     return node
 
 
+def _has_key(ctx: dict[str, Any], dotted: str) -> bool:
+    node: Any = ctx
+    for part in dotted.split("."):
+        if not isinstance(node, dict) or part not in node:
+            return False
+        node = node[part]
+    return True
+
+
+def _resolve_string(text: str, ctx: dict[str, Any]) -> Any:
+    """Expand placeholders repeatedly: deterministic, bounded, cycle-safe.
+
+    A whole-string placeholder preserves the referenced value's type (int, list,
+    ...). An embedded placeholder substitutes the string form and is re-expanded,
+    so nested references such as ``{{graphify.graph_dir}}`` resolve fully. An
+    unknown key, a detected cycle, or exceeding ``MAX_RESOLVE_DEPTH`` raises a
+    config error rather than guessing.
+    """
+    current: Any = text
+    seen: list[str] = []
+    for _ in range(MAX_RESOLVE_DEPTH + 1):
+        if not isinstance(current, str):
+            return current
+        whole = PLACEHOLDER_RE.fullmatch(current)
+        if whole:
+            value = _lookup(ctx, whole.group(1))
+            if not isinstance(value, str):
+                return value
+            if value == current or value in seen:
+                raise BootstrapError(
+                    f"placeholder cycle detected resolving {{{{{whole.group(1)}}}}}: {value!r}")
+            seen.append(current)
+            current = value
+            continue
+        if not PLACEHOLDER_RE.search(current):
+            return current
+        if current in seen:
+            raise BootstrapError(f"placeholder cycle detected: {current!r}")
+        seen.append(current)
+        current = PLACEHOLDER_RE.sub(lambda match: str(_lookup(ctx, match.group(1))), current)
+    raise BootstrapError(
+        f"placeholder expansion exceeded max depth {MAX_RESOLVE_DEPTH}: {text!r}")
+
+
 def resolve(value: Any, ctx: dict[str, Any]) -> Any:
     if isinstance(value, str):
-        whole = PLACEHOLDER_RE.fullmatch(value)
-        if whole:
-            return _lookup(ctx, whole.group(1))
-        return PLACEHOLDER_RE.sub(lambda m: str(_lookup(ctx, m.group(1))), value)
+        return _resolve_string(value, ctx)
     if isinstance(value, dict):
         return {key: resolve(item, ctx) for key, item in value.items()}
     if isinstance(value, list):
@@ -522,6 +565,8 @@ def find_toml_region(lines: list[str], table: str) -> tuple[str, int | None, int
         if any(dotted.match(line) for line in lines):
             return "blocked", None, None, f"ambiguous dotted keys for {table}"
         return "missing", None, None, None
+    if any(dotted.match(line) for line in lines):
+        return "blocked", None, None, f"ambiguous dotted keys alongside [{table}]"
     start = starts[0]
     end = len(lines)
     for index in range(start + 1, len(lines)):
@@ -559,6 +604,11 @@ def _unit_plan(unit: dict[str, Any], ctx: dict[str, Any], disabled: set[str],
         base.update(state="LOCAL-OVERRIDE", mutability=MUTABILITY_NONE,
                     reason="superseded by machine.local override")
         return base
+    required = unit.get("requires")
+    if required and not _has_key(ctx, required):
+        base.update(ownership=OWNERSHIP_NOT_MANAGED, mutability=MUTABILITY_NONE,
+                    reason=f"not declared for this machine ({required} absent)")
+        return base
     mode = unit.get("mode")
     if mode == "deferred":
         base.update(ownership=OWNERSHIP_NOT_MANAGED, mutability=MUTABILITY_NONE,
@@ -570,6 +620,8 @@ def _unit_plan(unit: dict[str, Any], ctx: dict[str, Any], disabled: set[str],
         return _plan_managed_block(unit, ctx, base)
     if mode == "toml-table":
         return _plan_toml(unit, ctx, base)
+    if mode == "toml-key":
+        return _plan_toml_key(unit, ctx, base)
     if mode == "generated-json":
         return _plan_json(unit, ctx, base)
     base.update(state="BLOCKED", hard=True, reason=f"unsupported mode: {mode}")
@@ -608,23 +660,43 @@ def _plan_managed_block(unit: dict[str, Any], ctx: dict[str, Any], base: dict[st
 
 
 def _plan_toml(unit: dict[str, Any], ctx: dict[str, Any], base: dict[str, Any]) -> dict[str, Any]:
+    """Own exactly one TOML table. Creates the table in an existing file only.
+
+    A missing target file is reported MISSING rather than fabricated: the M1/M2
+    contract never invents a whole ``~/.codex/config.toml``. Every unrelated key,
+    table, comment outside the owned table, and project-trust block is preserved.
+    """
     target = pathlib.Path(expand(str(resolve(unit["target"], ctx))))
     table = unit["table"]
     create = bool(unit.get("create"))
     desired = render_template(unit["template"], ctx).strip("\n") + "\n"
     base.update(target=str(target), table=table, create=create, desired=desired)
     if not target.exists():
-        base.update(state="MISSING", reason="target config absent",
-                    changes=create, write=desired if create else None)
+        base.update(state="MISSING",
+                    reason="target config absent; refusing to create whole file",
+                    changes=False)
         return base
-    lines = target.read_text(encoding="utf-8").splitlines(keepends=True)
+    try:
+        text = target.read_text(encoding="utf-8")
+    except OSError as exc:
+        base.update(state="BLOCKED", hard=True, reason=f"unreadable config: {exc}")
+        return base
+    try:
+        tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
+        base.update(state="BLOCKED", hard=True, reason=f"malformed TOML: {exc}")
+        return base
+    lines = text.splitlines(keepends=True)
     status, start, end, detail = find_toml_region(lines, table)
     if status == "blocked":
         base.update(state="BLOCKED", hard=True, reason=detail)
         return base
     if status == "missing":
-        base.update(state="MISSING", reason=f"[{table}] table absent",
-                    changes=create, write=(desired if create else None))
+        if not create:
+            base.update(state="MISSING", reason=f"[{table}] table absent", changes=False)
+            return base
+        base.update(state="MISSING", reason=f"[{table}] table absent; creating owned table",
+                    changes=True, write=append_block(text, desired))
         return base
     assert start is not None and end is not None
     existing = "".join(lines[start:end]).strip("\n")
@@ -633,6 +705,86 @@ def _plan_toml(unit: dict[str, Any], ctx: dict[str, Any], base: dict[str, Any]) 
     else:
         base.update(state="DRIFTED", reason=f"[{table}] differs", changes=True,
                     write="".join(lines[:start]) + desired + "".join(lines[end:]))
+    return base
+
+
+def _toml_literal(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    return json.dumps(value)
+
+
+def _plan_toml_key(unit: dict[str, Any], ctx: dict[str, Any], base: dict[str, Any]) -> dict[str, Any]:
+    """Own exactly one top-level TOML scalar key, never a table or whole file.
+
+    Used for a machine-specific default such as ``model``. A missing target file
+    is reported MISSING, not fabricated. The key is only considered at top level
+    (before the first table header); a table-scoped key of the same name is left
+    untouched. Duplicate top-level declarations and malformed TOML are BLOCKED.
+    """
+    target = pathlib.Path(expand(str(resolve(unit["target"], ctx))))
+    key = unit["key"]
+    desired_value = resolve(unit["value"], ctx)
+    desired_line = f"{key} = {_toml_literal(desired_value)}\n"
+    create = bool(unit.get("create"))
+    base.update(target=str(target), key=key, create=create, desired=desired_value)
+    if not target.exists():
+        base.update(state="MISSING",
+                    reason="target config absent; refusing to create whole file",
+                    changes=False)
+        return base
+    try:
+        text = target.read_text(encoding="utf-8")
+    except OSError as exc:
+        base.update(state="BLOCKED", hard=True, reason=f"unreadable config: {exc}")
+        return base
+    try:
+        parsed = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
+        base.update(state="BLOCKED", hard=True, reason=f"malformed TOML: {exc}")
+        return base
+    lines = text.splitlines(keepends=True)
+    first_header = next((i for i, line in enumerate(lines) if line.lstrip().startswith("[")),
+                        len(lines))
+    key_pattern = re.compile(r"^\s*" + re.escape(key) + r"\s*=")
+    offsets = [i for i in range(first_header) if key_pattern.match(lines[i])]
+    if len(offsets) > 1:
+        base.update(state="BLOCKED", hard=True, reason=f"duplicate top-level {key} key")
+        return base
+    if not offsets and key in parsed:
+        # The name is already bound as a table ([model]) or a dotted key, so
+        # inserting a scalar would produce invalid TOML. Refuse rather than guess.
+        base.update(state="BLOCKED", hard=True,
+                    reason=f"top-level {key} is defined as a table/dotted key")
+        return base
+    if offsets:
+        # ponytail: owns a single-line top-level scalar only; a multi-line value
+        # would need structured rewriting. Codex `model` is a quoted string.
+        if '"""' in lines[offsets[0]] or "'''" in lines[offsets[0]]:
+            base.update(state="BLOCKED", hard=True, reason=f"multi-line top-level {key} unsupported")
+            return base
+        if parsed.get(key) == desired_value:
+            base.update(state="ALIGNED", reason=f"top-level {key} matches")
+        else:
+            write = "".join(lines[:offsets[0]]) + desired_line + "".join(lines[offsets[0] + 1:])
+            base.update(state="DRIFTED", reason=f"top-level {key} differs",
+                        changes=True, write=write)
+        return base
+    if not create:
+        base.update(state="MISSING", reason=f"top-level {key} key absent", changes=False)
+        return base
+    head = lines[:first_header]
+    while head and not head[-1].strip():
+        head.pop()
+    head_text = "".join(head)
+    if head_text and not head_text.endswith("\n"):
+        head_text += "\n"
+    tail_text = "".join(lines[first_header:])
+    write = head_text + desired_line + ("\n" + tail_text if tail_text else "")
+    base.update(state="MISSING", reason=f"top-level {key} key absent; adding owned key",
+                changes=True, write=write)
     return base
 
 
@@ -863,7 +1015,14 @@ def cmd_apply(env: dict[str, str], dry_run: bool) -> int:
     print(f"Backup: {backup}")
     try:
         for unit in changed:
-            write_unit(unit)
+            # Re-plan per unit so several owned units in one file (Codex
+            # config.toml: the model key and the Headroom table) compose instead
+            # of each overwriting the other from a stale pre-apply snapshot.
+            refreshed, _ = build_plan(env)
+            current = next((candidate for candidate in refreshed
+                            if candidate["id"] == unit["id"]), None)
+            if current and current.get("changes") and current.get("write") is not None:
+                write_unit(current)
         verified, _ = build_plan(env)
         changed_ids = {unit["id"] for unit in changed}
         unresolved = [unit for unit in verified
