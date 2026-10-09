@@ -194,6 +194,37 @@ class TwoCallCeilingTests(unittest.TestCase):
         self.assertFalse(derived_knowledge.classify_failure("ACCOUNT_MODEL_UNSUPPORTED")
                          ["intelligence_escalation"])
 
+    def test_evidence_records_the_actual_backend_per_node(self) -> None:
+        import evidence
+        root = pathlib.Path(self.tmp.name) / "repo2"
+        root.mkdir()
+        subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(root), "config", "user.email", "t@example.com"], check=True)
+        subprocess.run(["git", "-C", str(root), "config", "user.name", "t"], check=True)
+        (root / "f").write_text("x\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(root), "commit", "-m", "i"], check=True, capture_output=True)
+        state = pathlib.Path(self.tmp.name) / "state2"
+        opencode = self._scripted("opencode", [{"task_id": "T2", "status": "SUCCESS",
+                                                "completion_signal": "agent_reported", "acceptance_results": {"ok": True}}])
+        codex = self._scripted("codex", [{"task_id": "T2S", "status": "SUCCESS",
+                                          "completion_signal": "agent_reported", "acceptance_results": {"ok": True}}])
+        health = failover.Health(binaries={"opencode": True, "codex": True},
+                                 providers={"opencode": {"deepseek"}, "codex": {"codex"}}, codex_model="gpt-6.1-sol")
+        by_tier = {"STRONG": [_spec("opencode", "deepseek", "deepseek-flash", "high", "STRONG", "high")],
+                   "MAX": [_spec("codex", "codex", None, "high", "MAX", "max")]}
+        with unittest.mock.patch.object(execution.failover, "candidates_for_tier",
+                                        side_effect=lambda tier, config=None: by_tier.get(tier, [])):
+            execution.execute_plan(self._plan(), backend=opencode,
+                                   backends={"opencode": opencode, "codex": codex}, health=health,
+                                   repo_root=root, confirm=True, record_evidence=True, max_ai_calls=2,
+                                   state_dir=state)
+        rows = {row["task_family"]: row for row in evidence.all_rows(state_dir=state)
+                if row["source"] == "observed_runtime"}
+        self.assertEqual("opencode", rows["multi_machine_acceptance"]["surface"])
+        self.assertEqual("codex", rows["security_sensitive_design"]["surface"])
+        self.assertEqual("gpt-6.1-sol", rows["security_sensitive_design"]["model"])
+
 
 if __name__ == "__main__":
     unittest.main()

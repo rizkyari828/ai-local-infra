@@ -454,8 +454,8 @@ def _run_node(node, deps, results, backend, resolution, *, state_dir, record_evi
     execution_id = uuid.uuid4().hex
     before = _worktree_paths(repo_root) if enforce_read_only else None
     decision_id = evidence.start(task_family=node["task_family"], task_class=node["task_class"],
-                                 surface=surface, provider=candidate["provider"], model=candidate["model"],
-                                 native_variant=candidate["native_variant"],
+                                 surface=candidate["backend"], provider=candidate["provider"],
+                                 model=candidate["model"], native_variant=candidate["native_variant"],
                                  normalized_effort=(node["routing"]["effort"] or "").upper() or None,
                                  initial_tier=initial_tier,
                                  initial_effort=node["routing"]["effort"], state_dir=state_dir) \
