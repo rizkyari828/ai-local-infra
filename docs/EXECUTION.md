@@ -95,3 +95,16 @@ orchestrators/sub-agents, and the top-level orchestrator owns decomposition.
 Not implemented in V0.1: parallel workers, automatic commit/push, learned-default
 promotion, retention scheduler, central DB, embeddings, monetary-cost assumptions,
 and UI automation.
+
+## Live execution caveats (verified on Work Mac)
+
+- OpenCode/Codex backends are **non-interactive**; a worker that tries to use tools
+  requiring approval can block on a permission prompt. Bounded by a CLI timeout
+  (default 300s, child terminated on timeout, classified `TIMEOUT`), but live nodes
+  should stay read-only or run under a pre-approved permission policy. Prefer
+  `plan` + `run --dry-run` first.
+- Runtime verification on Work Mac: OpenCode + `deepseek/deepseek-flash` (variant
+  `high`) executes end-to-end and records `observed_runtime` evidence. The default
+  `FAST`/`BALANCED` resolution maps to a local Ollama model that is not running, and
+  the `MAX` role maps to a placeholder backend model, so those are not live-verified.
+

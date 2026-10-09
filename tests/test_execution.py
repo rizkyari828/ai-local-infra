@@ -73,6 +73,24 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual("SUCCESS", result["status"])
         self.assertEqual("agent_reported", result["completion_signal"])
 
+    def test_cli_backend_timeout_is_bounded(self) -> None:
+        import time
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = pathlib.Path(tmp) / "slowopencode"
+            binary.write_text("#!/bin/sh\nsleep 5\n", encoding="utf-8")
+            binary.chmod(0o755)
+            backend = execution.CliBackend("opencode", str(binary), timeout=1)
+            request = {"task_id": "T1", "execution_id": "e1", "task_family": "f",
+                       "task_class": "MECHANICAL", "tier": "FAST", "provider": "p", "model": "m",
+                       "native_variant": "low", "objective_summary": "x", "acceptance_criteria": ["a"],
+                       "dependency_summaries": [], "knowledge_refs": [], "context_manifest": [],
+                       "working_dir": tmp, "prompt": "x"}
+            started = time.monotonic()
+            result = backend.execute(request)
+            elapsed = time.monotonic() - started
+        self.assertEqual("TIMEOUT", result["failure_category"])
+        self.assertLess(elapsed, 4)
+
     def test_unsupported_backend_reports_no_compatible(self) -> None:
         class Dead(execution.Backend):
             name = "dead"

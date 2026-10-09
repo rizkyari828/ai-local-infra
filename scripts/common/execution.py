@@ -104,7 +104,7 @@ class CliBackend(Backend):
     """Real local CLI backend. Invoked only with an explicit --confirm gate."""
     mode = "SUPPORTED"
 
-    def __init__(self, name: str, binary: str, timeout: int = 900):
+    def __init__(self, name: str, binary: str, timeout: int = 300):
         self.name = name
         self.binary = binary
         self.timeout = timeout
@@ -182,7 +182,7 @@ def classify_failure(returncode: int, stderr: str = "") -> Optional[str]:
     return "UNKNOWN_FAILURE"
 
 
-def backend_for(name: str, *, timeout: int = 900) -> Backend:
+def backend_for(name: str, *, timeout: int = 300) -> Backend:
     name = (name or "auto").lower()
     if name == "fake":
         return FakeBackend()
