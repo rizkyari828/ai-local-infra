@@ -182,9 +182,13 @@ class ReadOnlyTests(unittest.TestCase):
 
     def test_readonly_run_succeeds_without_mutation(self) -> None:
         plan = orchestrator.decompose("inspect the repository state")
+        self.assertEqual("NONE", plan["planner_mode"]["mode"])
+        self.assertTrue(all(node.get("executor") == "TOOL_ONLY" for node in plan["nodes"]))
         report = execution.execute_plan(plan, backend=execution.FakeBackend(), state_dir=self.state,
                                         repo_root=self.root, confirm=True, record_evidence=False)
-        self.assertEqual("SUCCESS", report["nodes"]["T1"]["status"])
+        self.assertEqual("SUCCESS", report["nodes"]["D1"]["status"])
+        self.assertEqual("SUCCESS", report["nodes"]["DF"]["status"])
+        self.assertEqual(0, report["calls_used"])  # TOOL_ONLY consumes no AI calls
 
     def test_readonly_violation_detected_and_stops(self) -> None:
         class Mutating(execution.Backend):
