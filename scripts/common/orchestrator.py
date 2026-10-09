@@ -264,13 +264,18 @@ def decompose(objective: str, *, constraints: Optional[dict[str, Any]] = None) -
         nodes[0]["acceptance_criteria"] = ["repository state determined deterministically"]
 
     last_analysis = "T1"
-    arch_class = "CRITICAL" if sig["security"] else "CORRECTNESS_SENSITIVE"
     if sig["architecture"]:
-        nodes.append(_node("T2", "Analyze architecture / cross-machine behavior", arch_class, ["T1"],
+        nodes.append(_node("T2", "Analyze architecture / cross-machine behavior", "CORRECTNESS_SENSITIVE", ["T1"],
                            risk_signals=["cross-machine", "architecture"],
                            acceptance=["architecture decision documented", "affected files identified"],
                            produces=["architecture_decision"], family="multi_machine_acceptance"))
         last_analysis = "T2"
+    if sig["security"]:
+        nodes.append(_node("T2S", "Security-sensitive correctness review", "CRITICAL", [last_analysis],
+                           risk_signals=["security"],
+                           acceptance=["security risks identified", "no unresolved critical finding"],
+                           produces=["security_review"], family="security_sensitive_design"))
+        last_analysis = "T2S"
 
     last_change = last_analysis
     if sig["implement"]:

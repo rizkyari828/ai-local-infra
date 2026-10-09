@@ -38,7 +38,7 @@
       {"backend": "codex", "provider": "codex", "model": null, "native_variant": "high"}
     ],
     "MAX": [
-      {"backend": "codex", "provider": "codex", "model": null, "native_variant": "max"},
+      {"backend": "codex", "provider": "codex", "model": null, "native_variant": "high"},
       {"backend": "opencode", "provider": "deepseek", "model": "deepseek-flash", "native_variant": "max"}
     ]
   },

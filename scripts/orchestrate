@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import pathlib
 import shutil
 import sys
@@ -28,19 +29,46 @@ import execution  # noqa: E402
 import discovery  # noqa: E402
 import failover  # noqa: E402
 
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+
+
+def _codex_model() -> str | None:
+    path = pathlib.Path.home() / ".codex" / "config.toml"
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if stripped.startswith("model") and "=" in stripped and "model_reasoning_effort" not in stripped:
+                return stripped.split("=", 1)[1].strip().strip('"')
+    except OSError:
+        return None
+    return None
+
+
+def _local_inference_policy() -> str | None:
+    machine = os.environ.get("LAI_MACHINE")
+    if not machine:
+        return None
+    try:
+        return json.loads((ROOT / "machines" / f"{machine}.yaml").read_text(encoding="utf-8")).get("local_inference")
+    except (OSError, json.JSONDecodeError):
+        return None
+
 
 def _local_health() -> tuple[failover.Health, dict[str, "execution.Backend"]]:
     """Cheap, no-inference runtime availability for the configured backends."""
     config = discovery.load_config()
     providers = {name: set(spec.get("providers", [])) for name, spec in config.get("backends", {}).items()}
     binaries = {name: bool(shutil.which(name)) for name in providers}
-    try:
-        with urllib.request.urlopen("http://127.0.0.1:11434/api/tags", timeout=1.5) as response:
-            ollama_models = {model["name"] for model in json.load(response).get("models", [])}
-    except (urllib.error.URLError, OSError, ValueError, KeyError):
-        ollama_models = None  # unreachable -> UNKNOWN (never assumed available)
+    policy = _local_inference_policy()
+    ollama_models: set[str] | None = None
+    if policy != failover.NOT_CONFIGURED_BY_MACHINE_POLICY:
+        try:
+            with urllib.request.urlopen("http://127.0.0.1:11434/api/tags", timeout=1.5) as response:
+                ollama_models = {model["name"] for model in json.load(response).get("models", [])}
+        except (urllib.error.URLError, OSError, ValueError, KeyError):
+            ollama_models = None  # unreachable -> UNKNOWN (never assumed available)
     health = failover.Health(binaries=binaries, providers=providers, ollama_models=ollama_models,
-                             codex_model=None)
+                             codex_model=_codex_model(), local_inference=policy)
     backends = {name: execution.CliBackend(name, name) for name in providers}
     return health, backends
 

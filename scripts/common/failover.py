@@ -28,8 +28,10 @@ MODEL_UNAVAILABLE = "MODEL_UNAVAILABLE"
 ACCOUNT_MODEL_UNSUPPORTED = "ACCOUNT_MODEL_UNSUPPORTED"
 TEMPORARILY_RATE_LIMITED = "TEMPORARILY_RATE_LIMITED"
 UNKNOWN = "UNKNOWN"
+NOT_CONFIGURED_BY_MACHINE_POLICY = "NOT_CONFIGURED_BY_MACHINE_POLICY"
 RUNTIME_STATUSES = (BACKEND_HEALTHY, BACKEND_UNAVAILABLE, PROVIDER_UNAVAILABLE, MODEL_UNAVAILABLE,
-                    ACCOUNT_MODEL_UNSUPPORTED, TEMPORARILY_RATE_LIMITED, UNKNOWN)
+                    ACCOUNT_MODEL_UNSUPPORTED, TEMPORARILY_RATE_LIMITED, UNKNOWN,
+                    NOT_CONFIGURED_BY_MACHINE_POLICY)
 
 # Failures that justify capability-preserving backend failover (not intelligence).
 FAILOVER_REASONS = ("RATE_LIMIT", "PROVIDER_503", "TIMEOUT", "ACCOUNT_MODEL_UNSUPPORTED",
@@ -63,13 +65,15 @@ class Health:
                  ollama_models: Optional[set[str]] = None,
                  codex_model: Optional[str] = None,
                  unavailable: Optional[dict[str, str]] = None,
-                 tripped: Optional[set[str]] = None) -> None:
+                 tripped: Optional[set[str]] = None,
+                 local_inference: Optional[str] = None) -> None:
         self.binaries = dict(binaries or {})
         self.providers = {k: set(v) for k, v in (providers or {}).items()}
         self.ollama_models = set(ollama_models) if ollama_models is not None else None
         self.codex_model = codex_model
         self.unavailable = dict(unavailable or {})
         self.tripped = set(tripped or ())
+        self.local_inference = local_inference
 
     def _override(self, candidate: dict[str, Any]) -> Optional[str]:
         backend, provider = candidate["backend"], candidate["provider"]
@@ -84,6 +88,9 @@ class Health:
         served = self.providers.get(candidate["backend"])
         if served is not None and candidate["provider"] not in served:
             return PROVIDER_UNAVAILABLE
+        if candidate["provider"] == "ollama" and self.local_inference == NOT_CONFIGURED_BY_MACHINE_POLICY:
+            # Machine policy: local inference intentionally disabled (not a failure).
+            return NOT_CONFIGURED_BY_MACHINE_POLICY
         if candidate["provider"] == "ollama":
             if self.ollama_models is None:
                 return UNKNOWN
@@ -117,6 +124,11 @@ def resolve(required_tier: str, required_effort: str, specs: list[dict[str, Any]
         candidate = dict(spec)
         candidate.setdefault("tier", required_tier)
         candidate.setdefault("effort", required_effort)
+        # Concrete machine-specific model fill (e.g., the locally configured Codex model);
+        # never hardcoded in routing — supplied by local runtime capability.
+        if candidate["provider"] == "codex" and not candidate.get("model") and health.codex_model:
+            candidate["model"] = health.codex_model
+        candidate["verified"] = candidate["provider"] != "codex"  # codex account capability UNVERIFIED
         candidate["status"] = health.status(candidate)
         blocking: list[str] = []
         if _rank(tier_order, candidate["tier"]) < _rank(tier_order, required_tier):

@@ -18,8 +18,9 @@
     "graph_dir": "~/.local/share/local-ai-infra/graphify/local-ai-infra/graphify-out"
   },
   "lifecycle_capabilities": ["launchd"],
+  "local_inference": "NOT_CONFIGURED_BY_MACHINE_POLICY",
   "provider_availability": {
-    "ollama": true,
+    "ollama": false,
     "deepseek": true,
     "codex": true
   },
