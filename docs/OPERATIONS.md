@@ -66,7 +66,9 @@ objective is never stored. See [Orchestration](ORCHESTRATION.md).
 `./scripts/orchestrate run --objective "<one objective>" --confirm [--backend fake|opencode|codex|auto]`
 executes the validated graph sequentially, routing each node independently. It
 requires `--confirm` (or `--dry-run`), one node at a time, with minimum-sufficient
-context and bounded retry/escalation. See [Multi-model execution](EXECUTION.md).
+context and bounded retry/escalation. `--read-only` enforces a hard read-only
+policy, and `--max-ai-calls N` sets a hard ceiling on real worker launches. See
+[Multi-model execution](EXECUTION.md).
 
 ## Runtime doctor (read-only)
 

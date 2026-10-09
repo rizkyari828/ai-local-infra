@@ -13,6 +13,7 @@ decomposition semantics.
 
 from __future__ import annotations
 
+import re
 from typing import Any, Optional
 
 import routing  # scripts/common, on sys.path
@@ -40,6 +41,53 @@ BASE_CONTEXT = {
 NON_INTELLIGENCE_CATEGORIES = tuple(c for c in knowledge.FAILURE_CATEGORIES
                                     if c != "REASONING_INSUFFICIENT")
 
+# Execution intent (never inferred from loose substrings such as "config"/"configured").
+INTENT_READ_ONLY = "READ_ONLY"
+INTENT_MUTATING = "MUTATING"
+INTENT_MIXED = "MIXED"
+INTENTS = (INTENT_READ_ONLY, INTENT_MUTATING, INTENT_MIXED)
+
+_READONLY_CUES = ("inspect", "show", "verify", "review", "check", "list", "report", "analyze",
+                  "analyse", "audit", "read", "describe", "summarize", "summarise", "identify",
+                  "name", "state", "explain", "trace", "confirm", "examine")
+_MUTATION_VERBS = ("modify", "change", "implement", "fix", "update", "add", "remove", "delete",
+                   "refactor", "rename", "patch", "write", "edit", "configure", "migrate",
+                   "replace", "create", "apply", "install", "enable", "disable", "set", "bump",
+                   "upgrade", "downgrade", "align", "introduce", "restore")
+# Negated mutation phrases ("do not modify", "without changing") never imply mutation.
+_NEGATION_RE = re.compile(
+    r"\b(?:do not|don't|dont|without|never|no)\s+(?:\w+\s+){0,2}?"
+    r"(?:modify|change|edit|write|create|delete|remove|update|touch|alter)\b", re.IGNORECASE)
+
+
+def _strip_negations(text: str) -> str:
+    return _NEGATION_RE.sub(" ", text or "")
+
+
+def has_mutation(text: str) -> bool:
+    text = _strip_negations(text).lower()
+    return any(re.search(r"\b" + re.escape(verb) + r"\b", text) for verb in _MUTATION_VERBS)
+
+
+def has_readonly_cue(text: str) -> bool:
+    text = (text or "").lower()
+    return any(re.search(r"\b" + re.escape(cue) + r"\b", text) for cue in _READONLY_CUES)
+
+
+def execution_intent(objective: str, *, read_only: bool = False) -> str:
+    """READ_ONLY / MUTATING / MIXED. `read_only=True` forces READ_ONLY (hard policy)."""
+    if read_only:
+        return INTENT_READ_ONLY
+    mutation = has_mutation(objective)
+    readonly = has_readonly_cue(objective)
+    if mutation and readonly:
+        return INTENT_MIXED
+    return INTENT_MUTATING if mutation else INTENT_READ_ONLY
+
+
+def node_intent(title: str) -> str:
+    return INTENT_MUTATING if has_mutation(title) else INTENT_READ_ONLY
+
 
 class OrchestratorError(RuntimeError):
     pass
@@ -63,8 +111,7 @@ def _signals(objective: str) -> dict[str, bool]:
                                                 "schema", "migration", "concurrency")),
         "security": any(w in text for w in ("security", "authentication", "authorization",
                                             "seauth", "auth architecture")),
-        "implement": any(w in text for w in ("fix", "implement", "change", "add", "update", "refactor",
-                                             "patch", "configure", "align")),
+        "implement": has_mutation(objective),
         "docs": any(w in text for w in ("doc", "docs", "documentation", "readme")),
         "tests": any(w in text for w in ("test", "tests", "verify", "validate")),
     }
@@ -77,7 +124,7 @@ def _node(task_id: str, title: str, task_class: str, depends_on: list[str], *,
     return {
         "task_id": task_id, "title": title, "task_family": family or knowledge.task_family_for(title),
         "task_class": task_class, "objective_summary": title, "depends_on": list(depends_on),
-        "conditional": conditional, "status": "planned",
+        "conditional": conditional, "status": "planned", "intent": node_intent(title),
         "risk_signals": list(risk_signals or []),
         "acceptance_criteria": list(acceptance or []),
         "produces_artifacts": list(produces or []), "consumes_results_from": list(consumes or depends_on),
@@ -131,15 +178,24 @@ def decompose(objective: str, *, constraints: Optional[dict[str, Any]] = None) -
                            produces=["final_report"], family="report_recovery_validation"))
 
     plan = {"schema_version": 1, "objective_summary": _bounded_summary(objective),
-            "planner": classify_planner(objective), "nodes": nodes}
+            "planner": classify_planner(objective), "nodes": nodes,
+            "intent": execution_intent(objective, read_only=bool(constraints.get("read_only")))}
     _apply_routing_and_context(plan, constraints)
     valid, diagnostics, order = validate_graph(plan["nodes"])
-    plan["valid"] = valid
+    conflicts = _intent_conflicts(plan["nodes"], plan["intent"])
+    plan["valid"] = valid and not conflicts
     plan["order"] = order
-    plan["diagnostics"] = diagnostics + quota_guards(plan)
+    plan["diagnostics"] = diagnostics + conflicts + quota_guards(plan)
     plan["routing_mix"] = _routing_mix(plan["nodes"])
     plan["quota_view"] = _quota_view(plan["nodes"])
     return plan
+
+
+def _intent_conflicts(nodes: list[dict[str, Any]], intent: str) -> list[str]:
+    if intent != INTENT_READ_ONLY:
+        return []
+    return [f"READ_ONLY_MUTATION_CONFLICT: {node['task_id']} '{node['title']}' is a mutating node "
+            f"under READ_ONLY intent" for node in nodes if node["intent"] == INTENT_MUTATING]
 
 
 def _bounded_summary(objective: str, limit: int = 120) -> str:
@@ -297,6 +353,7 @@ def _quota_view(nodes: list[dict[str, Any]]) -> dict[str, int]:
 
 def render_plan(plan: dict[str, Any]) -> str:
     lines = ["PLAN", f"OBJECTIVE: {plan['objective_summary']}",
+             f"INTENT: {plan.get('intent')}",
              f"PLANNER: {plan['planner']['required_tier']} / {plan['planner']['required_effort']}"]
     for node in plan["nodes"]:
         routing = node["routing"]

@@ -133,6 +133,8 @@ class CliBackend(Backend):
             return command + [prompt]
         if self.name == "codex":
             command = [self.binary, "exec"]
+            if request.get("read_only"):
+                command += ["-s", "read-only"]  # verified flag: codex exec --sandbox read-only
             if request["model"]:
                 command += ["-m", request["model"]]
             if request["native_variant"]:
@@ -173,6 +175,8 @@ def classify_failure(returncode: int, stderr: str = "") -> Optional[str]:
         return "RATE_LIMIT"
     if "timeout" in text or "timed out" in text:
         return "TIMEOUT"
+    if "permission" in text or "approval" in text or "approve" in text:
+        return "PERMISSION_REQUIRED"
     if "401" in text or "403" in text or "unauthorized" in text or "auth" in text:
         return "AUTH_FAILURE"
     if "not supported" in text or "unsupported model" in text:
@@ -244,6 +248,14 @@ def repo_state(root: pathlib.Path) -> dict[str, Any]:
             "dirty": bool(_git(root, "status", "--porcelain"))}
 
 
+def _worktree_paths(root: pathlib.Path) -> set[str]:
+    """Tracked or untracked working-tree changes (paths only)."""
+    status = _git(root, "status", "--porcelain", "--untracked-files=normal")
+    if not status:
+        return set()
+    return {line[3:].strip() for line in status.splitlines() if line.strip()}
+
+
 # --------------------------------------------------------------------------- #
 # Execution
 # --------------------------------------------------------------------------- #
@@ -253,25 +265,36 @@ def execute_plan(plan: dict[str, Any], *, backend: Backend, run_id: Optional[str
                  state_dir: Optional[pathlib.Path] = None, repo_root: Optional[pathlib.Path] = None,
                  confirm: bool = False, dry_run: bool = False, allow_dirty: bool = False,
                  surface: Optional[str] = None, record_evidence: bool = True,
-                 infra_retries: int = 1, same_tier_retries: int = 1, resume: bool = False) -> dict[str, Any]:
+                 infra_retries: int = 1, same_tier_retries: int = 1, resume: bool = False,
+                 read_only: bool = False, max_ai_calls: Optional[int] = None) -> dict[str, Any]:
     if not plan.get("valid"):
         raise ExecutionError("refusing to execute an invalid plan")
     if not confirm and not dry_run:
         raise ExecutionError("execution requires --confirm (or use --dry-run)")
     repo_root = pathlib.Path(repo_root or ROOT)
     state = repo_state(repo_root)
+    enforce_read_only = read_only or plan.get("intent") == "READ_ONLY"
     bindings = resolve_plan(plan, backend, surface)
     bounds = call_bounds(plan, infra_retries=infra_retries, same_tier_retries=same_tier_retries)
 
     report: dict[str, Any] = {"run_id": run_id, "backend": backend.name, "dry_run": dry_run,
-                              "bounds": bounds, "resolutions": bindings, "nodes": {},
-                              "head": state["head"], "dirty": state["dirty"]}
+                              "intent": plan.get("intent"), "bounds": bounds, "resolutions": bindings,
+                              "nodes": {}, "head": state["head"], "dirty": state["dirty"],
+                              "max_ai_calls": max_ai_calls, "calls_used": 0, "remaining_calls": None}
+    if enforce_read_only:
+        conflicts = [f"READ_ONLY_MUTATION_CONFLICT: {node['task_id']} is a mutating node under READ_ONLY intent"
+                     for node in plan["nodes"] if node.get("intent") == "MUTATING"]
+        if conflicts:
+            report["error"] = conflicts[0]
+            report["diagnostics"] = conflicts
+            return report
     if any(not binding["runnable"] for binding in bindings):
         report["error"] = "NO_COMPATIBLE_EXECUTION_BACKEND for one or more nodes"
         report["nodes"] = {b["task_id"]: {"status": "NO_COMPATIBLE_EXECUTION_BACKEND",
                                           "required_tier": b["tier"]} for b in bindings if not b["runnable"]}
         return report
     if dry_run:
+        report["remaining_calls"] = max_ai_calls
         return report
     if state["dirty"] and not allow_dirty:
         report["error"] = "working tree is dirty; commit/stash or pass --allow-dirty"
@@ -286,6 +309,14 @@ def execute_plan(plan: dict[str, Any], *, backend: Backend, run_id: Optional[str
             report["error"] = "REFUSE_RESUME: repository HEAD/identity changed; refusing to reuse stale results"
             return report
     results: dict[str, dict[str, Any]] = dict(previous["nodes"]) if (resume and previous) else {}
+    # Hard budget: resume never resets the counter; take the smaller of persisted/requested ceiling.
+    persisted_max = (previous or {}).get("hard_max_ai_calls")
+    if resume and persisted_max is not None:
+        budget = {"max": persisted_max if max_ai_calls is None else min(persisted_max, max_ai_calls),
+                  "used": previous.get("calls_used", 0)}
+    else:
+        budget = {"max": max_ai_calls, "used": 0}
+    report["max_ai_calls"] = budget["max"]
     resolutions = {b["task_id"]: b for b in bindings}
 
     for task_id in plan["order"]:
@@ -303,18 +334,35 @@ def execute_plan(plan: dict[str, Any], *, backend: Backend, run_id: Optional[str
             results[task_id] = _run_node(node, deps, results, backend, resolutions[task_id],
                                          state_dir=state_dir, record_evidence=record_evidence,
                                          infra_retries=infra_retries, same_tier_retries=same_tier_retries,
-                                         surface=backend.name)
+                                         surface=backend.name, budget=budget,
+                                         enforce_read_only=enforce_read_only, repo_root=repo_root)
         except KeyboardInterrupt:
             results[task_id] = {"status": CANCELLED, "task_id": task_id}
-            for future in plan["order"][plan["order"].index(task_id) + 1:]:
-                results.setdefault(future, {"status": NOT_RUN, "task_id": future})
+            _mark_not_run(plan, task_id, results)
             break
-        _save_state(run_dir, {"run_id": run_id, "head": state["head"], "repo": state["root"],
-                              "nodes": results})
+        if results[task_id]["status"] in ("CALL_BUDGET_EXHAUSTED", "READ_ONLY_VIOLATION"):
+            report["error"] = results[task_id]["status"]
+            _mark_not_run(plan, task_id, results)
+            break
+        _save_state(run_dir, _state_blob(run_id, state, results, budget))
     report["nodes"] = results
+    report["calls_used"] = budget["used"]
+    report["remaining_calls"] = (budget["max"] - budget["used"]) if budget["max"] is not None else None
     report["final"] = _final_summary(plan, results)
-    _save_state(run_dir, {"run_id": run_id, "head": state["head"], "repo": state["root"], "nodes": results})
+    _save_state(run_dir, _state_blob(run_id, state, results, budget))
     return report
+
+
+def _mark_not_run(plan: dict[str, Any], current: str, results: dict[str, dict[str, Any]]) -> None:
+    index = plan["order"].index(current)
+    for future in plan["order"][index + 1:]:
+        results.setdefault(future, {"status": NOT_RUN, "task_id": future})
+
+
+def _state_blob(run_id: str, state: dict[str, Any], results: dict[str, dict[str, Any]],
+                budget: dict[str, Any]) -> dict[str, Any]:
+    return {"run_id": run_id, "head": state["head"], "repo": state["root"], "nodes": results,
+            "calls_used": budget["used"], "hard_max_ai_calls": budget["max"]}
 
 
 def _conditional_active(node: dict[str, Any], deps: list[str], results: dict[str, dict[str, Any]]) -> bool:
@@ -328,14 +376,26 @@ def _conditional_active(node: dict[str, Any], deps: list[str], results: dict[str
 
 
 def _run_node(node, deps, results, backend, resolution, *, state_dir, record_evidence,
-              infra_retries, same_tier_retries, surface) -> dict[str, Any]:
-    dependency_summaries = [{"task_id": dep, "summary": results.get(dep, {}).get("summary", "")}
-                            for dep in deps]
+              infra_retries, same_tier_retries, surface, budget, enforce_read_only,
+              repo_root) -> dict[str, Any]:
     tier = node["routing"]["tier"]
     initial_tier = tier
+    if enforce_read_only and node.get("intent") == "MUTATING":
+        return {"task_id": node["task_id"], "status": "READ_ONLY_VIOLATION",
+                "failure_category": "READ_ONLY_VIOLATION",
+                "summary": "mutating node refused under READ_ONLY intent",
+                "initial_tier": initial_tier, "final_tier": tier, "attempts": 0, "escalated": False}
+    if budget["max"] is not None and budget["used"] >= budget["max"]:
+        return {"task_id": node["task_id"], "status": "CALL_BUDGET_EXHAUSTED",
+                "failure_category": "CALL_BUDGET_EXHAUSTED",
+                "summary": "hard AI-call budget exhausted before launch",
+                "initial_tier": initial_tier, "final_tier": tier, "attempts": 0, "escalated": False}
+    dependency_summaries = [{"task_id": dep, "summary": results.get(dep, {}).get("summary", "")}
+                            for dep in deps]
     attempt = 0
     infra_used = same_used = escalations = 0
     execution_id = uuid.uuid4().hex
+    before = _worktree_paths(repo_root) if enforce_read_only else None
     decision_id = evidence.start(task_family=node["task_family"], task_class=node["task_class"],
                                  surface=surface, provider=resolution["provider"], model=resolution["model"],
                                  native_variant=resolution["native_variant"],
@@ -344,14 +404,27 @@ def _run_node(node, deps, results, backend, resolution, *, state_dir, record_evi
                                  initial_effort=node["routing"]["effort"], state_dir=state_dir) \
         if record_evidence else execution_id
     while True:
+        if budget["max"] is not None and budget["used"] >= budget["max"]:
+            return _finalize(node, {"summary": "hard AI-call budget exhausted"}, FAILURE,
+                             "CALL_BUDGET_EXHAUSTED", initial_tier, tier, attempt, escalations,
+                             decision_id, resolution, state_dir, record_evidence)
         attempt += 1
-        request = _request(node, resolution, dependency_summaries, execution_id, tier, backend)
+        budget["used"] += 1
+        request = _request(node, resolution, dependency_summaries, execution_id, tier, backend,
+                           read_only=node.get("intent") == "READ_ONLY")
         result = backend.execute(request)
+        if enforce_read_only:
+            changed = sorted(_worktree_paths(repo_root) - (before or set()))
+            if changed:
+                return _finalize(node, {"summary": "read-only violation: " + ", ".join(changed[:5])},
+                                 "READ_ONLY_VIOLATION", "READ_ONLY_VIOLATION", initial_tier, tier,
+                                 attempt, escalations, decision_id, resolution, state_dir, record_evidence)
         category = result.get("failure_category")
-        status = result.get("status", FAILURE)
-        validated = _is_success(node, result)
-        if validated:
+        if _is_success(node, result):
             return _finalize(node, result, SUCCESS, None, initial_tier, tier, attempt, escalations,
+                             decision_id, resolution, state_dir, record_evidence)
+        if category == "PERMISSION_REQUIRED":
+            return _finalize(node, result, FAILURE, category, initial_tier, tier, attempt, escalations,
                              decision_id, resolution, state_dir, record_evidence)
         if category in INFRA_CATEGORIES:
             if infra_used < infra_retries:
@@ -385,7 +458,8 @@ def _is_success(node: dict[str, Any], result: dict[str, Any]) -> bool:
     return True
 
 
-def _request(node, resolution, dependency_summaries, execution_id, tier, backend) -> dict[str, Any]:
+def _request(node, resolution, dependency_summaries, execution_id, tier, backend,
+             read_only: bool = False) -> dict[str, Any]:
     return {
         "execution_id": execution_id, "task_id": node["task_id"], "task_family": node["task_family"],
         "task_class": node["task_class"], "tier": tier, "provider": resolution["provider"],
@@ -393,22 +467,25 @@ def _request(node, resolution, dependency_summaries, execution_id, tier, backend
         "objective_summary": node["objective_summary"], "acceptance_criteria": node["acceptance_criteria"],
         "dependency_summaries": dependency_summaries, "knowledge_refs": node.get("knowledge_refs", []),
         "context_manifest": node["context"]["manifest"], "working_dir": str(ROOT),
-        "prompt": _prompt(node, dependency_summaries),
+        "read_only": read_only,
+        "prompt": _prompt(node, dependency_summaries, read_only=read_only),
     }
 
 
-def _prompt(node, dependency_summaries) -> str:
+def _prompt(node, dependency_summaries, read_only: bool = False) -> str:
     deps = "; ".join(f"{d['task_id']}: {d['summary']}" for d in dependency_summaries) or "none"
-    return (f"{WORKER_ISOLATION_NOTE}\n\nObjective: {node['objective_summary']}\n"
+    guard = "\nRead-only task: do not modify, create, or delete any files." if read_only else ""
+    return (f"{WORKER_ISOLATION_NOTE}{guard}\n\nObjective: {node['objective_summary']}\n"
             f"Acceptance: {', '.join(node['acceptance_criteria'])}\nDependencies: {deps}")
 
 
 def _finalize(node, result, status, category, initial_tier, final_tier, attempts, escalations,
               decision_id, resolution, state_dir, record_evidence) -> dict[str, Any]:
     if record_evidence and decision_id:
+        outcome = SUCCESS if status == SUCCESS else ("UNKNOWN" if status == "UNKNOWN" else FAILURE)
         completion = result.get("completion_signal") if status == SUCCESS else None
         try:
-            evidence.finish(decision_id, outcome=status, completion_signal=completion,
+            evidence.finish(decision_id, outcome=outcome, completion_signal=completion,
                             final_tier=final_tier, final_effort=node["routing"]["effort"],
                             failure_category=category, attempt_count=attempts, state_dir=state_dir)
         except evidence.EvidenceError:
@@ -453,7 +530,7 @@ def _save_state(run_dir: pathlib.Path, state: dict[str, Any]) -> None:
 
 
 def render_execution(report: dict[str, Any]) -> str:
-    lines = [f"RUN {report.get('run_id')}  backend={report.get('backend')}"
+    lines = [f"RUN {report.get('run_id')}  backend={report.get('backend')}  intent={report.get('intent')}"
              + ("  (dry-run)" if report.get("dry_run") else "")]
     for binding in report.get("resolutions", []):
         lines.append(f"{binding['task_id']}  {binding['tier']}  ->  {binding.get('provider')}/{binding.get('model')}"
@@ -472,4 +549,7 @@ def render_execution(report: dict[str, Any]) -> str:
     lines.append(f"CALL BOUNDS: planned {bounds.get('planned_ai_nodes')}, conditional "
                  f"{bounds.get('conditional_nodes')}, max retries/escalations "
                  f"{bounds.get('max_retry_and_escalation_calls')}, parallel 0")
+    if report.get("max_ai_calls") is not None:
+        lines.append(f"HARD AI-CALL BUDGET: max {report['max_ai_calls']}, used {report.get('calls_used')}, "
+                     f"remaining {report.get('remaining_calls')}")
     return "\n".join(lines)

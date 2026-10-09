@@ -33,7 +33,8 @@ def _objective(args: argparse.Namespace) -> str:
 
 def _constraints(args: argparse.Namespace) -> dict:
     return {"surface": args.surface, "min_tier": args.min_tier, "max_tier": args.max_tier,
-            "local_only": args.local_only, "no_premium": args.no_premium}
+            "local_only": args.local_only, "no_premium": args.no_premium,
+            "read_only": getattr(args, "read_only", False)}
 
 
 def cmd_plan(args: argparse.Namespace) -> int:
@@ -65,7 +66,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         plan, backend=backend, run_id=args.run_id, state_dir=args.state_dir,
         repo_root=pathlib.Path.cwd(), confirm=args.confirm, dry_run=args.dry_run,
         allow_dirty=args.allow_dirty, surface=args.surface, record_evidence=not args.no_evidence,
-        resume=args.resume)
+        resume=args.resume, read_only=args.read_only, max_ai_calls=args.max_ai_calls)
     if args.json:
         print(json.dumps(report, indent=2, ensure_ascii=False))
     else:
@@ -93,6 +94,8 @@ def _add_objective_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--no-premium", action="store_true", help="disallow MAX unless a floor requires it")
     parser.add_argument("--prefer-model", help="informational preference (no auto-switch in V0.1)")
     parser.add_argument("--prefer-provider", help="informational preference (no auto-switch in V0.1)")
+    parser.add_argument("--read-only", action="store_true",
+                        help="hard read-only policy: reject any mutating node before execution")
     parser.add_argument("--json", action="store_true")
 
 
@@ -110,6 +113,8 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("--dry-run", action="store_true", help="show resolved backends/calls; launch nothing")
     run.add_argument("--confirm", action="store_true", help="required gate for real execution")
     run.add_argument("--allow-dirty", action="store_true", help="allow a dirty worktree (bounded override)")
+    run.add_argument("--max-ai-calls", type=int,
+                     help="hard ceiling on real AI worker launches (shared across nodes/retries/escalation)")
     run.add_argument("--resume", action="store_true", help="resume a previous run (--run-id required)")
     run.add_argument("--run-id", help="run identifier")
     run.add_argument("--state-dir", type=pathlib.Path, help="override local state root")

@@ -96,6 +96,40 @@ Not implemented in V0.1: parallel workers, automatic commit/push, learned-defaul
 promotion, retention scheduler, central DB, embeddings, monetary-cost assumptions,
 and UI automation.
 
+## Execution guardrails
+
+- **Execution intent** is `READ_ONLY`, `MUTATING`, or `MIXED`, derived from clear
+  action semantics (word-boundary mutation verbs, negation-aware) — never from loose
+  substrings, so "inspect the configured models" / "review the current config" stay
+  `READ_ONLY`. `--read-only` forces the `READ_ONLY` policy; if the decomposition
+  still yields a mutating node the plan is **invalid** with a
+  `READ_ONLY_MUTATION_CONFLICT` diagnostic and no worker is launched (semantics are
+  never silently rewritten).
+- **Hard AI-call budget**: `--max-ai-calls N` is a hard ceiling shared across every
+  real worker launch — initial nodes, same-tier retries, infra retries, reasoning
+  escalation, conditional nodes, and final integration. Before each launch the
+  remaining budget is checked; if exhausted the node returns
+  `CALL_BUDGET_EXHAUSTED`, downstream nodes are `NOT_RUN`, and state is preserved.
+  Planning/dry-run consume nothing. Bounds distinguish `planned_calls`,
+  `possible_conditional_calls`, `possible_retry_calls` from `hard_max_ai_calls`,
+  `actual_calls_used`, `remaining_calls`. `--resume` never resets the counter: the
+  persisted `calls_used` and ceiling are reused.
+- **Permission handling**: a backend that cannot proceed non-interactively because it
+  requests approval is classified `PERMISSION_REQUIRED` (never
+  `REASONING_INSUFFICIENT`) and is **not** intelligence-escalated. No automatic
+  permission approval is ever performed; the CLI timeout remains the final safety
+  net.
+- **Read-only enforcement**: for `READ_ONLY` runs the orchestrator captures the
+  worktree before each node and rejects any tracked/untracked change as
+  `READ_ONLY_VIOLATION`, stopping downstream nodes and reporting the changed paths
+  without any automatic reset/revert. Where a backend supports it, a safe sandbox is
+  propagated (Codex: `-s read-only`); OpenCode has no read-only flag (only the
+  dangerous `--auto`), so OpenCode relies on orchestration + worker instructions +
+  the post-node Git check.
+- `PERMISSION_REQUIRED`, `READ_ONLY_VIOLATION`, and `CALL_BUDGET_EXHAUSTED` are
+  non-intelligence categories: they never weaken a model's standing, and nodes never
+  launched due to budget/policy are not recorded as model failures.
+
 ## Live execution caveats (verified on Work Mac)
 
 - OpenCode/Codex backends are **non-interactive**; a worker that tries to use tools
