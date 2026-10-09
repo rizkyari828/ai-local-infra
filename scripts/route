@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+"""Recommend the cheapest sufficient model tier/effort for a task (read-only).
+
+Deterministic and offline: it classifies the task text with simple rules,
+applies the declarative policy in ``config/model-routing.yaml``, and prints a
+recommendation. It never calls a model or network, and never echoes the raw task
+(only the derived class/reason), so no prompt or secret leaks into output.
+
+Tiers reference existing model roles (models/roles.yaml); provider/model names
+are never hardcoded here. See docs/MODEL_ROUTING.md.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import pathlib
+import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "common"))
+import routing  # noqa: E402
+
+
+def _escalation_label(policy: dict, rec: dict) -> str:
+    target = rec.get("escalation_to")
+    if not target:
+        return "none (report instead of retrying)"
+    entry = policy["task_classes"][target]
+    retries = rec.get("max_retries", 0)
+    return f"{target} / {entry['tier']} / {entry['effort']} after up to {retries} same-tier retries"
+
+
+def cmd_route(args: argparse.Namespace) -> int:
+    policy = routing.load_policy()
+    rec = routing.recommend(
+        args.task or "",
+        task_class=args.task_class,
+        requested_effort=args.effort,
+        requested_tier=args.tier,
+        surface=args.surface,
+        policy=policy,
+    )
+    step = routing.escalation_step(
+        rec["task_class"], same_tier_attempts=args.attempts,
+        succeeded=args.succeeded, policy=policy)
+    role = rec["role"] or "?"
+    model = f" ({rec['model']})" if rec.get("model") else ""
+    rec["next_step"] = step
+    if args.json:
+        print(json.dumps(rec, indent=2, ensure_ascii=False))
+        return 0
+    print(f"CLASSIFICATION: {rec['task_class']}")
+    print(f"MODEL TIER: {rec['recommended_tier']}")
+    print(f"ROLE: {role}{model}")
+    print(f"EFFORT: {rec['recommended_effort']}")
+    print(f"ESCALATION: {_escalation_label(policy, rec)}")
+    print(f"NEXT STEP: {step['action']} ({step['reason']})")
+    print(f"RATIONALE: {rec['reason']}")
+    if args.surface:
+        print(f"SURFACE: {args.surface} ({rec['capability']})")
+    return 0
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(description=__doc__)
+    result.add_argument("--task", default="", help="task description (free text)")
+    result.add_argument("--class", dest="task_class",
+                        help="explicit task class override (wins over heuristics)")
+    result.add_argument("--effort", help="explicit requested effort floor: low|medium|high|max")
+    result.add_argument("--tier", help="explicit requested tier floor: FAST|BALANCED|STRONG|MAX")
+    result.add_argument("--surface", help="target surface: opencode|codex-cli|codex-vscode|codex-desktop")
+    result.add_argument("--attempts", type=int, default=0,
+                        help="same-tier attempts already spent (for the next-step preview)")
+    result.add_argument("--succeeded", action="store_true", help="mark the task as already succeeded")
+    result.add_argument("--json", action="store_true", help="emit stable machine-readable JSON")
+    return result
+
+
+def main() -> int:
+    args = parser().parse_args()
+    try:
+        return cmd_route(args)
+    except (routing.RoutingError, OSError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

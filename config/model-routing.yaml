@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "routing_version": "0.1.0",
+  "updated": "2026-10-09",
+  "notes": "Adaptive model routing V0.1. A deterministic, rule-based recommendation of the cheapest sufficient reasoning for a task. Task classes map to symbolic tiers (FAST/BALANCED/STRONG/MAX); tiers reference existing model roles in models/roles.yaml, which map role -> provider/model. Provider/model names are never hardcoded here, no account quota and no secrets are stored, and V0.1 never switches a user-selected model automatically (every surface is RECOMMEND_ONLY). This does not duplicate tool-baseline.yaml (tool versions) or the escalation policy in config/runtime.yaml (failure-category eligibility); it decides which tier a task should start at and when to escalate or stop.",
+  "tiers": {
+    "FAST": {"role": "student", "effort": "low"},
+    "BALANCED": {"role": "student", "effort": "medium"},
+    "STRONG": {"role": "teacher-cheap", "effort": "high"},
+    "MAX": {"role": "teacher-premium", "effort": "max"}
+  },
+  "task_classes": {
+    "MECHANICAL": {
+      "tier": "FAST",
+      "effort": "low",
+      "max_retries": 1,
+      "escalates_to": "NORMAL",
+      "rationale": "bounded deterministic edit (search, rename, format, config key, rerun tests, git)"
+    },
+    "NORMAL": {
+      "tier": "BALANCED",
+      "effort": "medium",
+      "max_retries": 1,
+      "escalates_to": "CORRECTNESS_SENSITIVE",
+      "rationale": "bounded implementation or bugfix with understood behavior"
+    },
+    "CORRECTNESS_SENSITIVE": {
+      "tier": "STRONG",
+      "effort": "high",
+      "max_retries": 1,
+      "escalates_to": "CRITICAL",
+      "rationale": "ambiguity or correctness risk (architecture, concurrency, security, persistence, cross-machine)"
+    },
+    "CRITICAL": {
+      "tier": "MAX",
+      "effort": "max",
+      "max_retries": 0,
+      "escalates_to": null,
+      "rationale": "unresolved correctness-sensitive or security-sensitive design"
+    }
+  },
+  "effort_order": ["low", "medium", "high", "max"],
+  "tier_order": ["FAST", "BALANCED", "STRONG", "MAX"],
+  "surfaces": {
+    "opencode": "RECOMMEND_ONLY",
+    "codex-cli": "RECOMMEND_ONLY",
+    "codex-vscode": "RECOMMEND_ONLY",
+    "codex-desktop": "RECOMMEND_ONLY"
+  }
+}
