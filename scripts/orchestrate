@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Task graph orchestrator CLI (plan-only, offline).
+"""Task graph orchestrator CLI: plan (offline) and run (gated execution).
 
-    ./scripts/orchestrate plan --objective "..."
-    ./scripts/orchestrate plan --objective-file objective.txt
-    ./scripts/orchestrate plan --objective "..." --json
-    ./scripts/orchestrate plan --objective "..." --surface codex-cli --max-tier BALANCED
+    ./scripts/orchestrate plan --objective "..." [--json] [--surface ...]
+    ./scripts/orchestrate run  --objective "..." --confirm [--backend fake|opencode|codex|auto]
+                               [--dry-run] [--resume] [--run-id ID] [--surface ...]
+                               [--min-tier T] [--max-tier T] [--local-only] [--no-premium]
 
-Turns ONE bounded objective into a DAG of task nodes with per-node symbolic routing
-and context budgets. V0.1 PLANS ONLY: it never calls a model, makes no network
-request, spawns no worker, and persists nothing. The raw objective is processed in
-memory and is never written to the evidence DB, knowledge, or any plan artifact.
+plan is local/deterministic and persists nothing. run executes the validated graph
+sequentially through a provider-agnostic backend adapter; real backends require an
+explicit --confirm gate. The raw objective is processed in memory only and is never
+persisted. See docs/ORCHESTRATION.md and docs/EXECUTION.md.
 """
 
 from __future__ import annotations
@@ -21,23 +21,27 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "common"))
 import orchestrator  # noqa: E402
+import execution  # noqa: E402
+
+
+def _objective(args: argparse.Namespace) -> str:
+    objective = args.objective
+    if objective is None and args.objective_file:
+        objective = pathlib.Path(args.objective_file).read_text(encoding="utf-8")
+    return objective or ""
+
+
+def _constraints(args: argparse.Namespace) -> dict:
+    return {"surface": args.surface, "min_tier": args.min_tier, "max_tier": args.max_tier,
+            "local_only": args.local_only, "no_premium": args.no_premium}
 
 
 def cmd_plan(args: argparse.Namespace) -> int:
-    objective = args.objective
-    if objective is None and args.objective_file:
-        try:
-            objective = pathlib.Path(args.objective_file).read_text(encoding="utf-8")
-        except OSError as exc:
-            print(f"ERROR: cannot read objective file: {exc}", file=sys.stderr)
-            return 2
-    if not objective or not objective.strip():
+    objective = _objective(args)
+    if not objective.strip():
         print("ERROR: provide --objective or --objective-file", file=sys.stderr)
         return 2
-
-    constraints = {"surface": args.surface, "min_tier": args.min_tier, "max_tier": args.max_tier,
-                   "local_only": args.local_only, "no_premium": args.no_premium}
-    plan = orchestrator.decompose(objective, constraints=constraints)
+    plan = orchestrator.decompose(objective, constraints=_constraints(args))
     plan["preferences"] = {"prefer_model": args.prefer_model, "prefer_provider": args.prefer_provider,
                            "note": "informational only; V0.1 never auto-switches models"}
     if args.json:
@@ -47,6 +51,31 @@ def cmd_plan(args: argparse.Namespace) -> int:
     return 0 if plan["valid"] else 2
 
 
+def cmd_run(args: argparse.Namespace) -> int:
+    objective = _objective(args)
+    if not objective.strip():
+        print("ERROR: provide --objective or --objective-file", file=sys.stderr)
+        return 2
+    plan = orchestrator.decompose(objective, constraints=_constraints(args))
+    if not plan["valid"]:
+        print("ERROR: invalid plan; run 'plan' to inspect diagnostics", file=sys.stderr)
+        return 2
+    backend = execution.backend_for(args.backend)
+    report = execution.execute_plan(
+        plan, backend=backend, run_id=args.run_id, state_dir=args.state_dir,
+        repo_root=pathlib.Path.cwd(), confirm=args.confirm, dry_run=args.dry_run,
+        allow_dirty=args.allow_dirty, surface=args.surface, record_evidence=not args.no_evidence,
+        resume=args.resume)
+    if args.json:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+    else:
+        print(execution.render_execution(report))
+    if report.get("error"):
+        return 2
+    final = report.get("final") or {}
+    return 1 if final.get("failed") or final.get("cancelled") else 0
+
+
 def _tier(value: str) -> str:
     candidate = value.upper()
     if candidate not in orchestrator.TIER_ORDER:
@@ -54,21 +83,38 @@ def _tier(value: str) -> str:
     return candidate
 
 
+def _add_objective_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--objective")
+    parser.add_argument("--objective-file")
+    parser.add_argument("--surface", help="target surface for capability resolution")
+    parser.add_argument("--min-tier", type=_tier, help="floor every node at this tier")
+    parser.add_argument("--max-tier", type=_tier, help="cap nodes (never below a safety floor)")
+    parser.add_argument("--local-only", action="store_true", help="prefer local/economical (cap BALANCED)")
+    parser.add_argument("--no-premium", action="store_true", help="disallow MAX unless a floor requires it")
+    parser.add_argument("--prefer-model", help="informational preference (no auto-switch in V0.1)")
+    parser.add_argument("--prefer-provider", help="informational preference (no auto-switch in V0.1)")
+    parser.add_argument("--json", action="store_true")
+
+
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     sub = result.add_subparsers(dest="command", required=True)
+
     plan = sub.add_parser("plan", help="produce a validated execution plan (no execution)")
-    plan.add_argument("--objective")
-    plan.add_argument("--objective-file")
-    plan.add_argument("--surface", help="target surface for capability resolution")
-    plan.add_argument("--min-tier", type=_tier, help="floor every node at this tier")
-    plan.add_argument("--max-tier", type=_tier, help="cap nodes (never below a safety floor)")
-    plan.add_argument("--local-only", action="store_true", help="prefer local/economical (cap BALANCED)")
-    plan.add_argument("--no-premium", action="store_true", help="disallow MAX unless a floor requires it")
-    plan.add_argument("--prefer-model", help="informational preference (no auto-switch in V0.1)")
-    plan.add_argument("--prefer-provider", help="informational preference (no auto-switch in V0.1)")
-    plan.add_argument("--json", action="store_true")
+    _add_objective_args(plan)
     plan.set_defaults(func=cmd_plan)
+
+    run = sub.add_parser("run", help="execute the validated plan sequentially (gated)")
+    _add_objective_args(run)
+    run.add_argument("--backend", default="auto", help="fake | opencode | codex | auto")
+    run.add_argument("--dry-run", action="store_true", help="show resolved backends/calls; launch nothing")
+    run.add_argument("--confirm", action="store_true", help="required gate for real execution")
+    run.add_argument("--allow-dirty", action="store_true", help="allow a dirty worktree (bounded override)")
+    run.add_argument("--resume", action="store_true", help="resume a previous run (--run-id required)")
+    run.add_argument("--run-id", help="run identifier")
+    run.add_argument("--state-dir", type=pathlib.Path, help="override local state root")
+    run.add_argument("--no-evidence", action="store_true", help="do not record outcome evidence")
+    run.set_defaults(func=cmd_run)
     return result
 
 
@@ -76,7 +122,7 @@ def main() -> int:
     args = parser().parse_args()
     try:
         return args.func(args)
-    except (orchestrator.OrchestratorError, OSError) as exc:
+    except (orchestrator.OrchestratorError, execution.ExecutionError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
 

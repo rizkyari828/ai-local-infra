@@ -61,6 +61,13 @@ objective into a small DAG of task nodes with per-node symbolic routing and cont
 budgets. V0.1 plans only: no model call, no worker, no persistence, and the raw
 objective is never stored. See [Orchestration](ORCHESTRATION.md).
 
+## Multi-model execution (gated)
+
+`./scripts/orchestrate run --objective "<one objective>" --confirm [--backend fake|opencode|codex|auto]`
+executes the validated graph sequentially, routing each node independently. It
+requires `--confirm` (or `--dry-run`), one node at a time, with minimum-sufficient
+context and bounded retry/escalation. See [Multi-model execution](EXECUTION.md).
+
 ## Runtime doctor (read-only)
 
 `LAI_MACHINE=work-mac ./scripts/bootstrap doctor` answers "is this machine ready for AI coding right now?" without mutating anything: no apply, no backups, no graph rebuild, no process start/stop, no agent launches. It reports `PASS`/`WARN`/`FAIL`/`SKIP` for repository, bootstrap, OpenCode, Codex, RTK, Graphify, Headroom, and the Codex Headroom MCP. `--json` emits a stable machine-readable report. Exit codes: `0` no `FAIL`, `1` some `FAIL`, `2` config/exec error. The tested baseline lives in `config/tool-baseline.yaml`; exact version match is `PASS`, any other version is `WARN` (never auto-upgrades/downgrades), and runtime AUTO is not re-proven. See [Multi-machine sync](MULTI_MACHINE_SYNC_V0_1.md) §18.
