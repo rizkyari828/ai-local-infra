@@ -17,6 +17,7 @@
     "bin": "~/.local/bin/headroom",
     "lifecycle": "wrapper"
   },
+  "graphify": {"graph_dir": "~/.local/share/local-ai-infra/graphify/local-ai-infra/graphify-out"},
   "lifecycle_capabilities": ["systemd"],
   "provider_availability": {
     "ollama": true,
