@@ -26,6 +26,7 @@ import sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "common"))
 import evidence  # noqa: E402
 import derived_knowledge  # noqa: E402
+import outcomes  # noqa: E402
 
 
 def _emit(payload: dict, as_json: bool) -> int:
@@ -38,7 +39,11 @@ def _emit(payload: dict, as_json: bool) -> int:
 
 
 def cmd_status(args) -> int:
-    return _emit(evidence.status(state_dir=args.state_dir), args.json)
+    result = evidence.status(state_dir=args.state_dir)
+    cand = outcomes.candidates(state_dir=args.state_dir)
+    result["promotion_candidates"] = cand["count"]
+    result["prunable_estimate"] = outcomes.prune_dry_run(state_dir=args.state_dir)["eligible_rows"]
+    return _emit(result, args.json)
 
 
 def cmd_seed(args) -> int:
@@ -74,7 +79,53 @@ def cmd_query(args) -> int:
 
 
 def cmd_candidates(args) -> int:
-    return _emit(evidence.candidates(state_dir=args.state_dir), args.json)
+    return _emit(outcomes.candidates(state_dir=args.state_dir), args.json)
+
+
+def cmd_models(args) -> int:
+    rows = outcomes.model_performance(task_family=args.task_family, surface=args.surface,
+                                      state_dir=args.state_dir)
+    return _emit({"models": rows, "count": len(rows)}, args.json)
+
+
+def cmd_start(args) -> int:
+    decision_id = evidence.start(
+        decision_id=args.decision_id, task_family=args.task_family, task_class=args.task_class,
+        surface=args.surface, provider=args.provider, model=args.model, native_variant=args.variant,
+        initial_tier=args.tier, initial_effort=args.effort, user_override_tier=args.override_tier,
+        user_override_effort=args.override_effort, user_override_model=args.override_model,
+        state_dir=args.state_dir)
+    return _emit({"decision_id": decision_id}, args.json)
+
+
+def _final_fields(args) -> dict:
+    return {"task_family": args.task_family, "task_class": args.task_class, "surface": args.surface,
+            "provider": args.provider, "model": args.model, "native_variant": args.variant,
+            "normalized_effort": args.effort or args.final_effort,
+            "final_tier": args.final_tier or args.tier, "final_effort": args.final_effort or args.effort,
+            "failure_category": args.failure_category, "completion_signal": args.completion_signal,
+            "attempt_count": args.attempts, "confidence": args.confidence, "source": args.source,
+            "user_override_tier": args.override_tier, "user_override_effort": args.override_effort,
+            "user_override_model": args.override_model}
+
+
+def cmd_finish(args) -> int:
+    decision_id = evidence.finish(args.decision_id, outcome=args.outcome, state_dir=args.state_dir,
+                                  **_final_fields(args))
+    return _emit({"finalized": decision_id}, args.json)
+
+
+def cmd_outcome(args) -> int:
+    decision_id = evidence.outcome(decision_id=args.decision_id, outcome=args.outcome,
+                                   state_dir=args.state_dir, replace=args.replace, **_final_fields(args))
+    return _emit({"recorded": decision_id}, args.json)
+
+
+def cmd_prune(args) -> int:
+    if args.apply:
+        raise derived_knowledge.KnowledgeError(
+            "prune --apply is deferred in V0.2; only --dry-run is supported")
+    return _emit(outcomes.prune_dry_run(state_dir=args.state_dir), args.json)
 
 
 def cmd_promote(args) -> int:
@@ -126,6 +177,63 @@ def parser() -> argparse.ArgumentParser:
     query.set_defaults(func=cmd_query)
 
     sub.add_parser("candidates", parents=[common]).set_defaults(func=cmd_candidates)
+
+    models = sub.add_parser("models", parents=[common])
+    models.add_argument("--task-family")
+    models.add_argument("--surface")
+    models.set_defaults(func=cmd_models)
+
+    start = sub.add_parser("start", parents=[common])
+    start.add_argument("--decision-id")
+    start.add_argument("--task-family", required=True)
+    start.add_argument("--class", dest="task_class")
+    start.add_argument("--surface")
+    start.add_argument("--provider")
+    start.add_argument("--model")
+    start.add_argument("--variant")
+    start.add_argument("--tier")
+    start.add_argument("--effort")
+    start.add_argument("--override-tier")
+    start.add_argument("--override-effort")
+    start.add_argument("--override-model")
+    start.set_defaults(func=cmd_start)
+
+    def add_final_args(parser):
+        parser.add_argument("--outcome", required=True, choices=list(derived_knowledge.EVIDENCE_OUTCOMES))
+        parser.add_argument("--task-family")
+        parser.add_argument("--class", dest="task_class")
+        parser.add_argument("--surface")
+        parser.add_argument("--provider")
+        parser.add_argument("--model")
+        parser.add_argument("--variant")
+        parser.add_argument("--tier")
+        parser.add_argument("--effort")
+        parser.add_argument("--final-tier")
+        parser.add_argument("--final-effort")
+        parser.add_argument("--failure-category", choices=list(derived_knowledge.FAILURE_CATEGORIES))
+        parser.add_argument("--completion-signal", choices=list(evidence.COMPLETION_SIGNALS))
+        parser.add_argument("--attempts", type=int)
+        parser.add_argument("--confidence")
+        parser.add_argument("--source", default="observed_runtime", choices=list(derived_knowledge.SOURCE_TYPES))
+        parser.add_argument("--override-tier")
+        parser.add_argument("--override-effort")
+        parser.add_argument("--override-model")
+
+    finish = sub.add_parser("finish", parents=[common])
+    finish.add_argument("--decision-id", required=True)
+    add_final_args(finish)
+    finish.set_defaults(func=cmd_finish)
+
+    outcome = sub.add_parser("outcome", parents=[common])
+    outcome.add_argument("--decision-id")
+    outcome.add_argument("--replace", action="store_true")
+    add_final_args(outcome)
+    outcome.set_defaults(func=cmd_outcome)
+
+    prune = sub.add_parser("prune", parents=[common])
+    prune.add_argument("--dry-run", action="store_true", default=True)
+    prune.add_argument("--apply", action="store_true")
+    prune.set_defaults(func=cmd_prune)
 
     promote = sub.add_parser("promote", parents=[common])
     promote.add_argument("--destination", default="learned-default")

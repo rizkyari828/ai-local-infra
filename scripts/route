@@ -21,7 +21,31 @@ import sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "common"))
 import routing  # noqa: E402
 import discovery  # noqa: E402
+import evidence  # noqa: E402
+import outcomes  # noqa: E402
 import derived_knowledge as knowledge  # noqa: E402
+
+
+def _outcome_fields(rec: dict, decision_id: str | None) -> None:
+    """Compact observed-runtime learning + candidate, only if a local ledger exists."""
+    rec["decision_id"] = decision_id
+    rec["observed_learning"] = None
+    rec["candidate"] = None
+    if not rec.get("task_family"):
+        return
+    try:
+        if not evidence.db_path().exists():
+            return
+        learning_summary = outcomes.family_learning(rec["task_family"])
+        rec["observed_learning"] = {"samples": learning_summary["observed_runtime"],
+                                    "success": learning_summary["success"],
+                                    "escalations": learning_summary["escalations"]}
+        for candidate in outcomes.candidates()["candidates"]:
+            if candidate.get("task_family") == rec["task_family"] and candidate["type"] != "INSUFFICIENT_EVIDENCE":
+                rec["candidate"] = candidate["type"]
+                break
+    except (evidence.EvidenceError, knowledge.KnowledgeError):
+        pass
 
 
 def _knowledge_fields(rec: dict, task: str, policy: dict) -> None:
@@ -102,6 +126,7 @@ def cmd_route(args: argparse.Namespace) -> int:
         succeeded=args.succeeded, policy=policy)
     rec["next_step"] = step
     _knowledge_fields(rec, args.task or "", policy)
+    _outcome_fields(rec, args.decision_id)
     _capability_fields(rec, args.surface)
     if args.json:
         print(json.dumps(rec, indent=2, ensure_ascii=False))
@@ -127,6 +152,13 @@ def cmd_route(args: argparse.Namespace) -> int:
         learned = rec.get("learned_default")
         state = "applied" if rec.get("learned_default_applied") else ("available" if learned else "none")
         print(f"LEARNED DEFAULT: {state}")
+    if rec.get("observed_learning"):
+        observed = rec["observed_learning"]
+        print(f"LEARNING: observed samples {observed['samples']}, success {observed['success']}, "
+              f"reasoning escalations {observed['escalations']}")
+        print("CANDIDATE: " + (f"{rec['candidate']} (review required)" if rec.get("candidate") else "none"))
+    if rec.get("decision_id"):
+        print(f"DECISION ID: {rec['decision_id']}")
     if args.surface:
         print(f"SURFACE: {args.surface} ({rec.get('capability')})")
         print(f"SURFACE AVAILABILITY: {rec.get('availability')}")
@@ -147,6 +179,9 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--tier", help="explicit requested tier floor: FAST|BALANCED|STRONG|MAX")
     result.add_argument("--model", help="explicit user-selected model (kept; conflicts reported)")
     result.add_argument("--surface", help="target surface: opencode|codex-cli|codex-vscode|codex-desktop")
+    result.add_argument("--decision-id",
+                        help="stable execution id to correlate route -> outcome (no prompt content)")
+    result.add_argument("--verbose", action="store_true", help="include extra learning detail")
     result.add_argument("--attempts", type=int, default=0,
                         help="same-tier attempts already spent (for the next-step preview)")
     result.add_argument("--succeeded", action="store_true", help="mark the task as already succeeded")

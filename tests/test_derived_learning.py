@@ -49,8 +49,8 @@ class EvidenceTests(unittest.TestCase):
 
     def test_record_and_query(self) -> None:
         evidence.record({"task_family": "demo", "task_class": "NORMAL", "outcome": "SUCCESS",
-                         "source": "observed_runtime", "surface": "opencode"},
-                        state_dir=self.state)
+                         "source": "observed_runtime", "surface": "opencode",
+                         "completion_signal": "task_finalized"}, state_dir=self.state)
         result = evidence.query(task_family="demo", state_dir=self.state)
         self.assertEqual((1, 1, 1), (result["total"], result["success"], result["local"]))
 

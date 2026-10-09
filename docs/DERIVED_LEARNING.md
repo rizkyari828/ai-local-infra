@@ -105,3 +105,67 @@ Only `knowledge/*` travels through Git. To reset the local DB without losing
 shared knowledge, `./scripts/learn reset --confirm` (or delete the file). To back
 up local evidence, copy `$LAI_STATE_DIR/learning/evidence.db` while no command is
 running. A corrupt/unreadable DB is reported clearly and never silently recreated.
+
+## Outcome Learning V0.2
+
+Bounded automatic capture records **one** compact final outcome per meaningful
+routed task (never per shell command, grep, read, or `git status`). A run is
+correlated by an opaque `decision_id` (random local id; never derived from the
+prompt). Raw prompts, responses, chain-of-thought, transcripts, diffs, sessions,
+and credentials are never stored.
+
+```bash
+./scripts/route --task "..." --decision-id "$ID"     # decision_id returned/echoed
+./scripts/learn start --task-family F --tier BALANCED --effort MEDIUM   # -> decision_id
+./scripts/learn finish --decision-id "$ID" --outcome SUCCESS --completion-signal tests_passed \
+                       --final-tier STRONG --final-effort HIGH --attempts 2
+./scripts/learn outcome --decision-id "$ID" --outcome FAILURE --failure-category PROVIDER_503
+./scripts/learn models --task-family F
+./scripts/learn status
+./scripts/learn prune --dry-run
+```
+
+- **Success is never inferred from exit code.** A `SUCCESS` for an observed run
+  requires an explicit bounded `completion_signal` (`task_finalized`,
+  `acceptance_passed`, `tests_passed`, `agent_reported`); otherwise record
+  `UNKNOWN`. Curated historical seed is exempt (it is prior evidence, not a run).
+- **Retry/escalation** is preserved in the one final row: `initial_tier/effort`,
+  `final_tier/effort`, `attempt_count`, and derived `escalated`.
+- **Duplicate finalization is refused** (the pending run is consumed; re-finishing
+  errors).
+- **User overrides** are captured (`user_override_tier/effort/model`) so a
+  user-selected stronger run is not mistaken for a failed router recommendation.
+
+Aggregation (`./scripts/learn models`, `outcomes.aggregate`) is deterministic and
+local, keyed by task family, tier, effort, surface, provider, model, and variant.
+Infrastructure/environment failures are **never** counted as reasoning weakness.
+
+Candidate generation (`./scripts/learn candidates`) emits suggestions only:
+`CHEAPER_TIER_SUFFICIENT`, `LOWER_EFFORT_SUFFICIENT`, `CURRENT_TIER_TOO_WEAK`,
+`CURRENT_EFFORT_TOO_LOW`, `RECURRING_NON_INTELLIGENCE_FAILURE`,
+`MODEL_VARIANT_EFFECTIVE`, `MODEL_VARIANT_UNRELIABLE`, `INSUFFICIENT_EVIDENCE`.
+Each carries sample counts, evidence, confidence, reason, and blocking safety
+constraints. Nothing mutates policy automatically.
+
+Learned-default safety separates **technical eligibility** from a **recommended
+confidence threshold**: the schema baseline (`min_samples` 3, `min_success_ratio`
+0.8) is a floor only. Riskier classes need stronger evidence in the candidate
+logic (`MECHANICAL` 3/0.9, `NORMAL` 5/0.9, `CORRECTNESS_SENSITIVE` 10/0.95),
+and `CRITICAL` never auto-recommends a downgrade below `MAX`/`max`. Historical
+seed alone never creates a default; promotion stays human-reviewed and explicit.
+
+DB observability (`./scripts/learn status`): path, file size, schema version,
+observation count, oldest/newest timestamps, historical vs observed-runtime
+counts, pending runs, promotion candidate count, approximate prunable count, and
+last-prune (if any). Storage growth is observed, not managed: `./scripts/learn
+prune --dry-run` reports eligible rows and reasons but **never deletes**;
+`--apply` is deferred in V0.2. There is **no** cron/launchd/systemd/Windows
+scheduler and **no** automatic retention.
+
+Cross-machine: SQLite databases are never merged; each machine learns locally and
+only reviewed `knowledge/*` is shared through Git. Future retention principles
+(recent detail retained, old repetitive successes aggregated, rare failures kept
+longer, pinned and default-supporting evidence preserved) are documented only —
+no retention window is active. Model/tool changes may eventually decay old
+model-specific evidence; timestamps are already recorded for that.
+
