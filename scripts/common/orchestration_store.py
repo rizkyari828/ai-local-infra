@@ -30,11 +30,14 @@ import learning  # scripts/common, on sys.path (secret guard)
 ROOT = infra.ROOT
 DB_SUBDIR = "orchestration"
 DB_FILENAME = "orchestration.db"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 BUSY_TIMEOUT_MS = 5000
 MAX_PAYLOAD = 2000  # bounded structured event payload
 
 RUN_STATUSES = ("PLANNED", "RUNNING", "SUCCEEDED", "FAILED", "BLOCKED", "CANCELLED")
+# How a run started. The local engine never guesses a controller's cost: a
+# CHAT_HANDOFF controller may have already spent AI calls the engine cannot see.
+ENTRY_MODES = ("CHAT_HANDOFF", "DIRECT_CLI", "AUTOMATION", "API_OR_UI_FUTURE")
 TASK_STATUSES = ("PENDING", "RUNNING", "SUCCESS", "FAILED", "SKIPPED", "NO_CHANGE_REQUIRED",
                  "AI_REQUIRED", "BLOCKED")
 EXECUTOR_TYPES = ("TOOL_ONLY", "AI")
@@ -170,6 +173,12 @@ _MIGRATIONS: list[tuple[int, list[str]]] = [
         "ALTER TABLE tasks ADD COLUMN input_fingerprint TEXT",
         "ALTER TABLE tasks ADD COLUMN result_fingerprint TEXT",
     ]),
+    # v3: entry mode / controller origin. Genuinely not derivable from existing
+    # data, and never used to invent a controller AI cost. Bounded metadata only.
+    (3, [
+        "ALTER TABLE runs ADD COLUMN entry_mode TEXT",
+        "ALTER TABLE runs ADD COLUMN controller_ai_calls INTEGER",
+    ]),
 ]
 
 
@@ -242,24 +251,30 @@ class OrchestrationStore:
                    planner_normalized_effort: Optional[str] = None, hard_max_ai_calls: Optional[int] = None,
                    planned_ai_calls: Optional[int] = None, used_ai_calls: int = 0,
                    minimum_required_ai_calls: Optional[int] = None, tool_only_count: int = 0,
-                   start_head: Optional[str] = None, objective_summary: Optional[str] = None) -> str:
+                   start_head: Optional[str] = None, objective_summary: Optional[str] = None,
+                   entry_mode: Optional[str] = None, controller_ai_calls: Optional[int] = None) -> str:
         if status not in RUN_STATUSES:
             raise StoreError(f"unknown run status: {status}")
+        if entry_mode is not None and entry_mode not in ENTRY_MODES:
+            raise StoreError(f"unknown entry mode: {entry_mode}")
         now = _now()
         with self.connection:
             self.connection.execute(
                 "INSERT INTO runs(run_id, project_id, machine_id, status, intent, planner_mode, planner_tier,"
                 " planner_native_effort, planner_normalized_effort, hard_max_ai_calls, planned_ai_calls,"
                 " used_ai_calls, minimum_required_ai_calls, tool_only_count, start_head, objective_summary,"
-                " created_at, started_at, schema_version) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " entry_mode, controller_ai_calls, created_at, started_at, schema_version)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (_clean(run_id, "run_id"), _clean(project_id, "project_id"), _clean(machine_id, "machine_id"),
                  status, _clean(intent, "intent"), _clean(planner_mode, "planner_mode"),
                  _clean(planner_tier, "planner_tier"), _clean(planner_native_effort, "planner_native_effort"),
                  _clean(planner_normalized_effort, "planner_normalized_effort"), hard_max_ai_calls,
                  planned_ai_calls, used_ai_calls, minimum_required_ai_calls, tool_only_count,
                  _clean(start_head, "start_head", max_len=64),
-                 _clean(objective_summary, "objective_summary", max_len=200), now, now, SCHEMA_VERSION))
-            self._event(run_id, "RUN_CREATED", payload={"status": status, "intent": intent})
+                 _clean(objective_summary, "objective_summary", max_len=200),
+                 _clean(entry_mode, "entry_mode"), controller_ai_calls, now, now, SCHEMA_VERSION))
+            self._event(run_id, "RUN_CREATED",
+                        payload={"status": status, "intent": intent, "entry_mode": entry_mode})
         return run_id
 
     def create_task(self, run_id: str, task_id: str, *, title: str, executor_type: str,
@@ -404,8 +419,8 @@ class OrchestrationStore:
     def recent_runs(self, limit: int = 20) -> list[dict[str, Any]]:
         rows = self.connection.execute(
             "SELECT run_id, project_id, machine_id, status, intent, planner_mode, hard_max_ai_calls,"
-            " used_ai_calls, minimum_required_ai_calls, tool_only_count, failure_category, created_at"
-            " FROM runs ORDER BY created_at DESC LIMIT ?", (limit,))
+            " used_ai_calls, minimum_required_ai_calls, tool_only_count, failure_category, entry_mode,"
+            " created_at FROM runs ORDER BY created_at DESC LIMIT ?", (limit,))
         return [dict(row) for row in rows]
 
     def get_run(self, run_id: str) -> Optional[dict[str, Any]]:
@@ -423,6 +438,35 @@ class OrchestrationStore:
 
     def task_attempts(self, task_id: str) -> list[dict[str, Any]]:
         rows = self.connection.execute("SELECT * FROM attempts WHERE task_id=? ORDER BY attempt_no", (task_id,))
+        return [dict(row) for row in rows]
+
+    def run_attempts(self, run_id: str) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            "SELECT * FROM attempts WHERE run_id=? ORDER BY task_id, attempt_no", (run_id,))
+        return [dict(row) for row in rows]
+
+    def model_usage(self, run_id: Optional[str] = None, *, machine_id: Optional[str] = None,
+                    project_id: Optional[str] = None) -> list[dict[str, Any]]:
+        """Grouped real-invocation attempts by backend/provider/model/tier/effort and
+        status. No model name is hardcoded; callers get facts, not labels."""
+        clauses, params = [], []
+        if run_id is not None:
+            clauses.append("a.run_id = ?")
+            params.append(run_id)
+        if machine_id is not None:
+            clauses.append("r.machine_id = ?")
+            params.append(machine_id)
+        if project_id is not None:
+            clauses.append("r.project_id = ?")
+            params.append(project_id)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        rows = self.connection.execute(
+            "SELECT a.backend, a.surface, a.provider, a.model, a.required_tier, a.required_effort,"
+            " a.native_effort, a.normalized_effort, a.status, a.failure_category, COUNT(*) AS n"
+            f" FROM attempts a JOIN runs r ON r.run_id = a.run_id{where}"
+            " GROUP BY a.backend, a.surface, a.provider, a.model, a.required_tier, a.required_effort,"
+            " a.native_effort, a.normalized_effort, a.status, a.failure_category"
+            " ORDER BY a.provider, a.model, a.required_tier", params)
         return [dict(row) for row in rows]
 
     def run_events(self, run_id: str, *, after: int = 0, limit: int = 1000) -> list[dict[str, Any]]:
@@ -479,15 +523,32 @@ def repository_identity(root: Optional[pathlib.Path] = None) -> dict[str, str]:
 
 def persist_run(plan: dict[str, Any], report: dict[str, Any], *, machine_id: str,
                 store: Optional[OrchestrationStore] = None, state_dir: Optional[pathlib.Path] = None,
-                project_id: Optional[str] = None) -> str:
+                project_id: Optional[str] = None, entry_mode: Optional[str] = None,
+                controller_ai_calls: Optional[int] = None) -> str:
     """Persist one orchestration lifecycle (run/tasks/deps/attempts/events) from a
-    plan + execution report. No raw prompts; bounded summaries only."""
+    plan + execution report. No raw prompts; bounded summaries only.
+
+    Idempotent: re-persisting an already-recorded run is a no-op (no duplicate run,
+    attempts, or events). ``entry_mode`` defaults to ``DIRECT_CLI`` for a local
+    programmatic invocation. A CHAT_HANDOFF controller cost is never invented: the
+    engine records 0 worker calls for a direct path, and ``None`` (unknown) for a
+    chat handoff unless a trusted integration explicitly supplies a value.
+    """
     owns = store is None
     store = store or OrchestrationStore(state_dir=state_dir)
     identity = repository_identity()
     project_id = project_id or identity["repository_id"]
-    store.ensure_project(project_id, repository_id=identity["repository_id"], name=identity["name"])
     run_id = report.get("run_id") or plan.get("run_id") or uuid.uuid4().hex[:12]
+    if store.get_run(run_id) is not None:
+        if owns:
+            store.close()
+        return run_id  # already recorded; never duplicate run/task/attempt/event rows
+    entry_mode = entry_mode or report.get("entry_mode") or "DIRECT_CLI"
+    if entry_mode not in ENTRY_MODES:
+        raise StoreError(f"unknown entry mode: {entry_mode}")
+    if controller_ai_calls is None and entry_mode != "CHAT_HANDOFF":
+        controller_ai_calls = 0  # a local/automation path launches no controller model
+    store.ensure_project(project_id, repository_id=identity["repository_id"], name=identity["name"])
     budget = plan.get("planning_budget", {})
     store.create_run(run_id, project_id=project_id, machine_id=machine_id,
                      status="RUNNING", intent=plan.get("intent"),
@@ -497,7 +558,8 @@ def persist_run(plan: dict[str, Any], report: dict[str, Any], *, machine_id: str
                      minimum_required_ai_calls=budget.get("minimum_required_ai_calls"),
                      tool_only_count=budget.get("tool_only_nodes", 0),
                      start_head=report.get("head"), objective_summary=plan.get("objective_summary"),
-                     used_ai_calls=report.get("calls_used", 0))
+                     used_ai_calls=report.get("calls_used", 0),
+                     entry_mode=entry_mode, controller_ai_calls=controller_ai_calls)
     for node in plan.get("nodes", []):
         executor = node.get("executor", "AI")
         required_tier = (node.get("routing") or {}).get("tier")

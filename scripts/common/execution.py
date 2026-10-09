@@ -303,7 +303,9 @@ def execute_plan(plan: dict[str, Any], *, backend: Backend, run_id: Optional[str
                  project_id: Optional[str] = None,
                  cache_store: Optional["result_cache.ResultCache"] = None,
                  explicit_model: bool = False,
-                 allow_stronger_reuse: bool = True) -> dict[str, Any]:
+                 allow_stronger_reuse: bool = True,
+                 entry_mode: str = "DIRECT_CLI",
+                 controller_ai_calls: Optional[int] = None) -> dict[str, Any]:
     if not plan.get("valid"):
         raise ExecutionError("refusing to execute an invalid plan")
     if not confirm and not dry_run:
@@ -322,6 +324,7 @@ def execute_plan(plan: dict[str, Any], *, backend: Backend, run_id: Optional[str
     report: dict[str, Any] = {"run_id": run_id, "backend": backend.name, "dry_run": dry_run,
                               "intent": plan.get("intent"), "bounds": bounds, "resolutions": bindings,
                               "nodes": {}, "head": state["head"], "dirty": state["dirty"],
+                              "entry_mode": entry_mode, "controller_ai_calls": controller_ai_calls,
                               "max_ai_calls": max_ai_calls, "calls_used": 0, "remaining_calls": None}
     if enforce_read_only:
         conflicts = [f"READ_ONLY_MUTATION_CONFLICT: {node['task_id']} is a mutating node under READ_ONLY intent"
@@ -727,7 +730,13 @@ def _run_node(node, deps, results, backend, resolution, *, state_dir, record_evi
                                  decision_id, resolution, state_dir, record_evidence)
             request["context_pack"] = context_result["pack"]
             request["context_manifest"] = context_result["manifest"]
-        result = current_backend.execute(request)
+        try:
+            result = current_backend.execute(request)
+        except KeyboardInterrupt:
+            raise  # cancellation semantics are handled by the caller
+        except Exception as exc:  # adapter bug/crash: never a false SUCCESS, never an orphan
+            result = {"task_id": node["task_id"], "status": FAILURE, "failure_category": "UNKNOWN_FAILURE",
+                      "summary": f"adapter error: {type(exc).__name__}"}
         if enforce_read_only:
             changed = sorted(_worktree_paths(repo_root) - (before or set()))
             if changed:

@@ -6,14 +6,19 @@
                                [--dry-run] [--resume] [--run-id ID] [--surface ...]
                                [--min-tier T] [--max-tier T] [--local-only] [--no-premium]
                                [--no-cache | --refresh] [--max-ai-calls N]
+                               [--entry-mode chat-handoff|direct-cli|automation|api-or-ui]
+    ./scripts/orchestrate direct --objective "..." [--confirm] [--backend ...] [run options]
+    ./scripts/orchestrate efficiency [RUN_ID] [--recent] [--model-usage] [--json]
     ./scripts/orchestrate cache [--state-dir DIR] [--json]
 
-plan is local/deterministic and persists nothing. run executes the validated graph
+plan is local/deterministic and persists nothing. run/direct execute the validated graph
 sequentially through a provider-agnostic backend adapter; real backends require an
-explicit --confirm gate. run reuses previously accepted results when inputs provably
-match (result cache; enabled by default, `--refresh` bypasses reuse, `--no-cache`
-disables it). The raw objective is processed in memory only and is never persisted.
-See docs/ORCHESTRATION.md, docs/EXECUTION.md, and docs/RESULT_CACHE.md.
+explicit --confirm gate. `direct` is the direct local entry path (no chat controller).
+run reuses previously accepted results when inputs provably match (result cache; enabled
+by default, `--refresh` bypasses reuse, `--no-cache` disables it). The raw objective is
+processed in memory only and is never persisted. efficiency reads deterministic
+telemetry from operational state (never CLI prose). See docs/ORCHESTRATION.md,
+docs/EXECUTION.md, docs/RESULT_CACHE.md, and docs/EFFICIENCY_TELEMETRY.md.
 """
 
 from __future__ import annotations
@@ -33,8 +38,9 @@ import execution  # noqa: E402
 import discovery  # noqa: E402
 import failover  # noqa: E402
 import orchestration_store  # noqa: E402
-import context_retrieval  # noqa: E402
 import result_cache  # noqa: E402
+import efficiency  # noqa: E402
+import lifecycle  # noqa: E402
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
@@ -120,6 +126,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     if not plan["valid"]:
         print("ERROR: invalid plan; run 'plan' to inspect diagnostics", file=sys.stderr)
         return 2
+    entry_mode = getattr(args, "entry_mode", None) or "DIRECT_CLI"
+    controller_ai_calls = getattr(args, "controller_ai_calls", None)
     backend = execution.backend_for(args.backend)
     health, backends = _local_health()
     if args.backend != "fake":
@@ -131,18 +139,13 @@ def cmd_run(args: argparse.Namespace) -> int:
         resume=args.resume, read_only=args.read_only, max_ai_calls=args.max_ai_calls,
         backends=backends, health=(None if args.backend == "fake" else health),
         constraints=_constraints(args), cache=not args.no_cache, force_refresh=args.refresh,
-        explicit_model=bool(args.prefer_model or args.prefer_provider))
+        explicit_model=bool(args.prefer_model or args.prefer_provider),
+        entry_mode=entry_mode, controller_ai_calls=controller_ai_calls)
     if not args.no_store:
-        try:
-            run_id = orchestration_store.persist_run(
-                plan, report, machine_id=os.environ.get("LAI_MACHINE") or "unknown",
-                state_dir=args.state_dir)
-            state_root = (pathlib.Path(args.state_dir) if args.state_dir
-                          else pathlib.Path(os.environ.get("LAI_STATE_DIR", "~/.local/state/local-ai-infra")).expanduser())
-            for task_id, manifest in (report.get("context_manifests") or {}).items():
-                context_retrieval.write_manifest(state_root, run_id, task_id, manifest)
-        except (orchestration_store.StoreError, context_retrieval.ContextError, OSError):
-            pass  # operational persistence is best-effort; never fails the run
+        # Automatic lifecycle hooks: run/task/attempt/events/outcome evidence/context.
+        lifecycle.record_run(plan, report, state_dir=args.state_dir,
+                             machine_id=os.environ.get("LAI_MACHINE") or "unknown",
+                             entry_mode=entry_mode, controller_ai_calls=controller_ai_calls)
     if args.json:
         print(json.dumps(report, indent=2, ensure_ascii=False))
     else:
@@ -157,6 +160,14 @@ def _tier(value: str) -> str:
     candidate = value.upper()
     if candidate not in orchestrator.TIER_ORDER:
         raise argparse.ArgumentTypeError(f"tier must be one of {', '.join(orchestrator.TIER_ORDER)}")
+    return candidate
+
+
+def _entry_mode(value: str) -> str:
+    candidate = value.strip().upper().replace("-", "_")
+    if candidate not in orchestration_store.ENTRY_MODES:
+        raise argparse.ArgumentTypeError(
+            f"entry mode must be one of {', '.join(orchestration_store.ENTRY_MODES)}")
     return candidate
 
 
@@ -177,6 +188,26 @@ def _add_objective_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--json", action="store_true")
 
 
+def _add_run_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--backend", default="auto", help="fake | opencode | codex | auto")
+    parser.add_argument("--dry-run", action="store_true", help="show resolved backends/calls; launch nothing")
+    parser.add_argument("--confirm", action="store_true", help="required gate for real execution")
+    parser.add_argument("--allow-dirty", action="store_true", help="allow a dirty worktree (bounded override)")
+    parser.add_argument("--resume", action="store_true", help="resume a previous run (--run-id required)")
+    parser.add_argument("--run-id", help="run identifier")
+    parser.add_argument("--state-dir", type=pathlib.Path, help="override local state root")
+    parser.add_argument("--no-evidence", action="store_true", help="do not record outcome evidence")
+    parser.add_argument("--no-store", action="store_true", help="do not persist operational run state")
+    parser.add_argument("--no-cache", action="store_true",
+                        help="disable result-cache reuse and writes for this run")
+    parser.add_argument("--refresh", action="store_true",
+                        help="bypass reuse for this run (cache entries are kept, not deleted)")
+    parser.add_argument("--entry-mode", type=_entry_mode, default="DIRECT_CLI",
+                        help="how the run started (default direct-cli); a chat controller uses chat-handoff")
+    parser.add_argument("--controller-ai-calls", type=int,
+                        help="trusted controller AI-call count for chat-handoff (never inferred)")
+
+
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     sub = result.add_subparsers(dest="command", required=True)
@@ -187,26 +218,92 @@ def parser() -> argparse.ArgumentParser:
 
     run = sub.add_parser("run", help="execute the validated plan sequentially (gated)")
     _add_objective_args(run)
-    run.add_argument("--backend", default="auto", help="fake | opencode | codex | auto")
-    run.add_argument("--dry-run", action="store_true", help="show resolved backends/calls; launch nothing")
-    run.add_argument("--confirm", action="store_true", help="required gate for real execution")
-    run.add_argument("--allow-dirty", action="store_true", help="allow a dirty worktree (bounded override)")
-    run.add_argument("--resume", action="store_true", help="resume a previous run (--run-id required)")
-    run.add_argument("--run-id", help="run identifier")
-    run.add_argument("--state-dir", type=pathlib.Path, help="override local state root")
-    run.add_argument("--no-evidence", action="store_true", help="do not record outcome evidence")
-    run.add_argument("--no-store", action="store_true", help="do not persist operational run state")
-    run.add_argument("--no-cache", action="store_true",
-                     help="disable result-cache reuse and writes for this run")
-    run.add_argument("--refresh", action="store_true",
-                     help="bypass reuse for this run (cache entries are kept, not deleted)")
+    _add_run_args(run)
     run.set_defaults(func=cmd_run)
+
+    direct = sub.add_parser("direct", help="direct local entry path (no chat controller)")
+    _add_objective_args(direct)
+    _add_run_args(direct)
+    direct.set_defaults(func=cmd_run)
+
+    efficiency_cmd = sub.add_parser("efficiency", help="deterministic run efficiency telemetry (read-only)")
+    efficiency_cmd.add_argument("run_id", nargs="?", help="a specific run id (omit for --recent)")
+    efficiency_cmd.add_argument("--recent", action="store_true", help="summarize recent runs")
+    efficiency_cmd.add_argument("--model-usage", action="store_true", help="show model/backend usage groups")
+    efficiency_cmd.add_argument("--limit", type=int, default=20, help="recent run limit")
+    efficiency_cmd.add_argument("--machine-id", help="filter by machine id")
+    efficiency_cmd.add_argument("--project-id", help="filter by project/repository id")
+    efficiency_cmd.add_argument("--state-dir", type=pathlib.Path, help="override local state root")
+    efficiency_cmd.add_argument("--json", action="store_true")
+    efficiency_cmd.set_defaults(func=cmd_efficiency)
 
     cache = sub.add_parser("cache", help="show local result-cache status (read-only)")
     cache.add_argument("--state-dir", type=pathlib.Path, help="override local state root")
     cache.add_argument("--json", action="store_true")
     cache.set_defaults(func=cmd_cache)
     return result
+
+
+def _render_efficiency(data: dict, args: argparse.Namespace) -> str:
+    if args.model_usage:
+        lines = [f"MODEL USAGE  total_invocations={data['total_invocations']}"]
+        for row in data["groups"]:
+            lines.append(f"  {row['backend']}/{row['provider']}/{row['model']} "
+                         f"{row['required_tier']}/{row['required_effort']} native={row['native_effort']} "
+                         f"normalized={row['normalized_effort']} {row['status']} "
+                         + (f"({row['failure_category']}) " if row['failure_category'] else "")
+                         + f"x{row['count']}")
+        return "\n".join(lines)
+    if "totals" in data:
+        t = data["totals"]
+        lines = [f"RECENT EFFICIENCY  runs={t['runs']}  logical_ai={t['logical_ai_tasks']}  "
+                 f"cache_reused_ai={t['cache_reused_ai_tasks']}  "
+                 f"real_invocations={t['real_ai_invocation_attempts']}  "
+                 f"tool_only={t['tool_only_tasks']}  true_zero_ai_runs={t['true_zero_ai_runs']}"]
+        for run in data["runs"]:
+            lines.append(f"  {run['run_id']}  {run['entry_mode']}  {run['status']}  "
+                         f"ai {run['ai']['real_invocation_attempts']}  "
+                         f"cache {run['tasks']['cache_reused_ai']}  "
+                         f"true_zero_ai={run['zero_ai']['true_zero_ai']}")
+        return "\n".join(lines)
+    t, a, z = data["tasks"], data["ai"], data["zero_ai"]
+    lines = [f"RUN {data['run_id']}  entry={data['entry_mode']}  status={data['status']}  "
+             f"planner={data['planner_mode']}",
+             f"TASKS  total={t['total']} tool_only={t['tool_only']} no_change={t['no_change']} "
+             f"logical_ai={t['logical_ai']} cache_reused_ai={t['cache_reused_ai']} fresh_ai={t['fresh_ai']}",
+             f"AI  real_invocations={a['real_invocation_attempts']} successful={a['successful_invocations']} "
+             f"failed={a['failed_invocations']} retries={a['retry_calls']} fallbacks={a['fallback_calls']} "
+             f"planner_calls={a['planner_calls']} calls_avoided_by_cache={a['calls_avoided_by_cache']}",
+             f"CACHE  hits={data['cache']['hits']} misses={data['cache']['misses']} "
+             f"rejected={data['cache']['rejected']} invalid={data['cache']['invalid']} "
+             f"bypassed={data['cache']['bypassed_by_user']}",
+             f"BUDGET  hard_max={data['budget']['hard_max_ai_calls']} "
+             f"remaining={data['budget']['remaining_ai_call_budget']}",
+             f"ZERO-AI  local_ai_calls={z['local_ai_calls']} "
+             f"controller_ai_calls={z['controller_ai_calls']} "
+             f"zero_additional_ai={z['zero_additional_ai']} true_zero_ai={z['true_zero_ai']}",
+             f"CONTEXT  packs={data['context']['pack_count']} chars={data['context']['total_chars']} "
+             f"required={data['context']['required_items']} optional={data['context']['optional_items']} "
+             f"dropped={data['context']['optional_items_dropped']} "
+             f"dedup_chars={data['context']['deduplicated_chars']}"]
+    return "\n".join(lines)
+
+
+def cmd_efficiency(args: argparse.Namespace) -> int:
+    try:
+        if args.model_usage:
+            data = efficiency.get_model_usage(state_dir=args.state_dir, run_id=args.run_id,
+                                              machine_id=args.machine_id, project_id=args.project_id)
+        elif args.run_id:
+            data = efficiency.get_run_efficiency(args.run_id, state_dir=args.state_dir)
+        else:
+            data = efficiency.get_recent_efficiency(state_dir=args.state_dir, limit=args.limit,
+                                                    machine_id=args.machine_id, project_id=args.project_id)
+    except orchestration_store.StoreError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    print(json.dumps(data, indent=2, ensure_ascii=False) if args.json else _render_efficiency(data, args))
+    return 0
 
 
 def cmd_cache(args: argparse.Namespace) -> int:

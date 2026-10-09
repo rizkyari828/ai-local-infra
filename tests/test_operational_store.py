@@ -53,23 +53,43 @@ class SchemaTests(unittest.TestCase):
         self.assertEqual(store.SCHEMA_VERSION, s2.status()["schema_version"])
         s2.close()
 
-    def test_v1_to_v2_migration_is_additive(self) -> None:
+    def test_v1_to_latest_migration_is_additive(self) -> None:
         # Build a v1 DB (migration 1 only), then reopen and confirm an incremental,
-        # non-destructive upgrade to v2 adds reuse provenance columns.
+        # non-destructive upgrade to latest adds reuse (v2) and entry-mode (v3) fields.
         v1 = [(1, store._MIGRATIONS[0][1])]
         with unittest.mock.patch.object(store, "_MIGRATIONS", v1):
             s = store.OrchestrationStore(state_dir=self.state)
             s.ensure_project("remote:x")
-            s.create_run("r1", project_id="remote:x", machine_id="work-mac")
+            # A genuine v1 row (no v2/v3 columns exist yet).
+            s.connection.execute(
+                "INSERT INTO runs(run_id, project_id, machine_id, status, created_at, started_at,"
+                " schema_version) VALUES('r1','remote:x','work-mac','RUNNING','now','now',1)")
+            s.connection.commit()
             self.assertEqual(1, s.status()["schema_version"])
             s.close()
-        s2 = store.OrchestrationStore(state_dir=self.state)  # migrates 1 -> 2
-        self.assertEqual(2, s2.status()["schema_version"])
+        s2 = store.OrchestrationStore(state_dir=self.state)  # migrates 1 -> latest
+        self.assertEqual(store.SCHEMA_VERSION, s2.status()["schema_version"])
         self.assertIsNotNone(s2.get_run("r1"))  # prior data preserved, not recreated
-        columns = {row[1] for row in s2.connection.execute("PRAGMA table_info(tasks)")}
+        task_columns = {row[1] for row in s2.connection.execute("PRAGMA table_info(tasks)")}
         for expected in ("execution_source", "cache_entry_id", "reused_from_run_id",
                          "reused_from_task_id", "input_fingerprint", "result_fingerprint"):
-            self.assertIn(expected, columns)
+            self.assertIn(expected, task_columns)
+        run_columns = {row[1] for row in s2.connection.execute("PRAGMA table_info(runs)")}
+        for expected in ("entry_mode", "controller_ai_calls"):
+            self.assertIn(expected, run_columns)
+        s2.close()
+
+    def test_v2_to_v3_entry_mode_migration(self) -> None:
+        v2 = list(store._MIGRATIONS[:2])
+        with unittest.mock.patch.object(store, "_MIGRATIONS", v2):
+            s = store.OrchestrationStore(state_dir=self.state)
+            self.assertEqual(2, s.status()["schema_version"])
+            s.close()
+        s2 = store.OrchestrationStore(state_dir=self.state)  # migrates 2 -> 3
+        self.assertEqual(3, s2.status()["schema_version"])
+        columns = {row[1] for row in s2.connection.execute("PRAGMA table_info(runs)")}
+        self.assertIn("entry_mode", columns)
+        self.assertIn("controller_ai_calls", columns)
         s2.close()
 
     def test_migration_rollback_on_failure(self) -> None:

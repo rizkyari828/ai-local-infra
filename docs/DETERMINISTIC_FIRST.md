@@ -91,5 +91,11 @@ not force a TOOL_ONLY task to become AI unless AI execution is explicitly reques
 An explicit model request is preserved where safe, with a note that deterministic
 execution was available.
 
-Not implemented in V0.1: live AI planner calls, the single-master-prompt live smoke,
-result cache, context retrieval optimization, efficiency telemetry, and retention.
+Efficiency telemetry (`docs/EFFICIENCY_TELEMETRY.md`) now reports these facts
+deterministically: TOOL_ONLY/NO_CHANGE counts, logical vs real AI calls, planner bypass,
+entry mode, and zero-additional-AI vs true-zero-AI. It measures facts, never
+counterfactual savings. A direct local entry path (`docs/DIRECT_MODE.md`) can reach
+TOOL_ONLY/cache-only true-zero-AI execution without a chat controller.
+
+Not implemented: live AI planner calls, the single-master-prompt live smoke, retention,
+and cross-machine efficiency aggregation.

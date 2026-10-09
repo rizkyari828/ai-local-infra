@@ -1,4 +1,4 @@
-# Operational Data Contract V0.2
+# Operational Data Contract V0.3
 
 A stable, versioned, queryable representation of what the orchestration engine is
 doing and has done. It is **data infrastructure, not UI**, and lives in its own SQLite
@@ -111,6 +111,23 @@ AI calls. `TASK_REUSED` plus `CACHE_HIT` communicate reuse without overloading s
 semantics. Migrations are additive and non-destructive (v1 → v2 `ALTER TABLE ... ADD
 COLUMN`); existing v1 databases upgrade in place with no data loss.
 
+## Entry mode / controller origin (schema v3)
+
+Efficiency telemetry (`docs/EFFICIENCY_TELEMETRY.md`) needs one semantic that is not
+derivable from existing rows: how the run started. The Run adds:
+
+| Run column (v3) | Meaning |
+|---|---|
+| `entry_mode` | `CHAT_HANDOFF` / `DIRECT_CLI` / `AUTOMATION` / `API_OR_UI_FUTURE` |
+| `controller_ai_calls` | `0` for a direct/automation path; `NULL` (unknown) for a chat handoff unless a trusted integration supplies it |
+
+The engine never invents a controller cost: a `CHAT_HANDOFF` controller may already have
+spent AI calls it cannot see, so `controller_ai_calls` stays `NULL` there and
+`true_zero_ai` is not claimed (only `zero_additional_ai`). Derived efficiency metrics
+(totals, ratios, context sizes) are **not** stored — they are computed on demand, so no
+schema was added for them. `persist_run` is idempotent: re-recording a run duplicates
+nothing.
+
 ## Migrations, concurrency, identity
 
 Incremental, transactional migrations keyed by an explicit `meta.schema_version`; a
@@ -121,11 +138,11 @@ migrate to latest; older DBs migrate incrementally. SQLite settings: `journal_mo
 ## Query layer
 
 `OrchestrationStore` exposes `status`, `recent_runs`, `get_run`, `run_tasks`,
-`run_dependencies`, `task_attempts`, `run_events(after=cursor)`, `execution_summary`, and
-`reuse_summary` (which tasks executed, were TOOL_ONLY, were AI, and reused — and from
-where). Future API/UI/telemetry call this layer, not CLI text. A small
-`./scripts/orchestrate` run integration persists each lifecycle best-effort; there is
-no HTTP API, WebSocket, or UI in V0.1.
+`run_dependencies`, `task_attempts`, `run_attempts`, `run_events(after=cursor)`,
+`execution_summary`, `reuse_summary`, and `model_usage` (grouped invocation facts). The
+efficiency query layer (`scripts/common/efficiency.py`) builds on these; a small
+`./scripts/orchestrate` run integration persists each lifecycle best-effort
+(`docs/DIRECT_MODE.md`); there is no HTTP API, WebSocket, or UI in V0.1.
 
 ## Privacy and objective storage
 
