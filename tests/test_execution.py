@@ -292,6 +292,9 @@ class OutcomeLearningTests(unittest.TestCase):
         self.assertEqual(executed, len(rows))
         self.assertTrue(all(row["source"] == "observed_runtime" for row in rows))
         self.assertEqual(0, evidence.query(state_dir=self.state)["historical"])
+        # backend/surface and normalized effort are recorded for fresh runtime evidence
+        self.assertTrue(all(row["surface"] == "fake" for row in rows))
+        self.assertTrue(all(row["normalized_effort"] for row in rows))
 
     def test_dry_run_records_nothing(self) -> None:
         plan = orchestrator.decompose(MIXED)

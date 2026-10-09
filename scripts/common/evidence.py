@@ -42,7 +42,7 @@ _TEXT_FIELDS = tuple(field for field in EVIDENCE_FIELDS if field not in _BOOL_FI
 
 PENDING_FIELDS = (
     "decision_id", "started_at", "task_family", "task_class", "surface",
-    "provider", "model", "native_variant", "initial_tier", "initial_effort",
+    "provider", "model", "native_variant", "normalized_effort", "initial_tier", "initial_effort",
     "user_override_tier", "user_override_effort", "user_override_model",
 )
 

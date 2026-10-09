@@ -302,7 +302,8 @@ def execute_plan(plan: dict[str, Any], *, backend: Backend, run_id: Optional[str
         try:
             results[task_id] = _run_node(node, deps, results, backend, resolutions[task_id],
                                          state_dir=state_dir, record_evidence=record_evidence,
-                                         infra_retries=infra_retries, same_tier_retries=same_tier_retries)
+                                         infra_retries=infra_retries, same_tier_retries=same_tier_retries,
+                                         surface=backend.name)
         except KeyboardInterrupt:
             results[task_id] = {"status": CANCELLED, "task_id": task_id}
             for future in plan["order"][plan["order"].index(task_id) + 1:]:
@@ -327,7 +328,7 @@ def _conditional_active(node: dict[str, Any], deps: list[str], results: dict[str
 
 
 def _run_node(node, deps, results, backend, resolution, *, state_dir, record_evidence,
-              infra_retries, same_tier_retries) -> dict[str, Any]:
+              infra_retries, same_tier_retries, surface) -> dict[str, Any]:
     dependency_summaries = [{"task_id": dep, "summary": results.get(dep, {}).get("summary", "")}
                             for dep in deps]
     tier = node["routing"]["tier"]
@@ -336,8 +337,10 @@ def _run_node(node, deps, results, backend, resolution, *, state_dir, record_evi
     infra_used = same_used = escalations = 0
     execution_id = uuid.uuid4().hex
     decision_id = evidence.start(task_family=node["task_family"], task_class=node["task_class"],
-                                 surface=None, provider=resolution["provider"], model=resolution["model"],
-                                 native_variant=resolution["native_variant"], initial_tier=initial_tier,
+                                 surface=surface, provider=resolution["provider"], model=resolution["model"],
+                                 native_variant=resolution["native_variant"],
+                                 normalized_effort=(node["routing"]["effort"] or "").upper() or None,
+                                 initial_tier=initial_tier,
                                  initial_effort=node["routing"]["effort"], state_dir=state_dir) \
         if record_evidence else execution_id
     while True:
