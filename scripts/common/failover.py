@@ -130,6 +130,12 @@ def resolve(required_tier: str, required_effort: str, specs: list[dict[str, Any]
             candidate["model"] = health.codex_model
         candidate["verified"] = candidate["provider"] != "codex"  # codex account capability UNVERIFIED
         candidate["status"] = health.status(candidate)
+        # Normalized effort is derived ONLY from the provider-native variant, never from the tier.
+        try:
+            candidate["normalized_effort"] = discovery.normalize_effort(
+                candidate["provider"], candidate.get("native_variant"), discovery.load_config())
+        except discovery.DiscoveryError:
+            candidate["normalized_effort"] = None
         blocking: list[str] = []
         if _rank(tier_order, candidate["tier"]) < _rank(tier_order, required_tier):
             blocking.append("below_tier_floor")

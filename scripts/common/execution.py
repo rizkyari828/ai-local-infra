@@ -453,10 +453,19 @@ def _run_node(node, deps, results, backend, resolution, *, state_dir, record_evi
     infra_used = same_used = escalations = 0
     execution_id = uuid.uuid4().hex
     before = _worktree_paths(repo_root) if enforce_read_only else None
+    native = candidate["native_variant"]
+    normalized = None
+    if native:
+        try:
+            normalized = discovery.normalize_effort(candidate["provider"], native, discovery.load_config())
+        except discovery.DiscoveryError:
+            normalized = None
+    if isinstance(resolution, dict):
+        resolution = {**resolution, "normalized_effort": normalized, "native_effort": native}
     decision_id = evidence.start(task_family=node["task_family"], task_class=node["task_class"],
                                  surface=candidate["backend"], provider=candidate["provider"],
-                                 model=candidate["model"], native_variant=candidate["native_variant"],
-                                 normalized_effort=(node["routing"]["effort"] or "").upper() or None,
+                                 model=candidate["model"], native_variant=native,
+                                 normalized_effort=normalized,
                                  initial_tier=initial_tier,
                                  initial_effort=node["routing"]["effort"], state_dir=state_dir) \
         if record_evidence else execution_id
@@ -596,9 +605,10 @@ def _finalize(node, result, status, category, initial_tier, final_tier, attempts
     if record_evidence and decision_id:
         outcome = SUCCESS if status == SUCCESS else ("UNKNOWN" if status == "UNKNOWN" else FAILURE)
         completion = result.get("completion_signal") if status == SUCCESS else None
+        final_effort = (resolution or {}).get("normalized_effort") or node["routing"]["effort"]
         try:
             evidence.finish(decision_id, outcome=outcome, completion_signal=completion,
-                            final_tier=final_tier, final_effort=node["routing"]["effort"],
+                            final_tier=final_tier, final_effort=final_effort,
                             failure_category=category, attempt_count=attempts, state_dir=state_dir)
         except evidence.EvidenceError:
             pass
