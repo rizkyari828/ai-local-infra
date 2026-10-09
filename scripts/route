@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Recommend the cheapest sufficient model tier/effort for a task (read-only).
 
-Deterministic and offline: it classifies the task text with simple rules,
-applies the declarative policy in ``config/model-routing.yaml``, and prints a
-recommendation. It never calls a model or network, and never echoes the raw task
-(only the derived class/reason), so no prompt or secret leaks into output.
+Deterministic and offline: it classifies the task text with simple rules, applies
+the declarative policy in ``config/model-routing.yaml``, and prints a
+recommendation. The output keeps three layers separate: TASK CLASS (provider
+independent) -> RECOMMENDED TIER / EFFORT (symbolic) -> RESOLVED MODEL (a
+configured provider/model, informational in V0.1). It never calls a model or
+network and never echoes the raw task, so no prompt or secret leaks into output.
 
-Tiers reference existing model roles (models/roles.yaml); provider/model names
-are never hardcoded here. See docs/MODEL_ROUTING.md.
+Provider/model names come only from ``models/roles.yaml``. See docs/MODEL_ROUTING.md.
 """
 
 from __future__ import annotations
@@ -30,6 +31,15 @@ def _escalation_label(policy: dict, rec: dict) -> str:
     return f"{target} / {entry['tier']} / {entry['effort']} after up to {retries} same-tier retries"
 
 
+def _resolved_label(rec: dict) -> str:
+    if rec.get("availability") == "UNAVAILABLE_ON_SURFACE":
+        return "UNAVAILABLE_ON_SURFACE"
+    if not rec.get("model"):
+        return "unmapped"
+    provider = rec.get("provider")
+    return f"{rec['model']} (provider: {provider})" if provider else rec["model"]
+
+
 def cmd_route(args: argparse.Namespace) -> int:
     policy = routing.load_policy()
     rec = routing.recommend(
@@ -37,27 +47,30 @@ def cmd_route(args: argparse.Namespace) -> int:
         task_class=args.task_class,
         requested_effort=args.effort,
         requested_tier=args.tier,
+        user_model=args.model,
         surface=args.surface,
         policy=policy,
     )
     step = routing.escalation_step(
         rec["task_class"], same_tier_attempts=args.attempts,
         succeeded=args.succeeded, policy=policy)
-    role = rec["role"] or "?"
-    model = f" ({rec['model']})" if rec.get("model") else ""
     rec["next_step"] = step
     if args.json:
         print(json.dumps(rec, indent=2, ensure_ascii=False))
         return 0
-    print(f"CLASSIFICATION: {rec['task_class']}")
-    print(f"MODEL TIER: {rec['recommended_tier']}")
-    print(f"ROLE: {role}{model}")
-    print(f"EFFORT: {rec['recommended_effort']}")
+    print(f"TASK CLASS: {rec['task_class']}")
+    print(f"RECOMMENDED TIER: {rec['recommended_tier']}")
+    print(f"EFFORT: {rec['recommended_effort'].upper()}")
+    print(f"ROLE: {rec['role'] or 'unmapped'}")
+    print(f"RESOLVED MODEL: {_resolved_label(rec)}")
+    if args.surface:
+        print(f"SURFACE: {args.surface} ({rec.get('capability')})")
+        print(f"SURFACE AVAILABILITY: {rec.get('availability')}")
+    if rec.get("user_model"):
+        print(f"USER MODEL: {rec['user_model']} ({rec['user_model_status']})")
     print(f"ESCALATION: {_escalation_label(policy, rec)}")
     print(f"NEXT STEP: {step['action']} ({step['reason']})")
     print(f"RATIONALE: {rec['reason']}")
-    if args.surface:
-        print(f"SURFACE: {args.surface} ({rec['capability']})")
     return 0
 
 
@@ -68,6 +81,7 @@ def parser() -> argparse.ArgumentParser:
                         help="explicit task class override (wins over heuristics)")
     result.add_argument("--effort", help="explicit requested effort floor: low|medium|high|max")
     result.add_argument("--tier", help="explicit requested tier floor: FAST|BALANCED|STRONG|MAX")
+    result.add_argument("--model", help="explicit user-selected model (kept; conflicts reported)")
     result.add_argument("--surface", help="target surface: opencode|codex-cli|codex-vscode|codex-desktop")
     result.add_argument("--attempts", type=int, default=0,
                         help="same-tier attempts already spent (for the next-step preview)")

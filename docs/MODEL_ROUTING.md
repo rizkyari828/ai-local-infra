@@ -36,18 +36,50 @@ silently to the cheapest class):
 | `CORRECTNESS_SENSITIVE` | architecture, concurrency, security, persistence, cross-machine | `STRONG` | high (`teacher-cheap`) |
 | `CRITICAL` | unresolved correctness-sensitive or security-sensitive design | `MAX` | max (`teacher-premium`) |
 
-Tiers are symbolic and reference the existing roles in
-[`../models/roles.yaml`](../models/roles.yaml), which map role -> provider/model.
-Provider/model names are never hardcoded in routing, so mappings can differ per
-machine/surface. Every surface (OpenCode, Codex CLI/VS Code/Desktop) is
-`RECOMMEND_ONLY` in V0.1: the router recommends, the human or agent applies it.
+Three layers stay deliberately separate, so routing survives a full model swap:
+
+- **A. Task classification** — `MECHANICAL`/`NORMAL`/`CORRECTNESS_SENSITIVE`/`CRITICAL`.
+- **B. Routing requirement** — a symbolic tier (`FAST`/`BALANCED`/`STRONG`/`MAX`) plus a reasoning effort.
+- **C. Model resolution** — concrete provider/model for a tier, from the role registry in [`../models/roles.yaml`](../models/roles.yaml).
+
+A and B reference no provider or model names. C is the only layer that knows
+them. Adding or replacing a provider/model is a **configuration-only** change:
+map a tier to a role in `config/model-routing.yaml` and the role to a
+provider/model in `models/roles.yaml`. Names such as Qwen, Claude, DeepSeek, GPT,
+or a local Ollama model are *examples and registry entries*, never routing
+concepts; `config/model-routing.yaml` names no concrete model. Every surface
+(OpenCode, Codex CLI/VS Code/Desktop) is `RECOMMEND_ONLY` in V0.1: the router
+recommends, a human or agent applies it. No user-selected model is ever changed.
 
 ```bash
 ./scripts/route --task "design a cross-machine config resolver"
 ./scripts/route --task "rename a config key" --json
-./scripts/route --task "anything" --class critical         # explicit override wins
-./scripts/route --task "rename" --effort high              # user floor, never downgraded
+./scripts/route --task "anything" --class critical          # explicit override wins
+./scripts/route --task "rename" --effort high               # user floor, never downgraded
+./scripts/route --task "rename" --model <configured-model>  # user model kept; conflicts reported
 ```
+
+### Surface availability and user override
+
+Surfaces may optionally restrict which tiers they can provide
+(`surfaces.<name>.tiers`). When the recommended tier is unavailable on a surface,
+routing reports `UNAVAILABLE_ON_SURFACE` and keeps the symbolic recommendation
+(e.g. `STRONG`/`high`) — it never silently downgrades and never invents a model.
+
+Explicit user choices win when they satisfy or exceed the safety floor: a
+requested tier/effort only ever raises the requirement, and `--model` keeps the
+user's model. If a user-selected model is below a class's floor it is reported as
+`CONFLICT` (not silently swapped); an unknown model is reported `UNVERIFIED`.
+
+### Preparing for Derived Learning
+
+Future Derived Learning must learn portable, provider-independent knowledge:
+`task_family`, `task_class`, `required_tier`, `required_effort`, and escalation
+behavior — **not** "always use model XYZ". Concrete model performance is a
+separate evidence dimension (`provider`, `model`, `surface`, `tier`, `effort`,
+`outcome`), so a lesson learned with one model stays useful when another model is
+introduced later. Routing V0.1 only emits the `task_class`/tier/effort/escalation
+evidence; it does not persist it.
 
 Escalation is bounded and evidence-based: a small number of same-tier retries
 (`max_retries`), then a single step up the class chain

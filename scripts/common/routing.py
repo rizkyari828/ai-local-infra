@@ -1,13 +1,16 @@
 """Adaptive model routing V0.1 (deterministic, standard library only).
 
-Answers "what is the cheapest sufficient model/reasoning tier for this task?"
-without calling any model or network: a small keyword classifier, a declarative
-policy (``config/model-routing.yaml``), and a bounded escalation step. Tiers
-reference the existing model roles in ``models/roles.yaml`` rather than
-hardcoding provider/model names.
+Three deliberately separate layers keep routing reusable when models change:
 
-This is a recommendation layer, not an autonomous router: every surface is
-``RECOMMEND_ONLY`` in V0.1 and no user-selected model is ever changed.
+A. task classification   -> MECHANICAL / NORMAL / CORRECTNESS_SENSITIVE / CRITICAL
+B. routing requirement   -> symbolic tier (FAST/BALANCED/STRONG/MAX) + reasoning effort
+C. model resolution       -> a concrete provider/model for a tier, via the role
+                             registry in ``models/roles.yaml``
+
+Layer C only ever resolves names; it never changes classification, tier floors, or
+escalation. Classification and escalation use no provider/model identifiers, so
+Qwen/Claude/DeepSeek/OpenAI/any future model can be swapped through configuration.
+No model or network call is ever made here, and no user-selected model is changed.
 """
 
 from __future__ import annotations
@@ -28,7 +31,8 @@ DEFAULT_TIER_ORDER = ("FAST", "BALANCED", "STRONG", "MAX")
 
 # Conservative, deterministic keyword signals. Word-boundary matched so a term
 # like "format" does not fire inside "information". An uncertain task falls
-# through to NORMAL (the safer middle), never silently to MECHANICAL.
+# through to NORMAL (the safer middle), never silently to MECHANICAL. These rules
+# never reference providers or models.
 _CRITICAL_TERMS = (
     "security-sensitive", "security sensitive", "authentication architecture",
     "auth architecture", "major architecture", "architecture decision",
@@ -68,6 +72,31 @@ def _matches(text: str, terms: tuple[str, ...]) -> bool:
     return False
 
 
+def _orders(policy: dict[str, Any]) -> tuple[list[str], list[str]]:
+    return (policy.get("effort_order", list(DEFAULT_EFFORT_ORDER)),
+            policy.get("tier_order", list(DEFAULT_TIER_ORDER)))
+
+
+def _higher(order: list[str], *values: Optional[str]) -> str:
+    present = [value for value in values if value in order]
+    return max(present, key=order.index) if present else order[0]
+
+
+def _tier_for_effort(policy: dict[str, Any], effort: str) -> Optional[str]:
+    effort_order, tier_order = _orders(policy)
+    target = effort_order.index(effort)
+    candidates = [
+        tier for tier, entry in policy["tiers"].items()
+        if effort_order.index(entry.get("effort", "low")) >= target
+    ]
+    return min(candidates, key=tier_order.index) if candidates else tier_order[-1]
+
+
+# --------------------------------------------------------------------------- #
+# A. Task classification (provider/model independent)
+# --------------------------------------------------------------------------- #
+
+
 def load_policy(path: pathlib.Path = ROUTING_PATH) -> dict[str, Any]:
     try:
         policy = infra.load_json(path)
@@ -87,14 +116,14 @@ def normalize_class(value: str) -> str:
 
 def normalize_effort(value: str, policy: dict[str, Any]) -> str:
     candidate = (value or "").strip().lower()
-    if candidate not in policy.get("effort_order", list(DEFAULT_EFFORT_ORDER)):
+    if candidate not in _orders(policy)[0]:
         raise RoutingError(f"unknown effort: {value!r}")
     return candidate
 
 
 def normalize_tier(value: str, policy: dict[str, Any]) -> str:
     candidate = (value or "").strip().upper()
-    if candidate not in policy.get("tier_order", list(DEFAULT_TIER_ORDER)):
+    if candidate not in _orders(policy)[1]:
         raise RoutingError(f"unknown tier: {value!r}")
     return candidate
 
@@ -113,44 +142,19 @@ def classify(task: str, override: Optional[str] = None) -> str:
     return "NORMAL"
 
 
-def _higher(order: tuple[str, ...] | list[str], *values: Optional[str]) -> str:
-    present = [value for value in values if value in order]
-    return max(present, key=order.index) if present else order[0]
+# --------------------------------------------------------------------------- #
+# B. Routing requirement (symbolic tier + effort; provider/model independent)
+# --------------------------------------------------------------------------- #
 
 
-def _tier_for_effort(policy: dict[str, Any], effort: str) -> Optional[str]:
-    effort_order = policy.get("effort_order", list(DEFAULT_EFFORT_ORDER))
-    tier_order = policy.get("tier_order", list(DEFAULT_TIER_ORDER))
-    target = effort_order.index(effort)
-    candidates = [
-        tier for tier, entry in policy["tiers"].items()
-        if effort_order.index(entry.get("effort", "low")) >= target
-    ]
-    return min(candidates, key=tier_order.index) if candidates else tier_order[-1]
-
-
-def role_model(role_id: Optional[str]) -> Optional[str]:
-    if not role_id:
-        return None
-    try:
-        data = infra.load_json(ROLES_PATH)
-    except infra.InfraError:
-        return None
-    for role in data.get("roles", []):
-        if role.get("id") == role_id:
-            return role.get("model_reference")
-    return None
-
-
-def recommend(task: str, *, task_class: Optional[str] = None,
-              requested_effort: Optional[str] = None, requested_tier: Optional[str] = None,
-              surface: Optional[str] = None, policy: Optional[dict[str, Any]] = None) -> dict[str, Any]:
-    """Recommend a tier/effort. User-requested effort/tier only ever raise it."""
+def requirement(task: str = "", *, task_class: Optional[str] = None,
+                requested_effort: Optional[str] = None, requested_tier: Optional[str] = None,
+                policy: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    """Map a task to a symbolic tier/effort. User-requested effort/tier only raise it."""
     policy = policy or load_policy()
     cls = normalize_class(task_class) if task_class else classify(task)
     entry = policy["task_classes"][cls]
-    effort_order = policy.get("effort_order", list(DEFAULT_EFFORT_ORDER))
-    tier_order = policy.get("tier_order", list(DEFAULT_TIER_ORDER))
+    effort_order, tier_order = _orders(policy)
 
     effort = entry["effort"]
     tier = entry["tier"]
@@ -160,27 +164,121 @@ def recommend(task: str, *, task_class: Optional[str] = None,
         tier = _higher(tier_order, tier, normalize_tier(requested_tier, policy))
     tier = _higher(tier_order, tier, _tier_for_effort(policy, effort))
     effort = _higher(effort_order, effort, policy["tiers"].get(tier, {}).get("effort"))
-    role = policy["tiers"].get(tier, {}).get("role")
-    surfaces = policy.get("surfaces", {})
     return {
         "task_class": cls,
         "recommended_tier": tier,
         "recommended_effort": effort,
-        "role": role,
-        "model": role_model(role),
         "reason": entry.get("rationale"),
         "escalation_from": None,
         "escalation_to": entry.get("escalates_to"),
         "max_retries": entry.get("max_retries", 0),
-        "surface": surface,
-        "capability": surfaces.get(surface) if surface else None,
     }
+
+
+# --------------------------------------------------------------------------- #
+# C. Model resolution (the only layer that knows providers/models)
+# --------------------------------------------------------------------------- #
+
+
+def load_roles(registry: Optional[dict[str, Any]] = None,
+               path: pathlib.Path = ROLES_PATH) -> dict[str, Any]:
+    """Return role_id -> role record. An explicit registry overrides the file."""
+    if registry is not None:
+        return registry
+    try:
+        data = infra.load_json(path)
+    except infra.InfraError:
+        return {}
+    return {role.get("id"): role for role in data.get("roles", []) if role.get("id")}
+
+
+def resolve_model(tier: str, policy: dict[str, Any],
+                  registry: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    role = policy["tiers"].get(tier, {}).get("role")
+    record = load_roles(registry).get(role) if role else None
+    return {
+        "role": role,
+        "model": (record or {}).get("model_reference"),
+        "provider": (record or {}).get("provider"),
+        "resolved": bool(record and record.get("model_reference")),
+    }
+
+
+def model_lookup(model_name: Optional[str], policy: dict[str, Any],
+                 registry: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    """Resolve a concrete model to its best symbolic tier/role/provider, if known."""
+    if not model_name:
+        return {"model": None, "tier": None, "provider": None, "role": None}
+    roles = load_roles(registry)
+    matches = []
+    for tier, entry in policy["tiers"].items():
+        role_id = entry.get("role")
+        record = roles.get(role_id) or {}
+        if record.get("model_reference") == model_name:
+            matches.append((tier, role_id, record))
+    if not matches:
+        return {"model": model_name, "tier": None, "provider": None, "role": None}
+    _, tier_order = _orders(policy)
+    tier, role_id, record = max(matches, key=lambda item: tier_order.index(item[0]))
+    return {"model": model_name, "tier": tier, "provider": record.get("provider"), "role": role_id}
+
+
+def model_tier(model_name: Optional[str], policy: dict[str, Any],
+               registry: Optional[dict[str, Any]] = None) -> Optional[str]:
+    """Best (highest) symbolic tier a concrete model can satisfy, or None if unknown."""
+    return model_lookup(model_name, policy, registry)["tier"]
+
+
+def surface_support(surface: Optional[str], tier: str, policy: dict[str, Any]) -> dict[str, Any]:
+    """Surface capability and whether it can provide ``tier``. Never downgrades: an
+    unsupported tier is reported as ``UNAVAILABLE_ON_SURFACE``."""
+    if not surface:
+        return {"surface": None, "capability": None, "availability": None}
+    spec = policy.get("surfaces", {}).get(surface)
+    if spec is None:
+        return {"surface": surface, "capability": None, "availability": "UNKNOWN_SURFACE"}
+    if isinstance(spec, str):  # backward-compatible shorthand
+        return {"surface": surface, "capability": spec, "availability": "AVAILABLE"}
+    tiers = spec.get("tiers")
+    availability = "AVAILABLE" if (not tiers or tier in tiers) else "UNAVAILABLE_ON_SURFACE"
+    return {"surface": surface, "capability": spec.get("capability"), "availability": availability}
+
+
+def recommend(task: str = "", *, task_class: Optional[str] = None,
+              requested_effort: Optional[str] = None, requested_tier: Optional[str] = None,
+              user_model: Optional[str] = None, surface: Optional[str] = None,
+              policy: Optional[dict[str, Any]] = None,
+              registry: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    """Compose requirement + model resolution + surface support + user override."""
+    policy = policy or load_policy()
+    _, tier_order = _orders(policy)
+    rec = requirement(task, task_class=task_class, requested_effort=requested_effort,
+                      requested_tier=requested_tier, policy=policy)
+    resolution = resolve_model(rec["recommended_tier"], policy, registry)
+    rec.update({"role": resolution["role"], "model": resolution["model"],
+                "provider": resolution["provider"], "resolved": resolution["resolved"]})
+    rec.update(surface_support(surface, rec["recommended_tier"], policy))
+
+    rec["user_model"] = user_model
+    rec["user_model_status"] = None
+    if user_model:
+        lookup = model_lookup(user_model, policy, registry)
+        if lookup["tier"] is None:
+            rec["user_model_status"] = "UNVERIFIED"
+        elif tier_order.index(lookup["tier"]) >= tier_order.index(rec["recommended_tier"]):
+            rec["user_model_status"] = "RESPECTED"
+        else:
+            rec["user_model_status"] = "CONFLICT"
+        rec["model"] = user_model
+        rec["provider"] = lookup["provider"]
+        rec["resolved"] = bool(lookup["tier"])
+    return rec
 
 
 def escalation_step(task_class: str, *, same_tier_attempts: int = 0, succeeded: bool = False,
                     policy: Optional[dict[str, Any]] = None) -> dict[str, Any]:
     """Bounded next step. Success stops; the maximum tier stops; otherwise a small
-    number of same-tier retries precede a single step up."""
+    number of same-tier retries precede a single step up. Symbolic only."""
     policy = policy or load_policy()
     cls = normalize_class(task_class)
     entry = policy["task_classes"][cls]

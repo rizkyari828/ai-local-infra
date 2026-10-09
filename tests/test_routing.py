@@ -1,8 +1,9 @@
 """Adaptive model routing V0.1: deterministic classification, routing, escalation,
-CLI, and safety. No model or network calls anywhere in this module."""
+CLI, safety, and provider/model portability. No model or network calls anywhere."""
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import pathlib
@@ -18,6 +19,17 @@ import infra  # noqa: E402
 
 
 ROUTE = ROOT / "scripts" / "route"
+
+
+def _policy(role_overrides: dict | None = None) -> dict:
+    policy = copy.deepcopy(routing.load_policy())
+    for tier, role in (role_overrides or {}).items():
+        policy["tiers"][tier]["role"] = role
+    return policy
+
+
+def _registry(**records) -> dict:
+    return {name: record for name, record in records.items()}
 
 
 class ClassificationTests(unittest.TestCase):
@@ -75,6 +87,7 @@ class RoutingTests(unittest.TestCase):
         rec = routing.recommend("rename a variable")
         self.assertEqual("student", rec["role"])
         self.assertEqual("qwen3.6:27b-coding", rec["model"])
+        self.assertEqual("ollama", rec["provider"])
 
     def test_requested_effort_floor_is_preserved(self) -> None:
         rec = routing.recommend("rename a variable", requested_effort="high")
@@ -100,6 +113,7 @@ class RoutingTests(unittest.TestCase):
     def test_surface_capability_is_recommend_only(self) -> None:
         rec = routing.recommend("rename", surface="codex-cli")
         self.assertEqual("RECOMMEND_ONLY", rec["capability"])
+        self.assertEqual("AVAILABLE", rec["availability"])
 
 
 class EscalationTests(unittest.TestCase):
@@ -115,7 +129,6 @@ class EscalationTests(unittest.TestCase):
         self.assertEqual("NORMAL", second["escalation_to"])
 
     def test_repeated_failure_does_not_loop(self) -> None:
-        # Many failures still produce a single bounded step, never an unbounded retry.
         step = routing.escalation_step("MECHANICAL", same_tier_attempts=50)
         self.assertEqual("escalate", step["action"])
         self.assertEqual("NORMAL", step["escalation_to"])
@@ -148,24 +161,111 @@ class PolicyTests(unittest.TestCase):
         for tier, entry in policy["tiers"].items():
             self.assertIn(entry["role"], roles, tier)
 
-    def test_all_surfaces_declared(self) -> None:
+    def test_all_surfaces_declared_recommend_only(self) -> None:
         policy = routing.load_policy()
         self.assertEqual(
             {"opencode", "codex-cli", "codex-vscode", "codex-desktop"},
             set(policy["surfaces"]))
-        self.assertTrue(all(v == "RECOMMEND_ONLY" for v in policy["surfaces"].values()))
+        for spec in policy["surfaces"].values():
+            self.assertEqual("RECOMMEND_ONLY", spec["capability"])
+
+    def test_policy_contains_no_concrete_model_names(self) -> None:
+        # Routing/task config must stay provider-agnostic; concrete models live only
+        # in models/roles.yaml.
+        text = (ROOT / "config/model-routing.yaml").read_text(encoding="utf-8").lower()
+        for name in ("qwen", "deepseek", "claude", "gpt-", "llama", "mistral", "gemini"):
+            self.assertNotIn(name, text, f"model-routing.yaml should not name {name}")
+
+
+class PortabilityTests(unittest.TestCase):
+    """Replacing or adding models/providers must not change classification or routing."""
+
+    TASKS = ("git status", "fix a typo in documentation", "design a cross-machine resolver",
+             "review a security-sensitive authentication architecture")
+
+    def test_classification_independent_of_model_configuration(self) -> None:
+        baseline = [routing.classify(task) for task in self.TASKS]
+        rebuilt = _policy({"FAST": "role-x", "BALANCED": "role-x", "STRONG": "role-y", "MAX": "role-z"})
+        # requirement uses only task_classes (symbolic); swapping tier roles changes nothing.
+        decisions = [
+            (routing.requirement(task, policy=rebuilt)["task_class"],
+             routing.requirement(task, policy=rebuilt)["recommended_tier"])
+            for task in self.TASKS
+        ]
+        self.assertEqual(
+            [(routing.classify(task), routing.requirement(task)["recommended_tier"]) for task in self.TASKS],
+            decisions)
+        self.assertEqual([routing.classify(task) for task in self.TASKS], baseline)
+
+    def test_changing_strong_provider_does_not_change_decision(self) -> None:
+        policy_a = _policy({"STRONG": "role-a"})
+        policy_b = _policy({"STRONG": "role-b"})
+        reg_a = _registry(**{"role-a": {"provider": "provider-a", "model_reference": "model-a"}})
+        reg_b = _registry(**{"role-b": {"provider": "provider-b", "model_reference": "model-b"}})
+        rec_a = routing.recommend("", task_class="CORRECTNESS_SENSITIVE", policy=policy_a, registry=reg_a)
+        rec_b = routing.recommend("", task_class="CORRECTNESS_SENSITIVE", policy=policy_b, registry=reg_b)
+        self.assertEqual(("STRONG", "high"), (rec_a["recommended_tier"], rec_a["recommended_effort"]))
+        self.assertEqual((rec_a["task_class"], rec_a["recommended_tier"], rec_a["recommended_effort"]),
+                         (rec_b["task_class"], rec_b["recommended_tier"], rec_b["recommended_effort"]))
+        self.assertEqual(("model-a", "provider-a"), (rec_a["model"], rec_a["provider"]))
+        self.assertEqual(("model-b", "provider-b"), (rec_b["model"], rec_b["provider"]))
+
+    def test_qwen_like_role_resolves_without_code_changes(self) -> None:
+        policy = _policy({"FAST": "qwen-role"})
+        reg = _registry(**{"qwen-role": {"provider": "ollama", "model_reference": "qwen3.6:27b-coding"}})
+        rec = routing.recommend("rename a variable", policy=policy, registry=reg)
+        self.assertEqual(("qwen-role", "qwen3.6:27b-coding", "ollama"),
+                         (rec["role"], rec["model"], rec["provider"]))
+
+    def test_claude_like_role_resolves_without_code_changes(self) -> None:
+        policy = _policy({"STRONG": "claude-role"})
+        reg = _registry(**{"claude-role": {"provider": "anthropic", "model_reference": "claude-opus-x"}})
+        rec = routing.recommend("", task_class="CORRECTNESS_SENSITIVE", policy=policy, registry=reg)
+        self.assertEqual(("claude-role", "claude-opus-x", "anthropic"),
+                         (rec["role"], rec["model"], rec["provider"]))
+
+    def test_unknown_future_model_does_not_break(self) -> None:
+        self.assertIsNone(routing.model_tier("future-model-9000", routing.load_policy()))
+        rec = routing.recommend("rename", user_model="future-model-9000")
+        self.assertEqual("UNVERIFIED", rec["user_model_status"])
+        self.assertEqual("MECHANICAL", rec["task_class"])
+
+    def test_unavailable_tier_reports_not_silent_downgrade(self) -> None:
+        policy = _policy()
+        policy["surfaces"]["opencode"] = {"capability": "RECOMMEND_ONLY", "tiers": ["FAST", "BALANCED"]}
+        rec = routing.recommend("", task_class="CRITICAL", surface="opencode", policy=policy)
+        self.assertEqual("MAX", rec["recommended_tier"])          # not downgraded
+        self.assertEqual("max", rec["recommended_effort"])
+        self.assertEqual("UNAVAILABLE_ON_SURFACE", rec["availability"])
+
+    def test_user_model_override_respected_or_conflicting(self) -> None:
+        respected = routing.recommend("rename a variable", user_model="qwen3.6:27b-coding")
+        self.assertEqual("RESPECTED", respected["user_model_status"])
+        self.assertEqual("ollama", respected["provider"])
+        conflict = routing.recommend("", task_class="CRITICAL", user_model="qwen3.6:27b-coding")
+        self.assertEqual("CONFLICT", conflict["user_model_status"])
+        self.assertEqual("MAX", conflict["recommended_tier"])     # floor unchanged
+
+    def test_critical_floor_not_weakened_by_provider_mapping(self) -> None:
+        policy = _policy({"MAX": "weak-role"})
+        reg = _registry(**{"weak-role": {"provider": "local", "model_reference": "tiny-model"}})
+        rec = routing.recommend("", task_class="CRITICAL", policy=policy, registry=reg)
+        self.assertEqual(("MAX", "max"), (rec["recommended_tier"], rec["recommended_effort"]))
+        self.assertEqual("tiny-model", rec["model"])
 
 
 class CliTests(unittest.TestCase):
     def cli(self, *args: str, env: dict | None = None) -> subprocess.CompletedProcess[str]:
         return subprocess.run([str(ROUTE), *args], text=True, capture_output=True, env=env)
 
-    def test_route_human_output(self) -> None:
-        result = self.cli("--task", "rename a config key")
+    def test_route_human_output_separates_layers(self) -> None:
+        result = self.cli("--task", "rename a config key", "--surface", "opencode")
         self.assertEqual(0, result.returncode, result.stderr)
-        self.assertIn("CLASSIFICATION: MECHANICAL", result.stdout)
-        self.assertIn("MODEL TIER: FAST", result.stdout)
-        self.assertIn("EFFORT: low", result.stdout)
+        self.assertIn("TASK CLASS: MECHANICAL", result.stdout)
+        self.assertIn("RECOMMENDED TIER: FAST", result.stdout)
+        self.assertIn("EFFORT: LOW", result.stdout)
+        self.assertIn("ROLE: student", result.stdout)
+        self.assertIn("RESOLVED MODEL:", result.stdout)
 
     def test_route_json_is_deterministic(self) -> None:
         one = self.cli("--task", "design concurrency-safe cache", "--json")
@@ -173,7 +273,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(one.stdout, two.stdout)
         rec = json.loads(one.stdout)
         for key in ("task_class", "recommended_tier", "recommended_effort", "reason",
-                    "escalation_from", "escalation_to"):
+                    "escalation_from", "escalation_to", "role", "model", "availability"):
             self.assertIn(key, rec)
 
     def test_route_is_offline(self) -> None:

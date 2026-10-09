@@ -2,7 +2,7 @@
   "schema_version": 1,
   "routing_version": "0.1.0",
   "updated": "2026-10-09",
-  "notes": "Adaptive model routing V0.1. A deterministic, rule-based recommendation of the cheapest sufficient reasoning for a task. Task classes map to symbolic tiers (FAST/BALANCED/STRONG/MAX); tiers reference existing model roles in models/roles.yaml, which map role -> provider/model. Provider/model names are never hardcoded here, no account quota and no secrets are stored, and V0.1 never switches a user-selected model automatically (every surface is RECOMMEND_ONLY). This does not duplicate tool-baseline.yaml (tool versions) or the escalation policy in config/runtime.yaml (failure-category eligibility); it decides which tier a task should start at and when to escalate or stop.",
+  "notes": "Adaptive model routing V0.1. Three separated layers: task classification (MECHANICAL/NORMAL/CORRECTNESS_SENSITIVE/CRITICAL) -> symbolic routing requirement (tier FAST/BALANCED/STRONG/MAX + reasoning effort) -> model resolution (tier -> role in models/roles.yaml -> provider/model). Classification and escalation use no provider/model identifiers, so any provider or model can be added or replaced by configuration alone. Concrete provider/model names are never named here, no account quota and no secrets are stored, and V0.1 never switches a user-selected model automatically (every surface is RECOMMEND_ONLY). Surfaces may optionally restrict tiers; an unsupported tier is reported UNAVAILABLE_ON_SURFACE, never silently downgraded. This does not duplicate tool-baseline.yaml (tool versions), models/roles.yaml (role -> provider/model), or the escalation policy in config/runtime.yaml (failure-category eligibility).",
   "tiers": {
     "FAST": {"role": "student", "effort": "low"},
     "BALANCED": {"role": "student", "effort": "medium"},
@@ -42,9 +42,9 @@
   "effort_order": ["low", "medium", "high", "max"],
   "tier_order": ["FAST", "BALANCED", "STRONG", "MAX"],
   "surfaces": {
-    "opencode": "RECOMMEND_ONLY",
-    "codex-cli": "RECOMMEND_ONLY",
-    "codex-vscode": "RECOMMEND_ONLY",
-    "codex-desktop": "RECOMMEND_ONLY"
+    "opencode": {"capability": "RECOMMEND_ONLY"},
+    "codex-cli": {"capability": "RECOMMEND_ONLY"},
+    "codex-vscode": {"capability": "RECOMMEND_ONLY"},
+    "codex-desktop": {"capability": "RECOMMEND_ONLY"}
   }
 }
