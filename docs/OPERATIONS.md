@@ -54,6 +54,13 @@ Git-shared historical seed idempotently. Reviewed, distilled knowledge lives in
 sessions are stored, and nothing auto-promotes. See
 [Derived learning](DERIVED_LEARNING.md).
 
+## Task graph orchestration (plan-only)
+
+`./scripts/orchestrate plan --objective "<one objective>"` decomposes a high-level
+objective into a small DAG of task nodes with per-node symbolic routing and context
+budgets. V0.1 plans only: no model call, no worker, no persistence, and the raw
+objective is never stored. See [Orchestration](ORCHESTRATION.md).
+
 ## Runtime doctor (read-only)
 
 `LAI_MACHINE=work-mac ./scripts/bootstrap doctor` answers "is this machine ready for AI coding right now?" without mutating anything: no apply, no backups, no graph rebuild, no process start/stop, no agent launches. It reports `PASS`/`WARN`/`FAIL`/`SKIP` for repository, bootstrap, OpenCode, Codex, RTK, Graphify, Headroom, and the Codex Headroom MCP. `--json` emits a stable machine-readable report. Exit codes: `0` no `FAIL`, `1` some `FAIL`, `2` config/exec error. The tested baseline lives in `config/tool-baseline.yaml`; exact version match is `PASS`, any other version is `WARN` (never auto-upgrades/downgrades), and runtime AUTO is not re-proven. See [Multi-machine sync](MULTI_MACHINE_SYNC_V0_1.md) §18.

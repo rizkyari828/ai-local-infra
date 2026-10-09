@@ -1,0 +1,85 @@
+#!/usr/bin/env python3
+"""Task graph orchestrator CLI (plan-only, offline).
+
+    ./scripts/orchestrate plan --objective "..."
+    ./scripts/orchestrate plan --objective-file objective.txt
+    ./scripts/orchestrate plan --objective "..." --json
+    ./scripts/orchestrate plan --objective "..." --surface codex-cli --max-tier BALANCED
+
+Turns ONE bounded objective into a DAG of task nodes with per-node symbolic routing
+and context budgets. V0.1 PLANS ONLY: it never calls a model, makes no network
+request, spawns no worker, and persists nothing. The raw objective is processed in
+memory and is never written to the evidence DB, knowledge, or any plan artifact.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import pathlib
+import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "common"))
+import orchestrator  # noqa: E402
+
+
+def cmd_plan(args: argparse.Namespace) -> int:
+    objective = args.objective
+    if objective is None and args.objective_file:
+        try:
+            objective = pathlib.Path(args.objective_file).read_text(encoding="utf-8")
+        except OSError as exc:
+            print(f"ERROR: cannot read objective file: {exc}", file=sys.stderr)
+            return 2
+    if not objective or not objective.strip():
+        print("ERROR: provide --objective or --objective-file", file=sys.stderr)
+        return 2
+
+    constraints = {"surface": args.surface, "min_tier": args.min_tier, "max_tier": args.max_tier,
+                   "local_only": args.local_only, "no_premium": args.no_premium}
+    plan = orchestrator.decompose(objective, constraints=constraints)
+    plan["preferences"] = {"prefer_model": args.prefer_model, "prefer_provider": args.prefer_provider,
+                           "note": "informational only; V0.1 never auto-switches models"}
+    if args.json:
+        print(json.dumps(plan, indent=2, ensure_ascii=False))
+    else:
+        print(orchestrator.render_plan(plan))
+    return 0 if plan["valid"] else 2
+
+
+def _tier(value: str) -> str:
+    candidate = value.upper()
+    if candidate not in orchestrator.TIER_ORDER:
+        raise argparse.ArgumentTypeError(f"tier must be one of {', '.join(orchestrator.TIER_ORDER)}")
+    return candidate
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(description=__doc__)
+    sub = result.add_subparsers(dest="command", required=True)
+    plan = sub.add_parser("plan", help="produce a validated execution plan (no execution)")
+    plan.add_argument("--objective")
+    plan.add_argument("--objective-file")
+    plan.add_argument("--surface", help="target surface for capability resolution")
+    plan.add_argument("--min-tier", type=_tier, help="floor every node at this tier")
+    plan.add_argument("--max-tier", type=_tier, help="cap nodes (never below a safety floor)")
+    plan.add_argument("--local-only", action="store_true", help="prefer local/economical (cap BALANCED)")
+    plan.add_argument("--no-premium", action="store_true", help="disallow MAX unless a floor requires it")
+    plan.add_argument("--prefer-model", help="informational preference (no auto-switch in V0.1)")
+    plan.add_argument("--prefer-provider", help="informational preference (no auto-switch in V0.1)")
+    plan.add_argument("--json", action="store_true")
+    plan.set_defaults(func=cmd_plan)
+    return result
+
+
+def main() -> int:
+    args = parser().parse_args()
+    try:
+        return args.func(args)
+    except (orchestrator.OrchestratorError, OSError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

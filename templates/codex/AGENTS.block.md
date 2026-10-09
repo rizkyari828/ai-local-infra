@@ -23,3 +23,6 @@ source in `ai-local-infra/templates/codex/AGENTS.block.md`, not in this file.
   optionally record a bounded outcome (`./scripts/learn record`) — never for every
   `git status`/read, and never with prompts, responses, or secrets. Learning is
   local evidence plus Git-shared distilled knowledge; it never auto-promotes.
+- Multi-step objectives: for a high-level objective, plan first with
+  `./scripts/orchestrate plan --objective "..."` to get per-node routing and
+  minimum-sufficient context before doing broad, expensive work.
