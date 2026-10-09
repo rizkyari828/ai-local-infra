@@ -23,6 +23,7 @@ import infra  # scripts/common, on sys.path
 import routing  # scripts/common, on sys.path
 import discovery  # scripts/common, on sys.path
 import failover  # scripts/common, on sys.path
+import deterministic  # scripts/common, on sys.path
 import derived_knowledge as knowledge  # scripts/common, on sys.path
 import evidence  # scripts/common, on sys.path
 
@@ -210,6 +211,10 @@ def resolve_plan(plan: dict[str, Any], backend: Backend, surface: Optional[str] 
                  backends: Optional[dict[str, Backend]] = None) -> list[dict[str, Any]]:
     resolutions = []
     for node in plan["nodes"]:
+        if node.get("executor") == "TOOL_ONLY":
+            resolutions.append({"task_id": node["task_id"], "executor": "TOOL_ONLY", "tier": None,
+                                "runnable": True, "candidates": None})
+            continue
         tier = node["routing"]["tier"]
         effort = node["routing"]["effort"]
         if health is None:
@@ -289,12 +294,14 @@ def execute_plan(plan: dict[str, Any], *, backend: Backend, run_id: Optional[str
                  read_only: bool = False, max_ai_calls: Optional[int] = None,
                  backends: Optional[dict[str, Backend]] = None,
                  health: Optional[failover.Health] = None,
-                 constraints: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+                 constraints: Optional[dict[str, Any]] = None,
+                 tool_executor: Optional[deterministic.ToolExecutor] = None) -> dict[str, Any]:
     if not plan.get("valid"):
         raise ExecutionError("refusing to execute an invalid plan")
     if not confirm and not dry_run:
         raise ExecutionError("execution requires --confirm (or use --dry-run)")
     repo_root = pathlib.Path(repo_root or ROOT)
+    tool_executor = tool_executor or deterministic.ToolExecutor(root=repo_root)
     state = repo_state(repo_root)
     enforce_read_only = read_only or plan.get("intent") == "READ_ONLY"
     backend_registry: dict[str, Backend] = dict(backends or {})
@@ -349,14 +356,23 @@ def execute_plan(plan: dict[str, Any], *, backend: Backend, run_id: Optional[str
 
     for task_id in plan["order"]:
         node = next(item for item in plan["nodes"] if item["task_id"] == task_id)
-        if resume and results.get(task_id, {}).get("status") == SUCCESS:
+        if resume and results.get(task_id, {}).get("status") in (SUCCESS, "NO_CHANGE_REQUIRED"):
             continue
         deps = node["depends_on"]
-        if any(results.get(dep, {}).get("status") not in (SUCCESS, SKIPPED) for dep in deps):
+        if any(results.get(dep, {}).get("status") not in (SUCCESS, SKIPPED, "NO_CHANGE_REQUIRED") for dep in deps):
             results[task_id] = {"status": BLOCKED, "task_id": task_id}
             continue
         if node["conditional"] and not _conditional_active(node, deps, results):
             results[task_id] = {"status": SKIPPED, "task_id": task_id}
+            continue
+        if node.get("executor") == "TOOL_ONLY":
+            results[task_id] = _run_tool_node(node, deps, results, tool_executor,
+                                              state_dir=state_dir, record_evidence=record_evidence)
+            if results[task_id]["status"] in ("AI_REQUIRED", FAILURE):
+                report["error"] = results[task_id].get("failure_category") or "TOOL_EXECUTION_FAILED"
+                _mark_not_run(plan, task_id, results)
+                break
+            _save_state(run_dir, _state_blob(run_id, state, results, budget))
             continue
         try:
             results[task_id] = _run_node(node, deps, results, backend, resolutions[task_id],
@@ -504,6 +520,43 @@ def _run_node(node, deps, results, backend, resolution, *, state_dir, record_evi
             continue
         return _finalize(node, result, FAILURE, category or "UNKNOWN_FAILURE", initial_tier, tier,
                          attempt, escalations, decision_id, resolution, state_dir, record_evidence)
+
+
+def _run_tool_node(node, deps, results, tool_executor, *, state_dir, record_evidence) -> dict[str, Any]:
+    """Deterministic execution: 0 AI calls, no model evidence. A success is only
+    claimed when a deterministic check passes; otherwise the node escalates to AI."""
+    operation = (node.get("tool") or {}).get("operation")
+    args = (node.get("tool") or {}).get("args") or {}
+    task = {"operation": operation, "args": args, "mode": node.get("intent")}
+    try:
+        result = tool_executor.execute(task)
+        ok = tool_executor.validate_result(task, result)
+    except Exception as exc:  # policy/exec failure — never model weakness
+        return {"task_id": node["task_id"], "executor": "TOOL_ONLY", "operation": operation,
+                "status": FAILURE, "failure_category": "TOOL_EXECUTION_FAILED",
+                "summary": f"{operation}: {type(exc).__name__}"}
+    if operation == "finalize":
+        status = SUCCESS if ok else FAILURE
+        category = None if ok else "DETERMINISTIC_CHECK_FAILED"
+    elif operation == "config_value_matches" and result.get("matches"):
+        status, category = "NO_CHANGE_REQUIRED", None
+    elif ok:
+        status, category = SUCCESS, None
+    else:
+        status, category = "AI_REQUIRED", "DETERMINISTIC_CHECK_FAILED"
+    if record_evidence:
+        try:
+            evidence.outcome(decision_id=uuid.uuid4().hex,
+                             outcome="SUCCESS" if status in (SUCCESS, "NO_CHANGE_REQUIRED") else "FAILURE",
+                             task_family=node.get("task_family"), task_class=node.get("task_class"),
+                             source="tool_only", surface="tool_only", failure_category=category,
+                             state_dir=state_dir)
+        except evidence.EvidenceError:
+            pass
+    bounded = {key: result.get(key) for key in ("branch", "head", "clean", "matches", "parsed",
+                                                "exists", "ok", "actual") if key in result}
+    return {"task_id": node["task_id"], "executor": "TOOL_ONLY", "operation": operation,
+            "status": status, "failure_category": category, "summary": operation, "result": bounded}
 
 
 def _is_success(node: dict[str, Any], result: dict[str, Any]) -> bool:

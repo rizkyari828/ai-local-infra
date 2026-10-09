@@ -19,6 +19,7 @@ from typing import Any, Optional
 import routing  # scripts/common, on sys.path
 import derived_knowledge as knowledge  # scripts/common, on sys.path
 import discovery  # scripts/common, on sys.path
+import deterministic as deterministic_tools  # scripts/common, on sys.path
 
 TIER_ORDER = list(routing.DEFAULT_TIER_ORDER)  # FAST, BALANCED, STRONG, MAX
 CONTEXT_BUDGETS = ("TINY", "SMALL", "MEDIUM", "LARGE")
@@ -89,6 +90,102 @@ def node_intent(title: str) -> str:
     return INTENT_MUTATING if has_mutation(title) else INTENT_READ_ONLY
 
 
+# Planner modes: NONE (no planning needed), DETERMINISTIC (rule-based), AI (planner call).
+PLANNER_NONE = "NONE"
+PLANNER_DETERMINISTIC = "DETERMINISTIC"
+PLANNER_AI = "AI"
+
+_AI_TERMS = ("architecture", "security", "review", "design", "debug", "root cause", "concurrency",
+             "persistence", "migration", "decide", "integrat", "refactor", "implement", "fix",
+             "optimi", "diagnos", "ambigu", "unknown", "unclear", "underspecified")
+_PLANNER_AI_TERMS = ("security-sensitive", "ambiguous", "multiple architectures", "unknown architecture",
+                     "unclear", "underspecified", "root cause", "major architecture")
+
+
+def _needs_ai(objective: str) -> bool:
+    text = (objective or "").lower()
+    return has_mutation(objective) or any(term in text for term in _AI_TERMS)
+
+
+def _planner_required(objective: str) -> bool:
+    text = (objective or "").lower()
+    return any(term in text for term in _PLANNER_AI_TERMS)
+
+
+def planner_decision(objective: str, *, constraints: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    """Choose the cheapest sufficient planner: none, deterministic, or AI (required).
+
+    Deterministic objectives bypass planning entirely. A single obvious AI task routes
+    directly with no planner. Ambiguous/security objectives report PLANNER_AI.
+    """
+    deterministic_tasks = deterministic_tools.classify_objective(objective)
+    planner = classify_planner(objective)
+    if deterministic_tasks and not _needs_ai(objective):
+        return {"mode": PLANNER_NONE, "required_tier": None, "required_effort": None,
+                "rationale": "deterministic objective; TOOL_ONLY execution, no planner"}
+    if _needs_ai(objective) and _planner_required(objective):
+        return {"mode": PLANNER_AI, "required_tier": "MAX", "required_effort": "max",
+                "rationale": "ambiguous/security decomposition warrants an AI planner (PLANNER_REQUIRED)"}
+    if _needs_ai(objective):
+        return {"mode": PLANNER_NONE, "required_tier": planner["required_tier"],
+                "required_effort": planner["required_effort"],
+                "rationale": "single obvious AI task; route directly without a planner"}
+    return {"mode": PLANNER_DETERMINISTIC, "required_tier": planner["required_tier"],
+            "required_effort": planner["required_effort"], "rationale": "rule-based decomposition"}
+
+
+def _deterministic_plan(objective: str, constraints: dict[str, Any], decision: dict[str, Any]) -> Optional[dict[str, Any]]:
+    tasks = deterministic_tools.classify_objective(objective)
+    if not tasks:
+        return None
+    nodes: list[dict[str, Any]] = []
+    for index, task in enumerate(tasks, start=1):
+        node = _node(f"D{index}", f"Deterministic {task['operation']}", "MECHANICAL", [],
+                     acceptance=[f"{task['operation']} check satisfied"], family="deterministic_tool")
+        node["executor"] = "TOOL_ONLY"
+        node["tool"] = {"operation": task["operation"], "args": task["args"]}
+        node["routing"] = None
+        nodes.append(node)
+    final = _node("DF", "Deterministic final verification", "MECHANICAL",
+                  [node["task_id"] for node in nodes],
+                  acceptance=["all deterministic checks satisfied"], family="deterministic_tool")
+    final["executor"] = "TOOL_ONLY"
+    final["tool"] = {"operation": "finalize", "args": {}}
+    final["routing"] = None
+    nodes.append(final)
+    plan = {"schema_version": 1, "objective_summary": _bounded_summary(objective),
+            "planner": {"required_tier": None, "required_effort": None},
+            "planner_mode": decision, "nodes": nodes, "order": [node["task_id"] for node in nodes],
+            "valid": True, "diagnostics": [],
+            "intent": execution_intent(objective, read_only=bool(constraints.get("read_only")))}
+    plan["routing_mix"] = {tier: 0 for tier in TIER_ORDER}
+    plan["executor_mix"] = {"TOOL_ONLY": len(nodes), "AI": 0}
+    plan["quota_view"] = {"nodes": len(nodes), "expensive_nodes": 0, "cheap_nodes": 0,
+                          "conditional_expensive_nodes": 0, "full_context_nodes": 0}
+    _attach_budget(plan, constraints)
+    return plan
+
+
+def _attach_budget(plan: dict[str, Any], constraints: dict[str, Any]) -> None:
+    nodes = plan["nodes"]
+    tool_only = sum(1 for node in nodes if node.get("executor") == "TOOL_ONLY")
+    direct_ai = sum(1 for node in nodes if node.get("executor") != "TOOL_ONLY")
+    conditional_ai = sum(1 for node in nodes if node.get("conditional") and node.get("executor") != "TOOL_ONLY")
+    planner_calls = 1 if plan.get("planner_mode", {}).get("mode") == PLANNER_AI else 0
+    minimum_required = direct_ai + planner_calls
+    hard_max = constraints.get("max_ai_calls")
+    plan["planning_budget"] = {
+        "tool_only_nodes": tool_only, "direct_ai_nodes": direct_ai, "planner_ai_calls": planner_calls,
+        "conditional_ai_nodes": conditional_ai, "possible_retry_calls": direct_ai,
+        "minimum_required_ai_calls": minimum_required, "planned_ai_calls": direct_ai + planner_calls,
+        "hard_max_ai_calls": hard_max,
+    }
+    if hard_max is not None and minimum_required > hard_max:
+        plan.setdefault("diagnostics", []).append(
+            f"INSUFFICIENT_AI_CALL_BUDGET: minimum required {minimum_required} exceeds hard max {hard_max}")
+        plan["valid"] = False
+
+
 class OrchestratorError(RuntimeError):
     pass
 
@@ -125,6 +222,7 @@ def _node(task_id: str, title: str, task_class: str, depends_on: list[str], *,
         "task_id": task_id, "title": title, "task_family": family or knowledge.task_family_for(title),
         "task_class": task_class, "objective_summary": title, "depends_on": list(depends_on),
         "conditional": conditional, "status": "planned", "intent": node_intent(title),
+        "executor": "AI",
         "risk_signals": list(risk_signals or []),
         "acceptance_criteria": list(acceptance or []),
         "produces_artifacts": list(produces or []), "consumes_results_from": list(consumes or depends_on),
@@ -134,6 +232,11 @@ def _node(task_id: str, title: str, task_class: str, depends_on: list[str], *,
 def decompose(objective: str, *, constraints: Optional[dict[str, Any]] = None) -> dict[str, Any]:
     """Build a small, valid task graph from one objective. Deterministic; no model."""
     constraints = constraints or {}
+    decision = planner_decision(objective, constraints=constraints)
+    if decision["mode"] == PLANNER_NONE and not _needs_ai(objective):
+        deterministic_plan = _deterministic_plan(objective, constraints, decision)
+        if deterministic_plan is not None:
+            return deterministic_plan
     sig = _signals(objective)
     nodes: list[dict[str, Any]] = []
     nodes.append(_node("T1", "Inspect repository and gather current state", "MECHANICAL", [],
@@ -178,7 +281,7 @@ def decompose(objective: str, *, constraints: Optional[dict[str, Any]] = None) -
                            produces=["final_report"], family="report_recovery_validation"))
 
     plan = {"schema_version": 1, "objective_summary": _bounded_summary(objective),
-            "planner": classify_planner(objective), "nodes": nodes,
+            "planner": classify_planner(objective), "planner_mode": decision, "nodes": nodes,
             "intent": execution_intent(objective, read_only=bool(constraints.get("read_only")))}
     _apply_routing_and_context(plan, constraints)
     valid, diagnostics, order = validate_graph(plan["nodes"])
@@ -188,6 +291,8 @@ def decompose(objective: str, *, constraints: Optional[dict[str, Any]] = None) -
     plan["diagnostics"] = diagnostics + conflicts + quota_guards(plan)
     plan["routing_mix"] = _routing_mix(plan["nodes"])
     plan["quota_view"] = _quota_view(plan["nodes"])
+    plan["executor_mix"] = {"TOOL_ONLY": 0, "AI": len(nodes)}
+    _attach_budget(plan, constraints)
     return plan
 
 
@@ -312,53 +417,63 @@ def validate_graph(nodes: list[dict[str, Any]]) -> tuple[bool, list[str], list[s
 
 def quota_guards(plan: dict[str, Any]) -> list[str]:
     nodes = plan["nodes"]
+    ai_nodes = [node for node in nodes if node.get("routing")]
     warnings: list[str] = []
-    tiers = [node["routing"]["tier"] for node in nodes]
+    tiers = [node["routing"]["tier"] for node in ai_nodes]
     if len(nodes) > MAX_PLAN_NODES:
         warnings.append(f"EXCESSIVE_TASK_SPLITTING: {len(nodes)} nodes exceeds {MAX_PLAN_NODES}")
-    if len(nodes) > 1 and all(tier == "STRONG" for tier in tiers):
-        warnings.append("ALL_TASKS_STRONG: every node is STRONG")
+    if len(ai_nodes) > 1 and all(tier == "STRONG" for tier in tiers) and len(tiers) == len(ai_nodes):
+        warnings.append("ALL_TASKS_STRONG: every AI node is STRONG")
     if tiers and all(tier == "MAX" for tier in tiers):
-        warnings.append("ALL_TASKS_MAX: every node is MAX")
-    budgets = [node["context"]["budget"] for node in nodes]
+        warnings.append("ALL_TASKS_MAX: every AI node is MAX")
+    budgets = [(node.get("context") or {}).get("budget") for node in ai_nodes]
     if budgets and all(budget == "LARGE" for budget in budgets):
         warnings.append("ALL_CONTEXT_LARGE: every node requests LARGE context")
     for node in nodes:
-        if node["routing"]["tier"] in ("STRONG", "MAX") and node["task_class"] in ("MECHANICAL", "NORMAL") \
-                and not node.get("risk_signals"):
-            warnings.append(f"UNJUSTIFIED_EXPENSIVE_NODE: {node['task_id']} is {node['routing']['tier']} "
-                            f"for a {node['task_class']} task without risk signals")
         if not node["acceptance_criteria"]:
             warnings.append(f"EMPTY_ACCEPTANCE_CRITERIA: {node['task_id']}")
+        routing = node.get("routing")
+        if routing and routing["tier"] in ("STRONG", "MAX") and node["task_class"] in ("MECHANICAL", "NORMAL") \
+                and not node.get("risk_signals"):
+            warnings.append(f"UNJUSTIFIED_EXPENSIVE_NODE: {node['task_id']} is {routing['tier']} "
+                            f"for a {node['task_class']} task without risk signals")
     return warnings
 
 
 def _routing_mix(nodes: list[dict[str, Any]]) -> dict[str, int]:
     mix = {tier: 0 for tier in TIER_ORDER}
     for node in nodes:
-        mix[node["routing"]["tier"]] = mix.get(node["routing"]["tier"], 0) + 1
+        routing = node.get("routing")
+        if routing:
+            mix[routing["tier"]] = mix.get(routing["tier"], 0) + 1
     return mix
 
 
 def _quota_view(nodes: list[dict[str, Any]]) -> dict[str, int]:
+    ai = [node for node in nodes if node.get("routing")]
     return {
         "nodes": len(nodes),
-        "expensive_nodes": sum(1 for node in nodes if node["routing"]["tier"] in ("STRONG", "MAX")),
-        "cheap_nodes": sum(1 for node in nodes if node["routing"]["tier"] in ("FAST", "BALANCED")),
-        "conditional_expensive_nodes": sum(1 for node in nodes if node["conditional"]
+        "expensive_nodes": sum(1 for node in ai if node["routing"]["tier"] in ("STRONG", "MAX")),
+        "cheap_nodes": sum(1 for node in ai if node["routing"]["tier"] in ("FAST", "BALANCED")),
+        "conditional_expensive_nodes": sum(1 for node in ai if node["conditional"]
                                            and node["routing"]["tier"] in ("STRONG", "MAX")),
-        "full_context_nodes": sum(1 for node in nodes if node["context"]["budget"] == "LARGE"),
+        "full_context_nodes": sum(1 for node in nodes if (node.get("context") or {}).get("budget") == "LARGE"),
     }
 
 
 def render_plan(plan: dict[str, Any]) -> str:
     lines = ["PLAN", f"OBJECTIVE: {plan['objective_summary']}",
              f"INTENT: {plan.get('intent')}",
-             f"PLANNER: {plan['planner']['required_tier']} / {plan['planner']['required_effort']}"]
+             f"PLANNER: {plan['planner']['required_tier']} / {plan['planner']['required_effort']}  "
+             f"mode={plan.get('planner_mode', {}).get('mode')}"]
     for node in plan["nodes"]:
-        routing = node["routing"]
         deps = ",".join(node["depends_on"]) or "none"
         suffix = " (conditional)" if node["conditional"] else ""
+        if node.get("executor") == "TOOL_ONLY":
+            operation = (node.get("tool") or {}).get("operation")
+            lines.append(f"{node['task_id']}{suffix}  {node['title']}  [TOOL_ONLY:{operation}]  depends {deps}")
+            continue
+        routing = node["routing"]
         lines.append(f"{node['task_id']}{suffix}  {node['title']}  [{node['task_class']}]  "
                      f"route {routing['tier']}/{routing['effort']}  context {node['context']['budget']}  "
                      f"depends {deps}")
@@ -368,6 +483,11 @@ def render_plan(plan: dict[str, Any]) -> str:
     lines.append(f"QUOTA VIEW: nodes {view['nodes']}, expensive {view['expensive_nodes']}, "
                  f"cheap {view['cheap_nodes']}, conditional-expensive {view['conditional_expensive_nodes']}, "
                  f"large-context {view['full_context_nodes']}")
+    if plan.get("planning_budget"):
+        budget = plan["planning_budget"]
+        lines.append(f"PLANNING BUDGET: tool_only {budget['tool_only_nodes']}, direct_ai {budget['direct_ai_nodes']}, "
+                     f"planner_ai {budget['planner_ai_calls']}, min_required_ai {budget['minimum_required_ai_calls']}, "
+                     f"hard_max {budget['hard_max_ai_calls']}")
     if plan["diagnostics"]:
         lines.append("WARNINGS: " + "; ".join(plan["diagnostics"]))
     return "\n".join(lines)

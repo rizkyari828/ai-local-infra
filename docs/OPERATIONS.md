@@ -58,8 +58,11 @@ sessions are stored, and nothing auto-promotes. See
 
 `./scripts/orchestrate plan --objective "<one objective>"` decomposes a high-level
 objective into a small DAG of task nodes with per-node symbolic routing and context
-budgets. V0.1 plans only: no model call, no worker, no persistence, and the raw
-objective is never stored. See [Orchestration](ORCHESTRATION.md).
+budgets. It is deterministic-first: known deterministic objectives plan as TOOL_ONLY
+(0 additional AI calls), simple AI objectives route directly (no AI planner), and
+only ambiguous/security objectives report `PLANNER_REQUIRED`. V0.1 plans only: no
+model call, no worker, no persistence, and the raw objective is never stored. See
+[Orchestration](ORCHESTRATION.md) and [Deterministic-first execution](DETERMINISTIC_FIRST.md).
 
 ## Multi-model execution (gated)
 

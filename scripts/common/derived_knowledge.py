@@ -37,11 +37,12 @@ FAILURE_CATEGORIES = (
     "RATE_LIMIT", "TIMEOUT", "AUTH_FAILURE", "ACCOUNT_MODEL_UNSUPPORTED",
     "SAFETY_GUARD", "STALE_SESSION", "CONFIG_DRIFT", "UNKNOWN_FAILURE",
     "PERMISSION_REQUIRED", "READ_ONLY_VIOLATION", "CALL_BUDGET_EXHAUSTED",
-    "NO_CAPABILITY_PRESERVING_FALLBACK",
+    "NO_CAPABILITY_PRESERVING_FALLBACK", "TOOL_EXECUTION_FAILED", "DETERMINISTIC_CHECK_FAILED",
+    "NO_CHANGE_REQUIRED", "AI_REQUIRED", "INSUFFICIENT_AI_CALL_BUDGET",
 )
 # Only reasoning/correctness evidence may influence intelligence escalation.
 INTELLIGENCE_CATEGORIES = ("REASONING_INSUFFICIENT",)
-SOURCE_TYPES = ("historical_verified", "observed_runtime", "manual_override", "discovered")
+SOURCE_TYPES = ("historical_verified", "observed_runtime", "manual_override", "discovered", "tool_only")
 
 
 class KnowledgeError(RuntimeError):
