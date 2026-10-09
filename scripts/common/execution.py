@@ -354,6 +354,7 @@ def execute_plan(plan: dict[str, Any], *, backend: Backend, run_id: Optional[str
     report["max_ai_calls"] = budget["max"]
     resolutions = {b["task_id"]: b for b in bindings}
 
+    attempts: list[dict[str, Any]] = []
     for task_id in plan["order"]:
         node = next(item for item in plan["nodes"] if item["task_id"] == task_id)
         if resume and results.get(task_id, {}).get("status") in (SUCCESS, "NO_CHANGE_REQUIRED"):
@@ -382,7 +383,7 @@ def execute_plan(plan: dict[str, Any], *, backend: Backend, run_id: Optional[str
                                          enforce_read_only=enforce_read_only, repo_root=repo_root,
                                          candidates=resolutions[task_id].get("candidates"),
                                          backends=backend_registry, health=health,
-                                         constraints=constraints)
+                                         constraints=constraints, attempts=attempts)
         except KeyboardInterrupt:
             results[task_id] = {"status": CANCELLED, "task_id": task_id}
             _mark_not_run(plan, task_id, results)
@@ -393,6 +394,7 @@ def execute_plan(plan: dict[str, Any], *, backend: Backend, run_id: Optional[str
             break
         _save_state(run_dir, _state_blob(run_id, state, results, budget))
     report["nodes"] = results
+    report["attempts"] = attempts
     report["calls_used"] = budget["used"]
     report["remaining_calls"] = (budget["max"] - budget["used"]) if budget["max"] is not None else None
     report["final"] = _final_summary(plan, results)
@@ -425,7 +427,7 @@ def _conditional_active(node: dict[str, Any], deps: list[str], results: dict[str
 def _run_node(node, deps, results, backend, resolution, *, state_dir, record_evidence,
               infra_retries, same_tier_retries, surface, budget, enforce_read_only,
               repo_root, candidates=None, backends=None, health=None,
-              constraints=None) -> dict[str, Any]:
+              constraints=None, attempts=None) -> dict[str, Any]:
     tier = node["routing"]["tier"]
     initial_tier = tier
     if enforce_read_only and node.get("intent") == "MUTATING":
@@ -447,6 +449,7 @@ def _run_node(node, deps, results, backend, resolution, *, state_dir, record_evi
                  "native_variant": (resolution or {}).get("native_variant"),
                  "tier": tier, "effort": node["routing"]["effort"]}
     current_backend = registry.get(candidate["backend"], backend)
+    first_backend = candidate["backend"]
     dependency_summaries = [{"task_id": dep, "summary": results.get(dep, {}).get("summary", "")}
                             for dep in deps]
     attempt = 0
@@ -488,7 +491,21 @@ def _run_node(node, deps, results, backend, resolution, *, state_dir, record_evi
                                  "READ_ONLY_VIOLATION", "READ_ONLY_VIOLATION", initial_tier, tier,
                                  attempt, escalations, decision_id, resolution, state_dir, record_evidence)
         category = result.get("failure_category")
-        if _is_success(node, result):
+        success = _is_success(node, result)
+        if attempts is not None:
+            attempts.append({
+                "task_id": node["task_id"], "attempt_no": attempt,
+                "backend": current_backend.name, "provider": candidate["provider"],
+                "model": candidate["model"], "native_effort": candidate["native_variant"],
+                "normalized_effort": resolution.get("normalized_effort") if isinstance(resolution, dict) else None,
+                "required_tier": initial_tier, "required_effort": node["routing"]["effort"],
+                "status": "SUCCESS" if success else "FAILED",
+                "failure_category": None if success else (category or "UNKNOWN_FAILURE"),
+                "is_retry": attempt > 1 and current_backend.name == first_backend,
+                "is_fallback": current_backend.name != first_backend,
+                "completion_signal": result.get("completion_signal"),
+            })
+        if success:
             return _finalize(node, result, SUCCESS, None, initial_tier, tier, attempt, escalations,
                              decision_id, resolution, state_dir, record_evidence)
         if category == "PERMISSION_REQUIRED":

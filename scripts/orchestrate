@@ -28,6 +28,7 @@ import orchestrator  # noqa: E402
 import execution  # noqa: E402
 import discovery  # noqa: E402
 import failover  # noqa: E402
+import orchestration_store  # noqa: E402
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
@@ -124,6 +125,13 @@ def cmd_run(args: argparse.Namespace) -> int:
         resume=args.resume, read_only=args.read_only, max_ai_calls=args.max_ai_calls,
         backends=backends, health=(None if args.backend == "fake" else health),
         constraints=_constraints(args))
+    if not args.no_store:
+        try:
+            orchestration_store.persist_run(
+                plan, report, machine_id=os.environ.get("LAI_MACHINE") or "unknown",
+                state_dir=args.state_dir)
+        except orchestration_store.StoreError:
+            pass  # operational persistence is best-effort; never fails the run
     if args.json:
         print(json.dumps(report, indent=2, ensure_ascii=False))
     else:
@@ -176,6 +184,7 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("--run-id", help="run identifier")
     run.add_argument("--state-dir", type=pathlib.Path, help="override local state root")
     run.add_argument("--no-evidence", action="store_true", help="do not record outcome evidence")
+    run.add_argument("--no-store", action="store_true", help="do not persist operational run state")
     run.set_defaults(func=cmd_run)
     return result
 
