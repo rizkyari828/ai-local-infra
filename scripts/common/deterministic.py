@@ -188,6 +188,7 @@ def classify_objective(text: str, *, root: Optional[pathlib.Path] = None) -> lis
     if any(phrase in lowered for phrase in _REPO_STATE_PHRASES):
         tasks.append({"executor": "TOOL_ONLY", "operation": "repository_state", "args": {}})
     for token in (text or "").split():
+        token = token.strip(".,;:()[]{}\"'`")
         if token.endswith((".yaml", ".json", ".toml")) and (root / token).exists():
             tasks.append({"executor": "TOOL_ONLY", "operation": "config_parse",
                           "args": {"path": token}})

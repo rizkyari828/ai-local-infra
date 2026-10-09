@@ -112,6 +112,15 @@ def _planner_required(objective: str) -> bool:
     return any(term in text for term in _PLANNER_AI_TERMS)
 
 
+_SYNTHESIS_TERMS = ("synthesize", "synthesis", "architecture decision", "decide", "recommend",
+                    "judge", "weigh", "trade-off", "tradeoff")
+
+
+def _requires_synthesis(objective: str) -> bool:
+    text = (objective or "").lower()
+    return any(term in text for term in _SYNTHESIS_TERMS)
+
+
 def planner_decision(objective: str, *, constraints: Optional[dict[str, Any]] = None) -> dict[str, Any]:
     """Choose the cheapest sufficient planner: none, deterministic, or AI (required).
 
@@ -242,6 +251,17 @@ def decompose(objective: str, *, constraints: Optional[dict[str, Any]] = None) -
     nodes.append(_node("T1", "Inspect repository and gather current state", "MECHANICAL", [],
                        acceptance=["repository state summarized", "relevant files identified"],
                        produces=["repo_state_summary"], family="repository_inspection"))
+    # Deterministic-first mixed decomposition: recognize explicit deterministic sub-work.
+    deterministic_tasks = deterministic_tools.classify_objective(objective)
+    if not constraints.get("deterministic_tests"):
+        deterministic_tasks = [task for task in deterministic_tasks if task["operation"] != "run_tests"]
+    repo_state = next((task for task in deterministic_tasks if task["operation"] == "repository_state"), None)
+    deterministic_tasks = [task for task in deterministic_tasks if task is not repo_state]
+    if repo_state is not None:
+        nodes[0]["executor"] = "TOOL_ONLY"
+        nodes[0]["tool"] = {"operation": "repository_state", "args": {}}
+        nodes[0]["routing"] = None
+        nodes[0]["acceptance_criteria"] = ["repository state determined deterministically"]
 
     last_analysis = "T1"
     arch_class = "CRITICAL" if sig["security"] else "CORRECTNESS_SENSITIVE"
@@ -273,12 +293,27 @@ def decompose(objective: str, *, constraints: Optional[dict[str, Any]] = None) -
                            acceptance=["focused tests pass"], produces=["test_summary"],
                            family="multi_machine_acceptance"))
 
+    for index, task in enumerate(deterministic_tasks, start=1):
+        det = _node(f"D{index}", f"Deterministic {task['operation']}", "MECHANICAL", [],
+                    acceptance=[f"{task['operation']} check satisfied"], family="deterministic_tool")
+        det["executor"] = "TOOL_ONLY"
+        det["tool"] = {"operation": task["operation"], "args": task["args"]}
+        det["routing"] = None
+        nodes.append(det)
+
     if len(nodes) > 1:
         depended_on = {dep for node in nodes for dep in node["depends_on"]}
         leaves = sorted(node["task_id"] for node in nodes if node["task_id"] not in depended_on)
-        nodes.append(_node("T6", "Final verification and integration report", "NORMAL", leaves,
-                           acceptance=["upstream acceptance criteria checked", "unresolved blockers reported"],
-                           produces=["final_report"], family="report_recovery_validation"))
+        final = _node("T6", "Final verification and integration report", "NORMAL", leaves,
+                      acceptance=["upstream acceptance criteria checked", "unresolved blockers reported"],
+                      produces=["final_report"], family="report_recovery_validation")
+        has_ai = any(node.get("executor") == "AI" for node in nodes)
+        if (repo_state is not None or deterministic_tasks) and not (_requires_synthesis(objective) and has_ai):
+            final["executor"] = "TOOL_ONLY"
+            final["tool"] = {"operation": "finalize", "args": {}}
+            final["routing"] = None
+            final["acceptance_criteria"] = ["all deterministic acceptance satisfied"]
+        nodes.append(final)
 
     plan = {"schema_version": 1, "objective_summary": _bounded_summary(objective),
             "planner": classify_planner(objective), "planner_mode": decision, "nodes": nodes,
@@ -291,7 +326,8 @@ def decompose(objective: str, *, constraints: Optional[dict[str, Any]] = None) -
     plan["diagnostics"] = diagnostics + conflicts + quota_guards(plan)
     plan["routing_mix"] = _routing_mix(plan["nodes"])
     plan["quota_view"] = _quota_view(plan["nodes"])
-    plan["executor_mix"] = {"TOOL_ONLY": 0, "AI": len(nodes)}
+    tool_only = sum(1 for node in nodes if node.get("executor") == "TOOL_ONLY")
+    plan["executor_mix"] = {"TOOL_ONLY": tool_only, "AI": len(nodes) - tool_only}
     _attach_budget(plan, constraints)
     return plan
 
@@ -311,6 +347,8 @@ def _bounded_summary(objective: str, limit: int = 120) -> str:
 def _apply_routing_and_context(plan: dict[str, Any], constraints: dict[str, Any]) -> None:
     surface = constraints.get("surface")
     for node in plan["nodes"]:
+        if node.get("executor") == "TOOL_ONLY":
+            continue
         recommendation = routing.recommend(node["objective_summary"], task_class=node["task_class"],
                                            requested_tier=constraints.get("min_tier"))
         recommendation["task_family"] = node["task_family"]

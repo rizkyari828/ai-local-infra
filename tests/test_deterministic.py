@@ -207,5 +207,70 @@ class OutcomeLearningSeparationTests(unittest.TestCase):
             self.assertFalse(derived_knowledge.classify_failure(category)["intelligence_escalation"])
 
 
+MIXED_OBJ = ("Inspect repository state, review the orchestration architecture for correctness, "
+             "validate config/model-routing.yaml, run deterministic verification, report the final result.")
+
+
+class MixedDecompositionTests(unittest.TestCase):
+    def test_mixed_has_tool_only_and_ai(self) -> None:
+        plan = orchestrator.decompose(MIXED_OBJ, constraints={"read_only": True, "max_ai_calls": 2})
+        executors = {node.get("executor") for node in plan["nodes"]}
+        self.assertEqual({"TOOL_ONLY", "AI"}, executors)
+        self.assertTrue(plan["valid"])
+
+    def test_mixed_deterministic_finalizer(self) -> None:
+        plan = orchestrator.decompose(MIXED_OBJ, constraints={"max_ai_calls": 2})
+        final = next(node for node in plan["nodes"] if node["task_id"] == "T6")
+        self.assertEqual("TOOL_ONLY", final["executor"])
+        self.assertEqual("finalize", final["tool"]["operation"])
+
+    def test_mixed_semantic_synthesis_keeps_ai_finalizer(self) -> None:
+        plan = orchestrator.decompose(
+            "Inspect repository state and synthesize the architecture decision for the cross-machine design.",
+            constraints={})
+        final = next(node for node in plan["nodes"] if node["task_id"] == "T6")
+        self.assertEqual("AI", final["executor"])
+
+    def test_config_parse_detected_with_punctuation(self) -> None:
+        plan = orchestrator.decompose(MIXED_OBJ)
+        operations = [node.get("tool", {}).get("operation") for node in plan["nodes"]
+                      if node.get("executor") == "TOOL_ONLY"]
+        self.assertIn("config_parse", operations)
+
+    def test_repository_state_converted_to_tool_only(self) -> None:
+        plan = orchestrator.decompose(MIXED_OBJ)
+        t1 = next(node for node in plan["nodes"] if node["task_id"] == "T1")
+        self.assertEqual("TOOL_ONLY", t1["executor"])
+        self.assertEqual("repository_state", t1["tool"]["operation"])
+
+    def test_deterministic_nodes_do_not_consume_ai_budget(self) -> None:
+        plan = orchestrator.decompose(MIXED_OBJ, constraints={"max_ai_calls": 2})
+        ai = sum(1 for node in plan["nodes"] if node.get("executor") == "AI")
+        self.assertEqual(ai, plan["planning_budget"]["minimum_required_ai_calls"])
+        self.assertLess(plan["planning_budget"]["minimum_required_ai_calls"], len(plan["nodes"]))
+        self.assertTrue(plan["valid"])
+
+    def test_genuine_ai_over_budget_rejected(self) -> None:
+        plan = orchestrator.decompose(MIXED_OBJ, constraints={"max_ai_calls": 1})
+        self.assertFalse(plan["valid"])
+        self.assertTrue(any("INSUFFICIENT_AI_CALL_BUDGET" in d for d in plan["diagnostics"]))
+
+    def test_no_excessive_splitting(self) -> None:
+        plan = orchestrator.decompose(MIXED_OBJ)
+        self.assertLessEqual(len(plan["nodes"]), orchestrator.MAX_PLAN_NODES)
+
+    def test_reasoning_not_classified_tool_only(self) -> None:
+        plan = orchestrator.decompose(MIXED_OBJ)
+        arch = next(node for node in plan["nodes"] if node["task_id"] == "T2")
+        self.assertEqual("AI", arch["executor"])
+        self.assertEqual("CORRECTNESS_SENSITIVE", arch["task_class"])
+
+    def test_decomposition_provider_independent(self) -> None:
+        a = orchestrator.decompose(MIXED_OBJ)
+        b = orchestrator.decompose(MIXED_OBJ)
+        self.assertEqual([n.get("executor") for n in a["nodes"]], [n.get("executor") for n in b["nodes"]])
+        self.assertEqual([n["task_id"] for n in a["nodes"]], [n["task_id"] for n in b["nodes"]])
+
+
 if __name__ == "__main__":
     unittest.main()
