@@ -29,6 +29,7 @@ import execution  # noqa: E402
 import discovery  # noqa: E402
 import failover  # noqa: E402
 import orchestration_store  # noqa: E402
+import context_retrieval  # noqa: E402
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
@@ -127,10 +128,14 @@ def cmd_run(args: argparse.Namespace) -> int:
         constraints=_constraints(args))
     if not args.no_store:
         try:
-            orchestration_store.persist_run(
+            run_id = orchestration_store.persist_run(
                 plan, report, machine_id=os.environ.get("LAI_MACHINE") or "unknown",
                 state_dir=args.state_dir)
-        except orchestration_store.StoreError:
+            state_root = (pathlib.Path(args.state_dir) if args.state_dir
+                          else pathlib.Path(os.environ.get("LAI_STATE_DIR", "~/.local/state/local-ai-infra")).expanduser())
+            for task_id, manifest in (report.get("context_manifests") or {}).items():
+                context_retrieval.write_manifest(state_root, run_id, task_id, manifest)
+        except (orchestration_store.StoreError, context_retrieval.ContextError, OSError):
             pass  # operational persistence is best-effort; never fails the run
     if args.json:
         print(json.dumps(report, indent=2, ensure_ascii=False))

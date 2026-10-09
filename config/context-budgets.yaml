@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "budgets_version": "0.1.0",
+  "notes": "Symbolic context-budget ceilings for AI worker context packs, measured in characters (deterministic; no tokenizer is assumed). A budget is a hard ceiling, not a target: packs are never padded to the limit. Config retrieval may use only bounded repository/workspace and approved knowledge/state sources. This file does not duplicate any authoritative rule/model/knowledge definition.",
+  "budgets": {
+    "TINY": 4000,
+    "SMALL": 12000,
+    "MEDIUM": 40000,
+    "LARGE": 120000
+  }
+}

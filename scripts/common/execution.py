@@ -24,6 +24,7 @@ import routing  # scripts/common, on sys.path
 import discovery  # scripts/common, on sys.path
 import failover  # scripts/common, on sys.path
 import deterministic  # scripts/common, on sys.path
+import context_retrieval  # scripts/common, on sys.path
 import derived_knowledge as knowledge  # scripts/common, on sys.path
 import evidence  # scripts/common, on sys.path
 
@@ -355,6 +356,7 @@ def execute_plan(plan: dict[str, Any], *, backend: Backend, run_id: Optional[str
     resolutions = {b["task_id"]: b for b in bindings}
 
     attempts: list[dict[str, Any]] = []
+    context_manifests: dict[str, dict[str, Any]] = {}
     for task_id in plan["order"]:
         node = next(item for item in plan["nodes"] if item["task_id"] == task_id)
         if resume and results.get(task_id, {}).get("status") in (SUCCESS, "NO_CHANGE_REQUIRED"):
@@ -383,7 +385,8 @@ def execute_plan(plan: dict[str, Any], *, backend: Backend, run_id: Optional[str
                                          enforce_read_only=enforce_read_only, repo_root=repo_root,
                                          candidates=resolutions[task_id].get("candidates"),
                                          backends=backend_registry, health=health,
-                                         constraints=constraints, attempts=attempts)
+                                         constraints=constraints, attempts=attempts,
+                                         context_manifests=context_manifests)
         except KeyboardInterrupt:
             results[task_id] = {"status": CANCELLED, "task_id": task_id}
             _mark_not_run(plan, task_id, results)
@@ -395,6 +398,7 @@ def execute_plan(plan: dict[str, Any], *, backend: Backend, run_id: Optional[str
         _save_state(run_dir, _state_blob(run_id, state, results, budget))
     report["nodes"] = results
     report["attempts"] = attempts
+    report["context_manifests"] = context_manifests
     report["calls_used"] = budget["used"]
     report["remaining_calls"] = (budget["max"] - budget["used"]) if budget["max"] is not None else None
     report["final"] = _final_summary(plan, results)
@@ -427,7 +431,7 @@ def _conditional_active(node: dict[str, Any], deps: list[str], results: dict[str
 def _run_node(node, deps, results, backend, resolution, *, state_dir, record_evidence,
               infra_retries, same_tier_retries, surface, budget, enforce_read_only,
               repo_root, candidates=None, backends=None, health=None,
-              constraints=None, attempts=None) -> dict[str, Any]:
+              constraints=None, attempts=None, context_manifests=None) -> dict[str, Any]:
     tier = node["routing"]["tier"]
     initial_tier = tier
     if enforce_read_only and node.get("intent") == "MUTATING":
@@ -483,6 +487,29 @@ def _run_node(node, deps, results, backend, resolution, *, state_dir, record_evi
                "native_variant": candidate["native_variant"]}
         request = _request(node, res, dependency_summaries, execution_id, tier, current_backend,
                            read_only=node.get("intent") == "READ_ONLY")
+        try:
+            ctx_request = context_retrieval.ContextRequest.build(
+                task_id=node["task_id"], task_family=node.get("task_family"),
+                task_class=node.get("task_class"), executor_type=node.get("executor", "AI"),
+                context_budget=(node.get("context") or {}).get("budget", "SMALL"),
+                objective_summary=node["objective_summary"],
+                acceptance_criteria=node.get("acceptance_criteria", []),
+                dependency_facts=dependency_summaries,
+                source_refs=node.get("context_refs") or [], symbol_refs=node.get("symbol_refs") or [],
+                config_refs=node.get("config_refs") or [], knowledge_refs=node.get("knowledge_refs") or [],
+                repository={"head": (resolution or {}).get("head")})
+            context_result = context_retrieval.build_pack(ctx_request, root=repo_root)
+        except (context_retrieval.ContextError, OSError):
+            context_result = None
+        if context_result is not None:
+            if context_manifests is not None:
+                context_manifests[node["task_id"]] = context_result["manifest"]
+            if context_result["status"] != context_retrieval.STATUS_READY:
+                return _finalize(node, {"summary": f"context {context_result['status']}"}, FAILURE,
+                                 context_result["status"], initial_tier, tier, attempt, escalations,
+                                 decision_id, resolution, state_dir, record_evidence)
+            request["context_pack"] = context_result["pack"]
+            request["context_manifest"] = context_result["manifest"]
         result = current_backend.execute(request)
         if enforce_read_only:
             changed = sorted(_worktree_paths(repo_root) - (before or set()))
