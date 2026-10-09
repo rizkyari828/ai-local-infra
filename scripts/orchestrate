@@ -5,11 +5,15 @@
     ./scripts/orchestrate run  --objective "..." --confirm [--backend fake|opencode|codex|auto]
                                [--dry-run] [--resume] [--run-id ID] [--surface ...]
                                [--min-tier T] [--max-tier T] [--local-only] [--no-premium]
+                               [--no-cache | --refresh] [--max-ai-calls N]
+    ./scripts/orchestrate cache [--state-dir DIR] [--json]
 
 plan is local/deterministic and persists nothing. run executes the validated graph
 sequentially through a provider-agnostic backend adapter; real backends require an
-explicit --confirm gate. The raw objective is processed in memory only and is never
-persisted. See docs/ORCHESTRATION.md and docs/EXECUTION.md.
+explicit --confirm gate. run reuses previously accepted results when inputs provably
+match (result cache; enabled by default, `--refresh` bypasses reuse, `--no-cache`
+disables it). The raw objective is processed in memory only and is never persisted.
+See docs/ORCHESTRATION.md, docs/EXECUTION.md, and docs/RESULT_CACHE.md.
 """
 
 from __future__ import annotations
@@ -30,6 +34,7 @@ import discovery  # noqa: E402
 import failover  # noqa: E402
 import orchestration_store  # noqa: E402
 import context_retrieval  # noqa: E402
+import result_cache  # noqa: E402
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
@@ -125,7 +130,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         allow_dirty=args.allow_dirty, surface=args.surface, record_evidence=not args.no_evidence,
         resume=args.resume, read_only=args.read_only, max_ai_calls=args.max_ai_calls,
         backends=backends, health=(None if args.backend == "fake" else health),
-        constraints=_constraints(args))
+        constraints=_constraints(args), cache=not args.no_cache, force_refresh=args.refresh,
+        explicit_model=bool(args.prefer_model or args.prefer_provider))
     if not args.no_store:
         try:
             run_id = orchestration_store.persist_run(
@@ -190,8 +196,34 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("--state-dir", type=pathlib.Path, help="override local state root")
     run.add_argument("--no-evidence", action="store_true", help="do not record outcome evidence")
     run.add_argument("--no-store", action="store_true", help="do not persist operational run state")
+    run.add_argument("--no-cache", action="store_true",
+                     help="disable result-cache reuse and writes for this run")
+    run.add_argument("--refresh", action="store_true",
+                     help="bypass reuse for this run (cache entries are kept, not deleted)")
     run.set_defaults(func=cmd_run)
+
+    cache = sub.add_parser("cache", help="show local result-cache status (read-only)")
+    cache.add_argument("--state-dir", type=pathlib.Path, help="override local state root")
+    cache.add_argument("--json", action="store_true")
+    cache.set_defaults(func=cmd_cache)
     return result
+
+
+def cmd_cache(args: argparse.Namespace) -> int:
+    try:
+        store = result_cache.ResultCache(state_dir=args.state_dir)
+    except result_cache.CacheError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    try:
+        status = store.status()
+    finally:
+        store.close()
+    print(json.dumps(status, indent=2, ensure_ascii=False) if args.json else (
+        f"RESULT CACHE  {status['db_path']}\n"
+        f"schema {status['schema_version']}  entries {status['entries']}  "
+        f"size {status['db_size_bytes']} bytes  oldest {status['oldest']}  newest {status['newest']}"))
+    return 0
 
 
 def main() -> int:

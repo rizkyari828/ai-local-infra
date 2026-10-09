@@ -27,6 +27,8 @@ import deterministic  # scripts/common, on sys.path
 import context_retrieval  # scripts/common, on sys.path
 import derived_knowledge as knowledge  # scripts/common, on sys.path
 import evidence  # scripts/common, on sys.path
+import result_cache  # scripts/common, on sys.path
+import orchestration_store  # scripts/common, on sys.path
 
 ROOT = infra.ROOT
 INFRA_CATEGORIES = ("PROVIDER_503", "RATE_LIMIT", "TIMEOUT", "STALE_SESSION", "AUTH_FAILURE",
@@ -296,7 +298,12 @@ def execute_plan(plan: dict[str, Any], *, backend: Backend, run_id: Optional[str
                  backends: Optional[dict[str, Backend]] = None,
                  health: Optional[failover.Health] = None,
                  constraints: Optional[dict[str, Any]] = None,
-                 tool_executor: Optional[deterministic.ToolExecutor] = None) -> dict[str, Any]:
+                 tool_executor: Optional[deterministic.ToolExecutor] = None,
+                 cache: bool = False, force_refresh: bool = False,
+                 project_id: Optional[str] = None,
+                 cache_store: Optional["result_cache.ResultCache"] = None,
+                 explicit_model: bool = False,
+                 allow_stronger_reuse: bool = True) -> dict[str, Any]:
     if not plan.get("valid"):
         raise ExecutionError("refusing to execute an invalid plan")
     if not confirm and not dry_run:
@@ -357,50 +364,97 @@ def execute_plan(plan: dict[str, Any], *, backend: Backend, run_id: Optional[str
 
     attempts: list[dict[str, Any]] = []
     context_manifests: dict[str, dict[str, Any]] = {}
-    for task_id in plan["order"]:
-        node = next(item for item in plan["nodes"] if item["task_id"] == task_id)
-        if resume and results.get(task_id, {}).get("status") in (SUCCESS, "NO_CHANGE_REQUIRED"):
-            continue
-        deps = node["depends_on"]
-        if any(results.get(dep, {}).get("status") not in (SUCCESS, SKIPPED, "NO_CHANGE_REQUIRED") for dep in deps):
-            results[task_id] = {"status": BLOCKED, "task_id": task_id}
-            continue
-        if node["conditional"] and not _conditional_active(node, deps, results):
-            results[task_id] = {"status": SKIPPED, "task_id": task_id}
-            continue
-        if node.get("executor") == "TOOL_ONLY":
-            results[task_id] = _run_tool_node(node, deps, results, tool_executor,
-                                              state_dir=state_dir, record_evidence=record_evidence)
-            if results[task_id]["status"] in ("AI_REQUIRED", FAILURE):
-                report["error"] = results[task_id].get("failure_category") or "TOOL_EXECUTION_FAILED"
+    cache_meta: dict[str, Any] = {"enabled": bool(cache), "hits": 0, "misses": 0, "writes": 0,
+                                  "rejected": 0, "decisions": []}
+    store, owns_store, repo_identity = _open_cache(cache, cache_store, state_dir, project_id, repo_root)
+    if store is None:
+        cache_meta["enabled"] = False
+    try:
+        for task_id in plan["order"]:
+            node = next(item for item in plan["nodes"] if item["task_id"] == task_id)
+            if resume and results.get(task_id, {}).get("status") in (SUCCESS, "NO_CHANGE_REQUIRED"):
+                continue
+            deps = node["depends_on"]
+            if any(results.get(dep, {}).get("status") not in (SUCCESS, SKIPPED, "NO_CHANGE_REQUIRED") for dep in deps):
+                results[task_id] = {"status": BLOCKED, "task_id": task_id}
+                continue
+            if node["conditional"] and not _conditional_active(node, deps, results):
+                results[task_id] = {"status": SKIPPED, "task_id": task_id}
+                continue
+            if node.get("executor") == "TOOL_ONLY":
+                results[task_id] = _run_tool_node(node, deps, results, tool_executor,
+                                                  state_dir=state_dir, record_evidence=record_evidence)
+                if store is not None and results[task_id]["status"] in (SUCCESS, "NO_CHANGE_REQUIRED"):
+                    _annotate_result(node, results[task_id])
+                if results[task_id]["status"] in ("AI_REQUIRED", FAILURE):
+                    report["error"] = results[task_id].get("failure_category") or "TOOL_EXECUTION_FAILED"
+                    _mark_not_run(plan, task_id, results)
+                    break
+                _save_state(run_dir, _state_blob(run_id, state, results, budget))
+                continue
+            dependency_summaries = _dependency_facts(node, results)
+            context_result = _build_node_context(node, dependency_summaries, repo_root)
+            identity = None
+            if store is not None:
+                dependencies_complete = all(fact.get("result_fingerprint") for fact in dependency_summaries)
+                freshness = result_cache.freshness_policy(node, constraints=constraints)
+                identity = _cache_identity(node, context_result, dependency_summaries, repo_identity,
+                                           freshness, state["head"])
+                resolution = resolutions.get(task_id) or {}
+                decision = result_cache.decide(
+                    store=store, project_id=repo_identity, node=node, identity=identity,
+                    required_tier=resolution.get("tier"), required_effort=node["routing"]["effort"],
+                    freshness=freshness, force_refresh=force_refresh, explicit_model=explicit_model,
+                    allow_stronger_reuse=allow_stronger_reuse, dependencies_complete=dependencies_complete)
+                cache_meta["decisions"].append(_bounded_decision(decision))
+                if decision["decision"] == result_cache.REUSE:
+                    cache_meta["hits"] += 1
+                    results[task_id] = _reused_result(node, decision)
+                    _save_state(run_dir, _state_blob(run_id, state, results, budget))
+                    context_manifests.setdefault(task_id, (context_result or {}).get("manifest"))
+                    continue
+                cache_meta["misses"] += 1
+            try:
+                node_result = _run_node(node, deps, results, backend, resolutions[task_id],
+                                        state_dir=state_dir, record_evidence=record_evidence,
+                                        infra_retries=infra_retries, same_tier_retries=same_tier_retries,
+                                        surface=backend.name, budget=budget,
+                                        enforce_read_only=enforce_read_only, repo_root=repo_root,
+                                        candidates=resolutions[task_id].get("candidates"),
+                                        backends=backend_registry, health=health,
+                                        constraints=constraints, attempts=attempts,
+                                        context_manifests=context_manifests,
+                                        dependency_summaries=dependency_summaries,
+                                        prebuilt_context=context_result)
+            except KeyboardInterrupt:
+                results[task_id] = {"status": CANCELLED, "task_id": task_id}
+                _mark_not_run(plan, task_id, results)
+                break
+            results[task_id] = node_result
+            if store is not None and identity is not None:
+                node_result["input_fingerprint"] = identity["input_fingerprint"]
+            if node_result["status"] == SUCCESS:
+                fp, bounded, rtype = _annotate_result(node, node_result)
+                if store is not None and identity is not None and fp is not None:
+                    _write_cache(store, node, identity, freshness, node_result, bounded, rtype, fp,
+                                 attempts, run_id, repo_identity, cache_meta)
+            if node_result["status"] in ("CALL_BUDGET_EXHAUSTED", "READ_ONLY_VIOLATION"):
+                report["error"] = node_result["status"]
                 _mark_not_run(plan, task_id, results)
                 break
             _save_state(run_dir, _state_blob(run_id, state, results, budget))
-            continue
-        try:
-            results[task_id] = _run_node(node, deps, results, backend, resolutions[task_id],
-                                         state_dir=state_dir, record_evidence=record_evidence,
-                                         infra_retries=infra_retries, same_tier_retries=same_tier_retries,
-                                         surface=backend.name, budget=budget,
-                                         enforce_read_only=enforce_read_only, repo_root=repo_root,
-                                         candidates=resolutions[task_id].get("candidates"),
-                                         backends=backend_registry, health=health,
-                                         constraints=constraints, attempts=attempts,
-                                         context_manifests=context_manifests)
-        except KeyboardInterrupt:
-            results[task_id] = {"status": CANCELLED, "task_id": task_id}
-            _mark_not_run(plan, task_id, results)
-            break
-        if results[task_id]["status"] in ("CALL_BUDGET_EXHAUSTED", "READ_ONLY_VIOLATION"):
-            report["error"] = results[task_id]["status"]
-            _mark_not_run(plan, task_id, results)
-            break
-        _save_state(run_dir, _state_blob(run_id, state, results, budget))
+    finally:
+        if owns_store and store is not None:
+            store.close()
     report["nodes"] = results
     report["attempts"] = attempts
     report["context_manifests"] = context_manifests
     report["calls_used"] = budget["used"]
     report["remaining_calls"] = (budget["max"] - budget["used"]) if budget["max"] is not None else None
+    report["cache"] = cache_meta
+    report["logical_ai_nodes"] = sum(1 for node in plan["nodes"] if node.get("executor") != "TOOL_ONLY")
+    report["cache_reused"] = cache_meta["hits"]
+    report["real_ai_calls"] = budget["used"]
     report["final"] = _final_summary(plan, results)
     _save_state(run_dir, _state_blob(run_id, state, results, budget))
     return report
@@ -410,6 +464,164 @@ def _mark_not_run(plan: dict[str, Any], current: str, results: dict[str, dict[st
     index = plan["order"].index(current)
     for future in plan["order"][index + 1:]:
         results.setdefault(future, {"status": NOT_RUN, "task_id": future})
+
+
+# --------------------------------------------------------------------------- #
+# Result cache integration (Layer 3) — deterministic reuse, zero AI calls on hit
+# --------------------------------------------------------------------------- #
+
+
+def _open_cache(cache, cache_store, state_dir, project_id, repo_root):
+    """Best-effort cache setup. Any failure disables caching; it never fails a run."""
+    if not cache:
+        return None, False, None
+    owns = False
+    store = cache_store
+    try:
+        if store is None:
+            store = result_cache.ResultCache(state_dir=state_dir)
+            owns = True
+        identity = project_id or orchestration_store.repository_identity(repo_root)["repository_id"]
+    except Exception:  # cache is best-effort local state, never a run blocker
+        if owns and store is not None:
+            store.close()
+        return None, False, None
+    return store, owns, identity
+
+
+def _dependency_facts(node: dict[str, Any], results: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    facts: list[dict[str, Any]] = []
+    for dep in node["depends_on"]:
+        outcome = results.get(dep, {})
+        fact: dict[str, Any] = {"task_id": dep, "summary": outcome.get("summary", ""),
+                                "status": outcome.get("status")}
+        # Meaningful dependency identity: the accepted result fingerprint, never
+        # execution activity (reused vs executed must not change descendant identity).
+        # A deterministically-inactive (SKIPPED) conditional node contributes a stable
+        # placeholder so it neither blocks nor pollutes descendant reuse.
+        fingerprint = outcome.get("result_fingerprint")
+        if not fingerprint and outcome.get("status") == SKIPPED:
+            fingerprint = result_cache.result_fingerprint("inactive", {"status": SKIPPED})
+        if fingerprint:
+            fact["result_fingerprint"] = fingerprint
+        facts.append(fact)
+    return facts
+
+
+def _build_node_context(node: dict[str, Any], dependency_summaries: list[dict[str, Any]],
+                        repo_root: pathlib.Path) -> Optional[dict[str, Any]]:
+    try:
+        ctx_request = context_retrieval.ContextRequest.build(
+            task_id=node["task_id"], task_family=node.get("task_family"),
+            task_class=node.get("task_class"), executor_type=node.get("executor", "AI"),
+            context_budget=(node.get("context") or {}).get("budget", "SMALL"),
+            objective_summary=node["objective_summary"],
+            acceptance_criteria=node.get("acceptance_criteria", []),
+            dependency_facts=dependency_summaries,
+            source_refs=node.get("context_refs") or [], symbol_refs=node.get("symbol_refs") or [],
+            config_refs=node.get("config_refs") or [], knowledge_refs=node.get("knowledge_refs") or [],
+            repository={"head": None})
+        return context_retrieval.build_pack(ctx_request, root=repo_root)
+    except (context_retrieval.ContextError, OSError):
+        return None
+
+
+def _cache_identity(node: dict[str, Any], context_result: Optional[dict[str, Any]],
+                    dependency_summaries: list[dict[str, Any]], project_id: str,
+                    freshness: str, repository_head: Optional[str]) -> dict[str, Any]:
+    manifest = (context_result or {}).get("manifest")
+    semantic = result_cache.task_semantic_fingerprint(node)
+    context_fp = result_cache.context_identity(manifest)
+    dep_fps = [fact["result_fingerprint"] for fact in dependency_summaries
+               if fact.get("result_fingerprint")]
+    fingerprint = result_cache.input_fingerprint(
+        project_id=project_id, task_semantic_fingerprint=semantic, context_fingerprint=context_fp,
+        dependency_fingerprints=dep_fps, freshness_policy=freshness, repository_head=repository_head)
+    return {"task_semantic_fingerprint": semantic, "context_manifest_fingerprint": context_fp,
+            "input_fingerprint": fingerprint, "dependency_fingerprints": dep_fps}
+
+
+def _bounded_decision(decision: dict[str, Any]) -> dict[str, Any]:
+    entry = decision.get("entry") or {}
+    return {"task_id": decision.get("task_id"), "decision": decision.get("decision"),
+            "reason": decision.get("reason"), "input_fingerprint": decision.get("input_fingerprint"),
+            "task_semantic_fingerprint": decision.get("task_semantic_fingerprint"),
+            "context_manifest_fingerprint": decision.get("context_manifest_fingerprint"),
+            "freshness_policy": decision.get("freshness_policy"),
+            "cache_entry_id": entry.get("cache_entry_id"),
+            "reused_from_run_id": entry.get("original_run_id"),
+            "reused_from_task_id": entry.get("original_task_id"),
+            "result_fingerprint": entry.get("result_fingerprint")}
+
+
+def _reused_result(node: dict[str, Any], decision: dict[str, Any]) -> dict[str, Any]:
+    entry = decision["entry"]
+    result = entry.get("result") or {}
+    return {"task_id": node["task_id"], "status": SUCCESS, "failure_category": None,
+            "summary": result.get("summary", ""), "decisions": result.get("decisions", []),
+            "files_changed": result.get("files_changed", []),
+            "acceptance_results": result.get("acceptance_results", {}),
+            "new_risk_signals": result.get("new_risk_signals", []), "recommended_followups": [],
+            "execution_source": "CACHE", "cache_status": "HIT",
+            "cache_entry_id": entry.get("cache_entry_id"),
+            "reused_from_run_id": entry.get("original_run_id"),
+            "reused_from_task_id": entry.get("original_task_id"),
+            "input_fingerprint": entry.get("input_fingerprint"),
+            "result_fingerprint": entry.get("result_fingerprint"),
+            "reuse_reason": decision.get("reason")}
+
+
+def _annotate_result(node: dict[str, Any], result: dict[str, Any]):
+    """Attach a deterministic accepted-result fingerprint for downstream dependency
+    identity (incremental DAG reuse), independent of cache write eligibility."""
+    bounded = result_cache.bounded_result(node, result)
+    if bounded is None:
+        return None, None, None
+    rtype = result_cache.result_type(node)
+    fingerprint = result_cache.result_fingerprint(rtype, bounded)
+    result["result_fingerprint"] = fingerprint
+    result.setdefault("execution_source", "TOOL_ONLY" if node.get("executor") == "TOOL_ONLY" else "EXECUTED")
+    return fingerprint, bounded, rtype
+
+
+def _success_attempt(attempts: list[dict[str, Any]], task_id: str) -> dict[str, Any]:
+    matches = [attempt for attempt in (attempts or [])
+               if attempt.get("task_id") == task_id and attempt.get("status") == "SUCCESS"]
+    return matches[-1] if matches else {}
+
+
+def _write_cache(store, node, identity, freshness, result, bounded, rtype, result_fp,
+                 attempts, run_id, project_id, cache_meta) -> None:
+    eligible, reason = result_cache.eligible_for_cache(node, result, freshness=freshness)
+    if not eligible:
+        cache_meta["rejected"] += 1
+        cache_meta["decisions"].append({"task_id": node["task_id"], "decision": "WRITE_REJECTED",
+                                        "reason": reason})
+        return
+    provenance = _success_attempt(attempts, node["task_id"])
+    try:
+        entry_id = store.write(
+            project_id=project_id, task_semantic_fingerprint=identity["task_semantic_fingerprint"],
+            input_fingerprint=identity["input_fingerprint"],
+            context_manifest_fingerprint=identity.get("context_manifest_fingerprint"),
+            result_fingerprint=result_fp, result_type=rtype, result=bounded, freshness_policy=freshness,
+            original_run_id=run_id, original_task_id=node["task_id"],
+            original_backend=provenance.get("backend"), original_provider=provenance.get("provider"),
+            original_model=provenance.get("model"),
+            original_required_tier=(node.get("routing") or {}).get("tier"),
+            original_required_effort=(node.get("routing") or {}).get("effort"),
+            original_native_effort=provenance.get("native_effort"),
+            original_normalized_effort=provenance.get("normalized_effort"))
+    except result_cache.CacheError:
+        cache_meta["rejected"] += 1
+        cache_meta["decisions"].append({"task_id": node["task_id"], "decision": "WRITE_REJECTED",
+                                        "reason": result_cache.REASON_RESULT_NOT_REUSABLE})
+        return
+    cache_meta["writes"] += 1
+    cache_meta["decisions"].append({"task_id": node["task_id"], "decision": "CACHE_WRITTEN",
+                                    "reason": result_cache.REASON_UNCHANGED_INPUTS,
+                                    "cache_entry_id": entry_id, "result_fingerprint": result_fp,
+                                    "input_fingerprint": identity["input_fingerprint"]})
 
 
 def _state_blob(run_id: str, state: dict[str, Any], results: dict[str, dict[str, Any]],
@@ -431,7 +643,8 @@ def _conditional_active(node: dict[str, Any], deps: list[str], results: dict[str
 def _run_node(node, deps, results, backend, resolution, *, state_dir, record_evidence,
               infra_retries, same_tier_retries, surface, budget, enforce_read_only,
               repo_root, candidates=None, backends=None, health=None,
-              constraints=None, attempts=None, context_manifests=None) -> dict[str, Any]:
+              constraints=None, attempts=None, context_manifests=None,
+              dependency_summaries=None, prebuilt_context=None) -> dict[str, Any]:
     tier = node["routing"]["tier"]
     initial_tier = tier
     if enforce_read_only and node.get("intent") == "MUTATING":
@@ -454,8 +667,9 @@ def _run_node(node, deps, results, backend, resolution, *, state_dir, record_evi
                  "tier": tier, "effort": node["routing"]["effort"]}
     current_backend = registry.get(candidate["backend"], backend)
     first_backend = candidate["backend"]
-    dependency_summaries = [{"task_id": dep, "summary": results.get(dep, {}).get("summary", "")}
-                            for dep in deps]
+    if dependency_summaries is None:
+        dependency_summaries = [{"task_id": dep, "summary": results.get(dep, {}).get("summary", "")}
+                                for dep in deps]
     attempt = 0
     infra_used = same_used = escalations = 0
     execution_id = uuid.uuid4().hex
@@ -487,20 +701,23 @@ def _run_node(node, deps, results, backend, resolution, *, state_dir, record_evi
                "native_variant": candidate["native_variant"]}
         request = _request(node, res, dependency_summaries, execution_id, tier, current_backend,
                            read_only=node.get("intent") == "READ_ONLY")
-        try:
-            ctx_request = context_retrieval.ContextRequest.build(
-                task_id=node["task_id"], task_family=node.get("task_family"),
-                task_class=node.get("task_class"), executor_type=node.get("executor", "AI"),
-                context_budget=(node.get("context") or {}).get("budget", "SMALL"),
-                objective_summary=node["objective_summary"],
-                acceptance_criteria=node.get("acceptance_criteria", []),
-                dependency_facts=dependency_summaries,
-                source_refs=node.get("context_refs") or [], symbol_refs=node.get("symbol_refs") or [],
-                config_refs=node.get("config_refs") or [], knowledge_refs=node.get("knowledge_refs") or [],
-                repository={"head": (resolution or {}).get("head")})
-            context_result = context_retrieval.build_pack(ctx_request, root=repo_root)
-        except (context_retrieval.ContextError, OSError):
-            context_result = None
+        if prebuilt_context is not None:
+            context_result = prebuilt_context
+        else:
+            try:
+                ctx_request = context_retrieval.ContextRequest.build(
+                    task_id=node["task_id"], task_family=node.get("task_family"),
+                    task_class=node.get("task_class"), executor_type=node.get("executor", "AI"),
+                    context_budget=(node.get("context") or {}).get("budget", "SMALL"),
+                    objective_summary=node["objective_summary"],
+                    acceptance_criteria=node.get("acceptance_criteria", []),
+                    dependency_facts=dependency_summaries,
+                    source_refs=node.get("context_refs") or [], symbol_refs=node.get("symbol_refs") or [],
+                    config_refs=node.get("config_refs") or [], knowledge_refs=node.get("knowledge_refs") or [],
+                    repository={"head": (resolution or {}).get("head")})
+                context_result = context_retrieval.build_pack(ctx_request, root=repo_root)
+            except (context_retrieval.ContextError, OSError):
+                context_result = None
         if context_result is not None:
             if context_manifests is not None:
                 context_manifests[node["task_id"]] = context_result["manifest"]
@@ -631,7 +848,7 @@ def _request(node, resolution, dependency_summaries, execution_id, tier, backend
         "model": resolution["model"], "native_variant": resolution["native_variant"],
         "objective_summary": node["objective_summary"], "acceptance_criteria": node["acceptance_criteria"],
         "dependency_summaries": dependency_summaries, "knowledge_refs": node.get("knowledge_refs", []),
-        "context_manifest": node["context"]["manifest"], "working_dir": str(ROOT),
+        "context_manifest": (node.get("context") or {}).get("manifest", []), "working_dir": str(ROOT),
         "read_only": read_only,
         "prompt": _prompt(node, dependency_summaries, read_only=read_only),
     }
@@ -703,8 +920,16 @@ def render_execution(report: dict[str, Any]) -> str:
                      f"  variant {binding.get('native_variant')}  {binding.get('mode')}"
                      + ("" if binding.get("runnable") else "  [NO_COMPATIBLE_EXECUTION_BACKEND]"))
     for task_id, result in report.get("nodes", {}).items():
+        suffix = ""
+        if result.get("execution_source") == "CACHE":
+            suffix = f"  [CACHE reuse from {result.get('reused_from_run_id')}/{result.get('reused_from_task_id')}]"
         lines.append(f"{task_id}: {result.get('status')}"
-                     + (f" ({result['failure_category']})" if result.get("failure_category") else ""))
+                     + (f" ({result['failure_category']})" if result.get("failure_category") else "") + suffix)
+    cache = report.get("cache")
+    if cache and cache.get("enabled"):
+        lines.append(f"RESULT CACHE: logical_ai {report.get('logical_ai_nodes')}, reused {cache['hits']}, "
+                     f"executed {report.get('real_ai_calls')} real AI calls, writes {cache['writes']}, "
+                     f"misses {cache['misses']}, rejected {cache['rejected']}")
     if report.get("error"):
         lines.append(f"ERROR: {report['error']}")
     if report.get("final"):

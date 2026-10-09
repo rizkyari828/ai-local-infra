@@ -30,7 +30,7 @@ class SchemaTests(unittest.TestCase):
         tables = {row[0] for row in s.connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         for expected in ("projects", "runs", "tasks", "task_dependencies", "attempts", "run_events", "meta"):
             self.assertIn(expected, tables)
-        self.assertEqual(1, s.status()["schema_version"])
+        self.assertEqual(store.SCHEMA_VERSION, s.status()["schema_version"])
         self.assertEqual("WAL", s.connection.execute("PRAGMA journal_mode").fetchone()[0].upper())
         self.assertEqual(1, s.connection.execute("PRAGMA foreign_keys").fetchone()[0])
         s.close()
@@ -50,7 +50,26 @@ class SchemaTests(unittest.TestCase):
         s.close()
         s2 = store.OrchestrationStore(state_dir=self.state)  # reopening must not recreate/drop
         self.assertIsNotNone(s2.get_run("r1"))
-        self.assertEqual(1, s2.status()["schema_version"])
+        self.assertEqual(store.SCHEMA_VERSION, s2.status()["schema_version"])
+        s2.close()
+
+    def test_v1_to_v2_migration_is_additive(self) -> None:
+        # Build a v1 DB (migration 1 only), then reopen and confirm an incremental,
+        # non-destructive upgrade to v2 adds reuse provenance columns.
+        v1 = [(1, store._MIGRATIONS[0][1])]
+        with unittest.mock.patch.object(store, "_MIGRATIONS", v1):
+            s = store.OrchestrationStore(state_dir=self.state)
+            s.ensure_project("remote:x")
+            s.create_run("r1", project_id="remote:x", machine_id="work-mac")
+            self.assertEqual(1, s.status()["schema_version"])
+            s.close()
+        s2 = store.OrchestrationStore(state_dir=self.state)  # migrates 1 -> 2
+        self.assertEqual(2, s2.status()["schema_version"])
+        self.assertIsNotNone(s2.get_run("r1"))  # prior data preserved, not recreated
+        columns = {row[1] for row in s2.connection.execute("PRAGMA table_info(tasks)")}
+        for expected in ("execution_source", "cache_entry_id", "reused_from_run_id",
+                         "reused_from_task_id", "input_fingerprint", "result_fingerprint"):
+            self.assertIn(expected, columns)
         s2.close()
 
     def test_migration_rollback_on_failure(self) -> None:

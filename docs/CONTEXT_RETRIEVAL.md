@@ -87,8 +87,8 @@ called after a validation failure (these are non-intelligence categories). Path
 traversal/absolute/home reads are rejected; binaries and oversized files are skipped;
 secret-like values are redacted to `[REDACTED]` while preserving structure, and never
 leak into the pack or manifest. Manifest/source/dependency/knowledge fingerprints are
-deterministic (no secrets, timestamps, or prompt text) and cache-ready; result caching
-itself is deferred.
+deterministic (no secrets, timestamps, or prompt text) and are consumed by the result
+cache; see `docs/RESULT_CACHE.md` for reuse identity and eligibility.
 
 ## Operational integration (transitional)
 
@@ -98,5 +98,6 @@ database body). No operational DB schema change was required; the existing
 `tasks.context_budget` field already records the budget. Full context bodies are never
 persisted. TOOL_ONLY and NO_CHANGE_REQUIRED tasks build no AI pack.
 
-Deferred: result cache, incremental DAG reuse, efficiency telemetry, vector/embeddings,
-external retrieval, AI-powered selection, automatic surface hooks, parallel workers.
+Deferred: efficiency telemetry, vector/embeddings, external retrieval, AI-powered
+selection, automatic surface hooks, parallel workers. Result cache + incremental DAG
+reuse V0.1 is implemented on top of these fingerprints (see `docs/RESULT_CACHE.md`).

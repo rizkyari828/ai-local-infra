@@ -1,4 +1,4 @@
-# Operational Data Contract V0.1
+# Operational Data Contract V0.2
 
 A stable, versioned, queryable representation of what the orchestration engine is
 doing and has done. It is **data infrastructure, not UI**, and lives in its own SQLite
@@ -7,6 +7,7 @@ database separate from learning and shared knowledge.
 ```text
 $LAI_STATE_DIR/orchestration/orchestration.db   operational run state (this contract)
 $LAI_STATE_DIR/learning/evidence.db             learning evidence (outcome learning)
+$LAI_STATE_DIR/cache/result-cache.db            reusable local task results (result cache)
 knowledge/*                                     shared portable knowledge (Git)
 ```
 
@@ -77,8 +78,10 @@ event sourcing). `event_id` is a monotonic cursor; poll with `events after curso
 (never `OFFSET`). Event types are bounded: `RUN_CREATED/STARTED/COMPLETED/FAILED`,
 `TASK_CREATED/STARTED/COMPLETED/FAILED/NO_CHANGE_REQUIRED/AI_REQUIRED`,
 `ATTEMPT_STARTED/SUCCEEDED/FAILED`, `FAILOVER_SELECTED`, `RETRY_SELECTED`,
-`CALL_BUDGET_UPDATED`, `READ_ONLY_VIOLATION`, `CALL_BUDGET_EXHAUSTED`. State changes and
-their event are written in one SQLite transaction where practical.
+`CALL_BUDGET_UPDATED`, `READ_ONLY_VIOLATION`, `CALL_BUDGET_EXHAUSTED`, and the Result
+Cache reuse events `CACHE_HIT`, `CACHE_MISS`, `CACHE_REJECTED`, `CACHE_ENTRY_WRITTEN`,
+`TASK_REUSED`. State changes and their event are written in one SQLite transaction where
+practical.
 
 Statuses are fixed sets: Run `PLANNED/RUNNING/SUCCEEDED/FAILED/BLOCKED/CANCELLED`;
 Task `PENDING/RUNNING/SUCCESS/FAILED/SKIPPED/NO_CHANGE_REQUIRED/AI_REQUIRED/BLOCKED`;
@@ -88,6 +91,25 @@ intelligence failure. Failure categories reuse the learning taxonomy (`RATE_LIMI
 `PERMISSION_REQUIRED`, `READ_ONLY_VIOLATION`, `CALL_BUDGET_EXHAUSTED`,
 `TOOL_EXECUTION_FAILED`, `DETERMINISTIC_CHECK_FAILED`, `INSUFFICIENT_AI_CALL_BUDGET`,
 …).
+
+## Result cache reuse (schema v2)
+
+Result Cache + Incremental DAG Reuse (`docs/RESULT_CACHE.md`) adds reuse **provenance only**
+to the operational contract. No accepted result body is stored here; the cache remains
+the cache authority. A reused task keeps `status = SUCCESS` (no invented `CACHED` status)
+and adds:
+
+| Task column (v2) | Meaning |
+|---|---|
+| `execution_source` | `CACHE` (reused), `EXECUTED` (fresh AI), `TOOL_ONLY` |
+| `cache_entry_id` | cache entry the result came from |
+| `reused_from_run_id`, `reused_from_task_id` | original provenance of the reused result |
+| `input_fingerprint`, `result_fingerprint` | deterministic identities (no secrets, no prompt text) |
+
+A reused task creates **no** `Attempt` row (no model was invoked) and consumes **zero**
+AI calls. `TASK_REUSED` plus `CACHE_HIT` communicate reuse without overloading status
+semantics. Migrations are additive and non-destructive (v1 → v2 `ALTER TABLE ... ADD
+COLUMN`); existing v1 databases upgrade in place with no data loss.
 
 ## Migrations, concurrency, identity
 
@@ -99,8 +121,9 @@ migrate to latest; older DBs migrate incrementally. SQLite settings: `journal_mo
 ## Query layer
 
 `OrchestrationStore` exposes `status`, `recent_runs`, `get_run`, `run_tasks`,
-`run_dependencies`, `task_attempts`, `run_events(after=cursor)`, and
-`execution_summary`. Future API/UI/telemetry call this layer, not CLI text. A small
+`run_dependencies`, `task_attempts`, `run_events(after=cursor)`, `execution_summary`, and
+`reuse_summary` (which tasks executed, were TOOL_ONLY, were AI, and reused — and from
+where). Future API/UI/telemetry call this layer, not CLI text. A small
 `./scripts/orchestrate` run integration persists each lifecycle best-effort; there is
 no HTTP API, WebSocket, or UI in V0.1.
 

@@ -30,7 +30,7 @@ import learning  # scripts/common, on sys.path (secret guard)
 ROOT = infra.ROOT
 DB_SUBDIR = "orchestration"
 DB_FILENAME = "orchestration.db"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 BUSY_TIMEOUT_MS = 5000
 MAX_PAYLOAD = 2000  # bounded structured event payload
 
@@ -44,6 +44,8 @@ EVENT_TYPES = (
     "TASK_AI_REQUIRED", "ATTEMPT_STARTED", "ATTEMPT_SUCCEEDED", "ATTEMPT_FAILED",
     "FAILOVER_SELECTED", "RETRY_SELECTED", "CALL_BUDGET_UPDATED", "READ_ONLY_VIOLATION",
     "CALL_BUDGET_EXHAUSTED",
+    # Result Cache + incremental DAG reuse (Layer 3).
+    "CACHE_HIT", "CACHE_MISS", "CACHE_REJECTED", "TASK_REUSED", "CACHE_ENTRY_WRITTEN",
 )
 # Superset failure taxonomy (non-intelligence categories never imply model weakness).
 FAILURE_TAXONOMY = (
@@ -157,6 +159,16 @@ _MIGRATIONS: list[tuple[int, list[str]]] = [
         "CREATE INDEX IF NOT EXISTS idx_attempts_status ON attempts(status, completed_at)",
         "CREATE INDEX IF NOT EXISTS idx_events_run ON run_events(run_id, event_id)",
         "CREATE INDEX IF NOT EXISTS idx_events_task ON run_events(task_id, event_id)",
+    ]),
+    # v2: additive Result Cache reuse provenance (no result bodies; cache stays the
+    # cache authority). Provenance/state only, never duplicated accepted results.
+    (2, [
+        "ALTER TABLE tasks ADD COLUMN execution_source TEXT",
+        "ALTER TABLE tasks ADD COLUMN cache_entry_id TEXT",
+        "ALTER TABLE tasks ADD COLUMN reused_from_run_id TEXT",
+        "ALTER TABLE tasks ADD COLUMN reused_from_task_id TEXT",
+        "ALTER TABLE tasks ADD COLUMN input_fingerprint TEXT",
+        "ALTER TABLE tasks ADD COLUMN result_fingerprint TEXT",
     ]),
 ]
 
@@ -295,16 +307,38 @@ class OrchestrationStore:
                                     (_now(), run_id, task_id))
             self._event(run_id, "TASK_STARTED", task_id=task_id)
 
-    def finish_task(self, run_id: str, task_id: str, status: str, *, failure_category: Optional[str] = None) -> None:
+    def finish_task(self, run_id: str, task_id: str, status: str, *, failure_category: Optional[str] = None,
+                    execution_source: Optional[str] = None, cache_entry_id: Optional[str] = None,
+                    reused_from_run_id: Optional[str] = None, reused_from_task_id: Optional[str] = None,
+                    input_fingerprint: Optional[str] = None,
+                    result_fingerprint: Optional[str] = None) -> None:
         if status not in TASK_STATUSES:
             raise StoreError(f"unknown task status: {status}")
         event = {"SUCCESS": "TASK_COMPLETED", "NO_CHANGE_REQUIRED": "TASK_NO_CHANGE_REQUIRED",
                  "AI_REQUIRED": "TASK_AI_REQUIRED", "FAILED": "TASK_FAILED"}.get(status, "TASK_COMPLETED")
         with self.connection:
-            self.connection.execute("UPDATE tasks SET status=?, completed_at=?, failure_category=?"
-                                    " WHERE run_id=? AND task_id=?",
-                                    (status, _now(), _clean(failure_category, "failure_category"), run_id, task_id))
+            self.connection.execute(
+                "UPDATE tasks SET status=?, completed_at=?, failure_category=?, execution_source=?,"
+                " cache_entry_id=?, reused_from_run_id=?, reused_from_task_id=?, input_fingerprint=?,"
+                " result_fingerprint=? WHERE run_id=? AND task_id=?",
+                (status, _now(), _clean(failure_category, "failure_category"),
+                 _clean(execution_source, "execution_source"), _clean(cache_entry_id, "cache_entry_id"),
+                 _clean(reused_from_run_id, "reused_from_run_id"), _clean(reused_from_task_id, "reused_from_task_id"),
+                 _clean(input_fingerprint, "input_fingerprint", max_len=64),
+                 _clean(result_fingerprint, "result_fingerprint", max_len=64), run_id, task_id))
             self._event(run_id, event, task_id=task_id, payload={"status": status, "failure_category": failure_category})
+            if execution_source == "CACHE":
+                self._event(run_id, "TASK_REUSED", task_id=task_id,
+                            payload={"cache_entry_id": cache_entry_id, "reused_from_run_id": reused_from_run_id,
+                                     "reused_from_task_id": reused_from_task_id})
+
+    def cache_event(self, run_id: str, event_type: str, *, task_id: Optional[str] = None,
+                    payload: Optional[dict[str, Any]] = None) -> None:
+        """Bounded cache operational timeline event (CACHE_HIT/MISS/REJECTED/WRITTEN)."""
+        if event_type not in EVENT_TYPES:
+            raise StoreError(f"unknown event type: {event_type}")
+        with self.connection:
+            self._event(run_id, event_type, task_id=task_id, payload=payload)
 
     def record_attempt(self, run_id: str, task_id: str, *, attempt_no: int, backend: Optional[str],
                        provider: Optional[str], model: Optional[str], native_effort: Optional[str],
@@ -403,6 +437,23 @@ class OrchestrationStore:
             " JOIN runs r ON r.run_id=t.run_id WHERE t.run_id=? GROUP BY t.status", (run_id,)).fetchall()
         return {"run_id": run_id, "tasks_by_status": {r["status"]: r["n"] for r in row}}
 
+    def reuse_summary(self, run_id: str) -> dict[str, Any]:
+        """Reuse provenance from a run without parsing CLI prose: which tasks executed,
+        were TOOL_ONLY, were AI, and which reused a cache entry and from where."""
+        rows = self.connection.execute(
+            "SELECT task_id, executor_type, status, execution_source, reused_from_run_id,"
+            " reused_from_task_id, input_fingerprint, result_fingerprint FROM tasks"
+            " WHERE run_id=? ORDER BY task_id", (run_id,)).fetchall()
+        reused = [r["task_id"] for r in rows if r["execution_source"] == "CACHE"]
+        return {"run_id": run_id,
+                "tasks": [dict(r) for r in rows],
+                "executed": [r["task_id"] for r in rows if r["execution_source"] == "EXECUTED"],
+                "tool_only": [r["task_id"] for r in rows if r["executor_type"] == "TOOL_ONLY"],
+                "ai": [r["task_id"] for r in rows if r["executor_type"] == "AI"],
+                "reused": reused,
+                "reused_from": {r["task_id"]: r["reused_from_run_id"] for r in rows
+                                if r["execution_source"] == "CACHE"}}
+
     def legacy_observation_excluded(self, observation_id: str) -> bool:
         return observation_id in LEGACY_SEMANTIC_INVALID_OBSERVATIONS
 
@@ -472,7 +523,31 @@ def persist_run(plan: dict[str, Any], report: dict[str, Any], *, machine_id: str
                              completion_signal=attempt.get("completion_signal"))
     for task_id, result in (report.get("nodes") or {}).items():
         store.finish_task(run_id, task_id, result.get("status", "FAILED"),
-                          failure_category=result.get("failure_category"))
+                          failure_category=result.get("failure_category"),
+                          execution_source=result.get("execution_source"),
+                          cache_entry_id=result.get("cache_entry_id"),
+                          reused_from_run_id=result.get("reused_from_run_id"),
+                          reused_from_task_id=result.get("reused_from_task_id"),
+                          input_fingerprint=result.get("input_fingerprint"),
+                          result_fingerprint=result.get("result_fingerprint"))
+    cache = report.get("cache") or {}
+    if cache.get("decisions"):
+        for decision in cache["decisions"]:
+            task_id = decision.get("task_id")
+            kind = decision.get("decision")
+            if kind == "CACHE_WRITTEN":
+                store.cache_event(run_id, "CACHE_ENTRY_WRITTEN", task_id=task_id,
+                                  payload={"cache_entry_id": decision.get("cache_entry_id")})
+            elif kind == "WRITE_REJECTED":
+                store.cache_event(run_id, "CACHE_REJECTED", task_id=task_id,
+                                  payload={"reason": decision.get("reason")})
+            elif kind == "REUSE":
+                store.cache_event(run_id, "CACHE_HIT", task_id=task_id,
+                                  payload={"cache_entry_id": decision.get("cache_entry_id"),
+                                           "reason": decision.get("reason")})
+            else:  # RERUN
+                store.cache_event(run_id, "CACHE_MISS", task_id=task_id,
+                                  payload={"reason": decision.get("reason")})
     failed = report.get("final", {}).get("failed", 0)
     run_status = "SUCCEEDED" if not failed and not report.get("error") else "FAILED"
     store.finish_run(run_id, run_status, used_ai_calls=report.get("calls_used"),
