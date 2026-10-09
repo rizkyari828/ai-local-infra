@@ -22,5 +22,25 @@
     "codex-vscode": {"shares_config_with": "codex-cli"},
     "codex-desktop": {"shares_config_with": "codex-cli"}
   },
+  "backends": {
+    "opencode": {"providers": ["deepseek", "ollama", "anthropic", "openai"]},
+    "codex": {"providers": ["codex", "openai"]}
+  },
+  "failover": {
+    "FAST": [
+      {"backend": "opencode", "provider": "ollama", "model": "qwen3.6:27b-coding", "native_variant": "low"}
+    ],
+    "BALANCED": [
+      {"backend": "opencode", "provider": "ollama", "model": "qwen3.6:27b-coding", "native_variant": "medium"}
+    ],
+    "STRONG": [
+      {"backend": "opencode", "provider": "deepseek", "model": "deepseek-flash", "native_variant": "high"},
+      {"backend": "codex", "provider": "codex", "model": null, "native_variant": "high"}
+    ],
+    "MAX": [
+      {"backend": "codex", "provider": "codex", "model": null, "native_variant": "max"},
+      {"backend": "opencode", "provider": "deepseek", "model": "deepseek-flash", "native_variant": "max"}
+    ]
+  },
   "manual_overrides": []
 }

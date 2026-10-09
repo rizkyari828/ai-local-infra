@@ -22,6 +22,7 @@ from typing import Any, Optional
 import infra  # scripts/common, on sys.path
 import routing  # scripts/common, on sys.path
 import discovery  # scripts/common, on sys.path
+import failover  # scripts/common, on sys.path
 import derived_knowledge as knowledge  # scripts/common, on sys.path
 import evidence  # scripts/common, on sys.path
 
@@ -203,20 +204,39 @@ def backend_for(name: str, *, timeout: int = 300) -> Backend:
 # --------------------------------------------------------------------------- #
 
 
-def resolve_plan(plan: dict[str, Any], backend: Backend, surface: Optional[str] = None) -> list[dict[str, Any]]:
+def resolve_plan(plan: dict[str, Any], backend: Backend, surface: Optional[str] = None, *,
+                 health: Optional[failover.Health] = None,
+                 constraints: Optional[dict[str, Any]] = None,
+                 backends: Optional[dict[str, Backend]] = None) -> list[dict[str, Any]]:
     resolutions = []
     for node in plan["nodes"]:
         tier = node["routing"]["tier"]
-        resolution = routing.resolve_model(tier, routing.load_policy())
-        resolved = backend.resolve(node, resolution["provider"], resolution["model"],
-                                   node["routing"]["effort"])
-        capability = None
-        if surface:
-            capability = discovery.capability(resolution["provider"], resolution["model"], surface)["status"]
-        resolved.update({"task_id": node["task_id"], "tier": tier,
-                         "capability_status": capability,
-                         "runnable": bool(backend.available() and resolution["model"]) or backend.name == "fake"})
-        resolutions.append(resolved)
+        effort = node["routing"]["effort"]
+        if health is None:
+            resolution = routing.resolve_model(tier, routing.load_policy())
+            resolved = backend.resolve(node, resolution["provider"], resolution["model"], effort)
+            capability = None
+            if surface:
+                capability = discovery.capability(resolution["provider"], resolution["model"], surface)["status"]
+            resolved.update({"task_id": node["task_id"], "tier": tier, "capability_status": capability,
+                             "runnable": bool(backend.available() and resolution["model"]) or backend.name == "fake"})
+            resolutions.append(resolved)
+            continue
+        # Runtime-availability-aware, capability-preserving candidate resolution.
+        specs = failover.candidates_for_tier(tier)
+        candidates = failover.resolve(tier, effort, specs, health, constraints=constraints)
+        selected = failover.select(candidates)
+        runnable = bool(selected and (backends is None or selected["backend"] in backends))
+        resolutions.append({
+            "task_id": node["task_id"], "tier": tier, "effort": effort, "candidates": candidates,
+            "backend": selected["backend"] if selected else None,
+            "provider": selected["provider"] if selected else None,
+            "model": selected.get("model") if selected else None,
+            "native_variant": selected.get("native_variant") if selected else None,
+            "capability_status": selected["status"] if selected else None,
+            "runnable": runnable,
+            "reason": None if runnable else "NO_CAPABILITY_PRESERVING_FALLBACK",
+        })
     return resolutions
 
 
@@ -266,7 +286,10 @@ def execute_plan(plan: dict[str, Any], *, backend: Backend, run_id: Optional[str
                  confirm: bool = False, dry_run: bool = False, allow_dirty: bool = False,
                  surface: Optional[str] = None, record_evidence: bool = True,
                  infra_retries: int = 1, same_tier_retries: int = 1, resume: bool = False,
-                 read_only: bool = False, max_ai_calls: Optional[int] = None) -> dict[str, Any]:
+                 read_only: bool = False, max_ai_calls: Optional[int] = None,
+                 backends: Optional[dict[str, Backend]] = None,
+                 health: Optional[failover.Health] = None,
+                 constraints: Optional[dict[str, Any]] = None) -> dict[str, Any]:
     if not plan.get("valid"):
         raise ExecutionError("refusing to execute an invalid plan")
     if not confirm and not dry_run:
@@ -274,7 +297,11 @@ def execute_plan(plan: dict[str, Any], *, backend: Backend, run_id: Optional[str
     repo_root = pathlib.Path(repo_root or ROOT)
     state = repo_state(repo_root)
     enforce_read_only = read_only or plan.get("intent") == "READ_ONLY"
-    bindings = resolve_plan(plan, backend, surface)
+    backend_registry: dict[str, Backend] = dict(backends or {})
+    if backend is not None:
+        backend_registry.setdefault(backend.name, backend)
+    bindings = resolve_plan(plan, backend, surface, health=health, constraints=constraints,
+                            backends=backend_registry)
     bounds = call_bounds(plan, infra_retries=infra_retries, same_tier_retries=same_tier_retries)
 
     report: dict[str, Any] = {"run_id": run_id, "backend": backend.name, "dry_run": dry_run,
@@ -289,9 +316,10 @@ def execute_plan(plan: dict[str, Any], *, backend: Backend, run_id: Optional[str
             report["diagnostics"] = conflicts
             return report
     if any(not binding["runnable"] for binding in bindings):
-        report["error"] = "NO_COMPATIBLE_EXECUTION_BACKEND for one or more nodes"
-        report["nodes"] = {b["task_id"]: {"status": "NO_COMPATIBLE_EXECUTION_BACKEND",
-                                          "required_tier": b["tier"]} for b in bindings if not b["runnable"]}
+        reason = next((binding.get("reason") for binding in bindings if not binding["runnable"]), None)
+        report["error"] = reason or "NO_COMPATIBLE_EXECUTION_BACKEND"
+        report["nodes"] = {b["task_id"]: {"status": report["error"], "required_tier": b["tier"]}
+                           for b in bindings if not b["runnable"]}
         return report
     if dry_run:
         report["remaining_calls"] = max_ai_calls
@@ -335,7 +363,10 @@ def execute_plan(plan: dict[str, Any], *, backend: Backend, run_id: Optional[str
                                          state_dir=state_dir, record_evidence=record_evidence,
                                          infra_retries=infra_retries, same_tier_retries=same_tier_retries,
                                          surface=backend.name, budget=budget,
-                                         enforce_read_only=enforce_read_only, repo_root=repo_root)
+                                         enforce_read_only=enforce_read_only, repo_root=repo_root,
+                                         candidates=resolutions[task_id].get("candidates"),
+                                         backends=backend_registry, health=health,
+                                         constraints=constraints)
         except KeyboardInterrupt:
             results[task_id] = {"status": CANCELLED, "task_id": task_id}
             _mark_not_run(plan, task_id, results)
@@ -377,7 +408,8 @@ def _conditional_active(node: dict[str, Any], deps: list[str], results: dict[str
 
 def _run_node(node, deps, results, backend, resolution, *, state_dir, record_evidence,
               infra_retries, same_tier_retries, surface, budget, enforce_read_only,
-              repo_root) -> dict[str, Any]:
+              repo_root, candidates=None, backends=None, health=None,
+              constraints=None) -> dict[str, Any]:
     tier = node["routing"]["tier"]
     initial_tier = tier
     if enforce_read_only and node.get("intent") == "MUTATING":
@@ -390,6 +422,15 @@ def _run_node(node, deps, results, backend, resolution, *, state_dir, record_evi
                 "failure_category": "CALL_BUDGET_EXHAUSTED",
                 "summary": "hard AI-call budget exhausted before launch",
                 "initial_tier": initial_tier, "final_tier": tier, "attempts": 0, "escalated": False}
+    registry: dict[str, Backend] = dict(backends or {})
+    if backend is not None:
+        registry.setdefault(backend.name, backend)
+    candidate = {"backend": (resolution or {}).get("backend") or backend.name,
+                 "provider": (resolution or {}).get("provider"),
+                 "model": (resolution or {}).get("model"),
+                 "native_variant": (resolution or {}).get("native_variant"),
+                 "tier": tier, "effort": node["routing"]["effort"]}
+    current_backend = registry.get(candidate["backend"], backend)
     dependency_summaries = [{"task_id": dep, "summary": results.get(dep, {}).get("summary", "")}
                             for dep in deps]
     attempt = 0
@@ -397,8 +438,8 @@ def _run_node(node, deps, results, backend, resolution, *, state_dir, record_evi
     execution_id = uuid.uuid4().hex
     before = _worktree_paths(repo_root) if enforce_read_only else None
     decision_id = evidence.start(task_family=node["task_family"], task_class=node["task_class"],
-                                 surface=surface, provider=resolution["provider"], model=resolution["model"],
-                                 native_variant=resolution["native_variant"],
+                                 surface=surface, provider=candidate["provider"], model=candidate["model"],
+                                 native_variant=candidate["native_variant"],
                                  normalized_effort=(node["routing"]["effort"] or "").upper() or None,
                                  initial_tier=initial_tier,
                                  initial_effort=node["routing"]["effort"], state_dir=state_dir) \
@@ -410,9 +451,11 @@ def _run_node(node, deps, results, backend, resolution, *, state_dir, record_evi
                              decision_id, resolution, state_dir, record_evidence)
         attempt += 1
         budget["used"] += 1
-        request = _request(node, resolution, dependency_summaries, execution_id, tier, backend,
+        res = {"provider": candidate["provider"], "model": candidate["model"],
+               "native_variant": candidate["native_variant"]}
+        request = _request(node, res, dependency_summaries, execution_id, tier, current_backend,
                            read_only=node.get("intent") == "READ_ONLY")
-        result = backend.execute(request)
+        result = current_backend.execute(request)
         if enforce_read_only:
             changed = sorted(_worktree_paths(repo_root) - (before or set()))
             if changed:
@@ -430,6 +473,14 @@ def _run_node(node, deps, results, backend, resolution, *, state_dir, record_evi
             if infra_used < infra_retries:
                 infra_used += 1
                 continue
+            # Capability-preserving backend failover (never downgrades the tier floor).
+            if candidates is not None and health is not None:
+                next_candidate = failover.failover(candidates, candidate, health, category)
+                if next_candidate and next_candidate["backend"] in registry:
+                    candidate = next_candidate
+                    current_backend = registry[next_candidate["backend"]]
+                    infra_used = 0
+                    continue
             return _finalize(node, result, FAILURE, category, initial_tier, tier, attempt, escalations,
                              decision_id, resolution, state_dir, record_evidence)
         if category == REASONING:
@@ -437,6 +488,14 @@ def _run_node(node, deps, results, backend, resolution, *, state_dir, record_evi
             if next_tier and escalations < 2:
                 tier = next_tier
                 escalations += 1
+                if health is not None:
+                    stronger = failover.resolve(next_tier, node["routing"]["effort"],
+                                                failover.candidates_for_tier(next_tier), health,
+                                                constraints=constraints)
+                    chosen = failover.select(stronger)
+                    if chosen and chosen["backend"] in registry:
+                        candidate = chosen
+                        current_backend = registry[chosen["backend"]]
                 continue
             return _finalize(node, result, FAILURE, category, initial_tier, tier, attempt, escalations,
                              decision_id, resolution, state_dir, record_evidence)

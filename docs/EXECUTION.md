@@ -130,6 +130,45 @@ and UI automation.
   non-intelligence categories: they never weaken a model's standing, and nodes never
   launched due to budget/policy are not recorded as model failures.
 
+## Capability-preserving backend failover (V0.1)
+
+Symbolic capability (tier/effort) is separate from runtime availability. Registry
+presence in `models/roles.yaml`/`config/model-capabilities.yaml` never implies a
+model is runnable. Resolution selects only candidates that are **actually runnable**:
+backend binary present, provider served by that backend, model installed/available,
+effort/variant supported, backend not in cooldown — and that **preserve the symbolic
+floor** (candidate tier/effort `>=` required).
+
+Runtime availability states (local, not Git): `BACKEND_HEALTHY`,
+`BACKEND_UNAVAILABLE`, `PROVIDER_UNAVAILABLE`, `MODEL_UNAVAILABLE`,
+`ACCOUNT_MODEL_UNSUPPORTED`, `TEMPORARILY_RATE_LIMITED`, `UNKNOWN`. Health checks are
+cheap (binary presence, local endpoints/inventory such as Ollama `/api/tags` and
+Headroom `/health`); they never send a completion request and never consume the
+AI-call budget.
+
+The portable candidate map lives in `config/model-capabilities.yaml`
+(`backends` = which providers each backend serves; `failover` = per-tier ordered
+candidates). Transient health/cooldowns stay local.
+
+- **Failover vs escalation**: infrastructure/availability failures
+  (`RATE_LIMIT`, `PROVIDER_503`, `TIMEOUT`, `ACCOUNT_MODEL_UNSUPPORTED`,
+  `MODEL_UNAVAILABLE`, `BACKEND_UNAVAILABLE`, `PROVIDER_UNAVAILABLE`) fail over to
+  another capability-preserving candidate. `REASONING_INSUFFICIENT` is **not**
+  failover — it is intelligence escalation. The two paths never mix.
+- **Capability floor**: a fallback must satisfy the same tier/effort floor. If only a
+  weaker candidate exists it is refused with `NO_CAPABILITY_PRESERVING_FALLBACK` —
+  never a silent downgrade.
+- **Circuit breaker**: a rate-limit/503 trips a bounded per-run cooldown for that
+  backend/provider; subsequent nodes in the same run skip it without spending
+  another call. No daemon, no permanent blacklist.
+- **Call budget**: failover consumes the same hard `--max-ai-calls` budget; health
+  checks cost zero; no failover can bypass the ceiling.
+- **User constraints** (`--local-only`, `--no-premium`, `--prefer-provider`,
+  `--prefer-model`) are honored as preferences/filters, never above safety. If a
+  preferred backend is unavailable and no alternative is permitted, execution stops.
+- **Same node only**: failover affects only the failing node; successful siblings are
+  not rerun.
+
 ## Live execution caveats (verified on Work Mac)
 
 - OpenCode/Codex backends are **non-interactive**; a worker that tries to use tools
