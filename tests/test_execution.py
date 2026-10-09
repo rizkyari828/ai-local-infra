@@ -58,6 +58,21 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual("UNKNOWN_FAILURE", execution.classify_failure(1, "kaboom"))
         self.assertIsNone(execution.classify_failure(0, ""))
 
+    def test_cli_backend_extracts_bounded_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = pathlib.Path(tmp) / "fakeopencode"
+            binary.write_text("#!/bin/sh\necho '{\"reply\":\"ok\"}'\n", encoding="utf-8")
+            binary.chmod(0o755)
+            backend = execution.CliBackend("opencode", str(binary))
+            request = {"task_id": "T1", "execution_id": "e1", "task_family": "f",
+                       "task_class": "MECHANICAL", "tier": "FAST", "provider": "p", "model": "m",
+                       "native_variant": "low", "objective_summary": "x", "acceptance_criteria": ["a"],
+                       "dependency_summaries": [], "knowledge_refs": [], "context_manifest": [],
+                       "working_dir": tmp, "prompt": "x"}
+            result = backend.execute(request)
+        self.assertEqual("SUCCESS", result["status"])
+        self.assertEqual("agent_reported", result["completion_signal"])
+
     def test_unsupported_backend_reports_no_compatible(self) -> None:
         class Dead(execution.Backend):
             name = "dead"
@@ -118,6 +133,17 @@ class DagExecutionTests(unittest.TestCase):
                                                         "new_risk_signals": ["architecture-ambiguity"]}]})
         plan, report = self._run(backend)
         self.assertEqual("SUCCESS", report["nodes"]["T3E"]["status"])
+
+    def test_success_not_inferred_without_completion_signal(self) -> None:
+        class NoSignal(execution.Backend):
+            name = "nosignal"
+            mode = "SUPPORTED"
+            def available(self): return True
+            def execute(self, request): return {"task_id": request["task_id"], "status": "SUCCESS"}
+        plan = orchestrator.decompose(MIXED)
+        report = execution.execute_plan(plan, backend=NoSignal(), state_dir=self.state,
+                                        repo_root=self.root, confirm=True, record_evidence=False)
+        self.assertNotEqual("SUCCESS", report["nodes"]["T1"]["status"])
 
     def test_resume_skips_successful_nodes(self) -> None:
         first = execution.FakeBackend(script={"T3": [{"status": "FAILURE", "failure_category": "UNKNOWN_FAILURE"}]})

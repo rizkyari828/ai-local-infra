@@ -93,6 +93,8 @@ class FakeBackend(Backend):
         result = dict(outcome)
         result.setdefault("task_id", request["task_id"])
         result.setdefault("status", SUCCESS)
+        if result.get("status") == SUCCESS:
+            result.setdefault("completion_signal", "agent_reported")
         result["provider"] = request["provider"]
         result["model"] = request["model"]
         return result
@@ -148,10 +150,17 @@ class CliBackend(Backend):
             return {"task_id": request["task_id"], "status": FAILURE, "failure_category": "UNKNOWN_FAILURE",
                     "summary": f"backend error: {type(exc).__name__}"}
         category = classify_failure(completed.returncode, completed.stderr)
-        status = SUCCESS if completed.returncode == 0 and not category else FAILURE
-        return {"task_id": request["task_id"], "status": status, "failure_category": category,
-                "summary": (completed.stdout or "")[-400:] if status == SUCCESS else (completed.stderr or "")[-400:],
-                "acceptance_results": {}, "files_changed": [], "decisions": [], "new_risk_signals": []}
+        if completed.returncode == 0 and not category:
+            output = (completed.stdout or "").strip()
+            if not output:
+                return {"task_id": request["task_id"], "status": "UNKNOWN",
+                        "summary": "backend produced no output"}
+            return {"task_id": request["task_id"], "status": SUCCESS,
+                    "completion_signal": "agent_reported", "summary": output[-400:],
+                    "acceptance_results": {}, "files_changed": [], "decisions": [], "new_risk_signals": []}
+        return {"task_id": request["task_id"], "status": FAILURE, "failure_category": category or "UNKNOWN_FAILURE",
+                "summary": (completed.stderr or "")[-400:], "acceptance_results": {},
+                "files_changed": [], "decisions": [], "new_risk_signals": []}
 
 
 def classify_failure(returncode: int, stderr: str = "") -> Optional[str]:
@@ -337,8 +346,7 @@ def _run_node(node, deps, results, backend, resolution, *, state_dir, record_evi
         result = backend.execute(request)
         category = result.get("failure_category")
         status = result.get("status", FAILURE)
-        acceptance = result.get("acceptance_results") or {}
-        validated = status == SUCCESS and _acceptance_ok(node, acceptance)
+        validated = _is_success(node, result)
         if validated:
             return _finalize(node, result, SUCCESS, None, initial_tier, tier, attempt, escalations,
                              decision_id, resolution, state_dir, record_evidence)
@@ -363,11 +371,15 @@ def _run_node(node, deps, results, backend, resolution, *, state_dir, record_evi
                          attempt, escalations, decision_id, resolution, state_dir, record_evidence)
 
 
-def _acceptance_ok(node: dict[str, Any], acceptance: dict[str, Any]) -> bool:
-    criteria = node["acceptance_criteria"]
-    if not criteria:
-        return True
-    return all(acceptance.get(criterion, False) for criterion in criteria)
+def _is_success(node: dict[str, Any], result: dict[str, Any]) -> bool:
+    """SUCCESS requires a bounded completion signal; exit code alone is never enough.
+    When the backend supplies acceptance_results, all criteria must pass."""
+    if result.get("status") != SUCCESS or not result.get("completion_signal"):
+        return False
+    acceptance = result.get("acceptance_results")
+    if acceptance:
+        return all(acceptance.get(criterion, False) for criterion in node["acceptance_criteria"])
+    return True
 
 
 def _request(node, resolution, dependency_summaries, execution_id, tier, backend) -> dict[str, Any]:
@@ -391,7 +403,7 @@ def _prompt(node, dependency_summaries) -> str:
 def _finalize(node, result, status, category, initial_tier, final_tier, attempts, escalations,
               decision_id, resolution, state_dir, record_evidence) -> dict[str, Any]:
     if record_evidence and decision_id:
-        completion = "acceptance_passed" if status == SUCCESS else None
+        completion = result.get("completion_signal") if status == SUCCESS else None
         try:
             evidence.finish(decision_id, outcome=status, completion_signal=completion,
                             final_tier=final_tier, final_effort=node["routing"]["effort"],
