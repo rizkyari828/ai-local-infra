@@ -17,3 +17,9 @@ source in `ai-local-infra/templates/codex/AGENTS.block.md`, not in this file.
 - Scope: inspect the minimum necessary context (targeted reads, and Graphify before
   broad scans). Do not perform unrelated cleanup or retry the same failed approach.
   Headroom compression is independent; never add its savings to routing savings.
+- Derived knowledge: before a broad or expensive investigation, classify the task
+  and consult relevant derived knowledge (`./scripts/route`), reusing verified
+  lessons instead of rediscovering known failure causes. After a meaningful task,
+  optionally record a bounded outcome (`./scripts/learn record`) — never for every
+  `git status`/read, and never with prompts, responses, or secrets. Learning is
+  local evidence plus Git-shared distilled knowledge; it never auto-promotes.

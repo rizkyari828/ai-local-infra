@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "families_version": "0.1.0",
+  "notes": "Portable task-family catalogue. Maps a family to its default task class and cheap keyword signals used to associate a free-text task with a family. Surface-neutral: a family is shared across OpenCode and all Codex surfaces.",
+  "families": [
+    {"task_family": "safe_git_operation", "task_class": "MECHANICAL",
+     "keywords": ["git status", "git push", "git commit", "reviewed commits", "push"],
+     "safety_sensitive": false},
+    {"task_family": "report_recovery_validation", "task_class": "MECHANICAL",
+     "keywords": ["final report", "acceptance report", "recovery"], "safety_sensitive": false},
+    {"task_family": "multi_machine_acceptance", "task_class": "CORRECTNESS_SENSITIVE",
+     "keywords": ["multi-machine", "cross-machine acceptance", "acceptance"], "safety_sensitive": false},
+    {"task_family": "configuration_resolution", "task_class": "CORRECTNESS_SENSITIVE",
+     "keywords": ["configuration resolver", "config resolver", "nested configuration",
+                  "config resolution", "precedence"], "safety_sensitive": false},
+    {"task_family": "runtime_path_alignment", "task_class": "CORRECTNESS_SENSITIVE",
+     "keywords": ["runtime path", "graphify path", "canonical graph path", "path alignment"],
+     "safety_sensitive": false},
+    {"task_family": "cross_platform_runtime_bootstrap", "task_class": "CORRECTNESS_SENSITIVE",
+     "keywords": ["bootstrap launcher", "python runtime", "portable launcher",
+                  "supported python"], "safety_sensitive": false},
+    {"task_family": "codex_model_availability", "task_class": "NORMAL",
+     "keywords": ["model availability", "codex model", "account model"], "safety_sensitive": false},
+    {"task_family": "security_sensitive_design", "task_class": "CRITICAL",
+     "keywords": ["security", "authentication architecture", "auth architecture",
+                  "authorization", "access control"], "safety_sensitive": true},
+    {"task_family": "concurrency_correctness", "task_class": "CORRECTNESS_SENSITIVE",
+     "keywords": ["concurrency", "race condition", "deadlock"], "safety_sensitive": true},
+    {"task_family": "persistence_correctness", "task_class": "CORRECTNESS_SENSITIVE",
+     "keywords": ["migration", "persistence", "transaction", "idempotency", "data integrity"],
+     "safety_sensitive": true}
+  ]
+}

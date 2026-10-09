@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "failures_version": "0.1.0",
+  "notes": "Verified non-intelligence failure/remediation lessons. Every entry states whether it may influence model-intelligence escalation; infrastructure, safety-guard, session, and availability failures must not.",
+  "failures": [
+    {"failure_id": "provider-503-infra",
+     "condition": "provider.internal / HTTP 503",
+     "category": "PROVIDER_503",
+     "intelligence_escalation": false,
+     "lesson": "Do not upgrade model intelligence merely because the provider endpoint is temporarily unavailable.",
+     "remediation": null},
+    {"failure_id": "dirty-worktree-graph-rebuild",
+     "condition": "Graphify provenance rebuild refused because the Git worktree was dirty",
+     "category": "SAFETY_GUARD",
+     "intelligence_escalation": false,
+     "lesson": "Commit or otherwise resolve intended source changes, then rebuild on a clean tree. Do not change model merely because the safety guard refused execution.",
+     "remediation": "Resolve intended changes and rebuild on a clean worktree."},
+    {"failure_id": "codex-desktop-stale-session",
+     "condition": "New PATH and MCP configuration existed, but the active Desktop session retained the old environment/tool registry",
+     "category": "STALE_SESSION",
+     "intelligence_escalation": false,
+     "lesson": "A stale surface session is a lifecycle issue, not a model capability signal.",
+     "remediation": "Fully restart Codex Desktop and create a fresh session."},
+    {"failure_id": "account-model-unsupported",
+     "condition": "Codex account rejected the configured model with 'not supported for this account'",
+     "category": "ACCOUNT_MODEL_UNSUPPORTED",
+     "intelligence_escalation": false,
+     "lesson": "This is availability evidence, not evidence that model reasoning is insufficient.",
+     "remediation": "Select a model the account supports; record the model as UNAVAILABLE, not weak.",
+     "provider": "codex",
+     "model": "gpt-5.4"}
+  ]
+}

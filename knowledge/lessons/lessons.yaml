@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "lessons_version": "0.1.0",
+  "notes": "Concise, portable, tool-neutral engineering lessons. Shared across OpenCode and every Codex surface. No prompts, secrets, or machine-specific absolute paths.",
+  "lessons": [
+    {"lesson_id": "graphify-canonical-runtime-path",
+     "title": "Use the canonical external Graphify graph",
+     "lesson": "All active runtime consumers must use the canonical external graphify-out/graph.json; no legacy graph path may remain an active consumer; never share machine-specific absolute paths.",
+     "tags": ["graphify"], "surface_neutral": true},
+    {"lesson_id": "graphify-clean-tree-provenance",
+     "title": "Graph rebuild requires a clean worktree",
+     "lesson": "An explicit graph rebuild requires a clean Git worktree; a HEAD change makes provenance stale; rebuild explicitly after a clean commit; status/apply never auto-rebuild.",
+     "tags": ["graphify", "git"], "surface_neutral": true},
+    {"lesson_id": "explicit-machine-selection",
+     "title": "Machine identity is explicit",
+     "lesson": "LAI_MACHINE must be provided explicitly; never guess machine identity from hostname.",
+     "tags": ["multi-machine"], "surface_neutral": true},
+    {"lesson_id": "codex-desktop-wsl",
+     "title": "Codex Desktop on Windows + WSL keeps runtime state local",
+     "lesson": "Windows Codex Desktop may use a Windows-local CODEX_HOME while command execution happens in WSL. Do not copy a complete WSL ~/.codex into Windows; auth/session/runtime state remains local.",
+     "tags": ["codex", "surface"], "surface_neutral": true},
+    {"lesson_id": "bootstrap-python-runtime",
+     "title": "Bootstrap selects a supported Python",
+     "lesson": "scripts/bootstrap requires Python >= 3.11 and selects a supported interpreter; there is no implicit Python download or install.",
+     "tags": ["bootstrap"], "surface_neutral": true},
+    {"lesson_id": "runtime-state-local",
+     "title": "Runtime state stays local; only distilled knowledge is shared",
+     "lesson": "Sessions, auth, cache, generated graph, and the local evidence DB remain machine-local; only distilled portable knowledge is shared through Git.",
+     "tags": ["privacy", "multi-machine"], "surface_neutral": true}
+  ]
+}

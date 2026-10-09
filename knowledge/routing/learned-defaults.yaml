@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "defaults_version": "0.1.0",
+  "notes": "Approved, human-promoted learned defaults. A learned default may influence a task family's initial tier/effort only when it is approved and never below the classification safety floor or a user override. Historical observations alone never create a default. Start conservative; promote only through the reviewed workflow (./scripts/learn promote --apply).",
+  "policy": {
+    "min_samples": 3,
+    "min_success_ratio": 0.8,
+    "require_human_review": true,
+    "safety_floor": {"MECHANICAL": "FAST", "NORMAL": "FAST", "CORRECTNESS_SENSITIVE": "STRONG", "CRITICAL": "MAX"}
+  },
+  "defaults": []
+}

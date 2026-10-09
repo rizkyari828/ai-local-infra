@@ -254,6 +254,8 @@ def recommend(task: str = "", *, task_class: Optional[str] = None,
     _, tier_order = _orders(policy)
     rec = requirement(task, task_class=task_class, requested_effort=requested_effort,
                       requested_tier=requested_tier, policy=policy)
+    rec["requested_tier"] = normalize_tier(requested_tier, policy) if requested_tier else None
+    rec["requested_effort"] = normalize_effort(requested_effort, policy) if requested_effort else None
     resolution = resolve_model(rec["recommended_tier"], policy, registry)
     rec.update({"role": resolution["role"], "model": resolution["model"],
                 "provider": resolution["provider"], "resolved": resolution["resolved"]})

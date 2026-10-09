@@ -21,6 +21,33 @@ import sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "common"))
 import routing  # noqa: E402
 import discovery  # noqa: E402
+import derived_knowledge as knowledge  # noqa: E402
+
+
+def _knowledge_fields(rec: dict, task: str, policy: dict) -> None:
+    """Attach advisory historical evidence, lessons, and any approved learned
+    default. Learned defaults never drop below the safety floor or user override."""
+    rec["task_family"] = None
+    rec["historical_evidence"] = None
+    rec["relevant_lessons"] = []
+    rec["learned_default"] = None
+    rec["learned_default_applied"] = False
+    try:
+        rec["task_family"] = knowledge.task_family_for(task)
+        knowledge.apply_learned_default(rec)
+        if rec.get("learned_default_applied"):
+            resolution = routing.resolve_model(rec["recommended_tier"], policy)
+            rec.update({"role": resolution["role"], "model": resolution["model"],
+                        "provider": resolution["provider"], "resolved": resolution["resolved"]})
+        observations = knowledge.observations_for_family(rec["task_family"])
+        rec["historical_evidence"] = {
+            "task_family": rec["task_family"], "samples": len(observations),
+            "confidence": observations[0].get("confidence") if observations else None,
+            "source": observations[0].get("source") if observations else None,
+        }
+        rec["relevant_lessons"] = [lesson["lesson_id"] for lesson in knowledge.relevant_lessons(task)]
+    except knowledge.KnowledgeError:
+        pass
 
 
 def _capability_fields(rec: dict, surface: str | None) -> None:
@@ -74,6 +101,7 @@ def cmd_route(args: argparse.Namespace) -> int:
         rec["task_class"], same_tier_attempts=args.attempts,
         succeeded=args.succeeded, policy=policy)
     rec["next_step"] = step
+    _knowledge_fields(rec, args.task or "", policy)
     _capability_fields(rec, args.surface)
     if args.json:
         print(json.dumps(rec, indent=2, ensure_ascii=False))
@@ -88,6 +116,17 @@ def cmd_route(args: argparse.Namespace) -> int:
               + (f" (source: {rec['capability_source']})" if rec.get("capability_source") else ""))
         if rec.get("effort_status"):
             print(f"EFFORT STATUS: {rec['recommended_effort'].upper()} {rec['effort_status']}")
+    if rec.get("task_family"):
+        evidence = rec.get("historical_evidence") or {}
+        detail = f"{evidence.get('samples', 0)} observation(s)"
+        if evidence.get("confidence"):
+            detail += f", confidence {evidence['confidence']}"
+        print(f"HISTORICAL EVIDENCE: {rec['task_family']} ({detail})")
+        if rec.get("relevant_lessons"):
+            print(f"RELEVANT LESSONS: {', '.join(rec['relevant_lessons'])}")
+        learned = rec.get("learned_default")
+        state = "applied" if rec.get("learned_default_applied") else ("available" if learned else "none")
+        print(f"LEARNED DEFAULT: {state}")
     if args.surface:
         print(f"SURFACE: {args.surface} ({rec.get('capability')})")
         print(f"SURFACE AVAILABILITY: {rec.get('availability')}")
