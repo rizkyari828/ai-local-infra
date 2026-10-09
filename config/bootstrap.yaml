@@ -25,6 +25,20 @@
     "binary": "graphify",
     "warn_only": true
   },
+  "doctor": {
+    "notes": "Read-only runtime readiness (V0.1). Versions/capabilities come from config/tool-baseline.yaml. `required` false yields SKIP for absent pieces; true yields FAIL for missing required pieces. timeouts bound every version probe and health request.",
+    "timeouts": {
+      "version_seconds": 5,
+      "health_seconds": 3
+    },
+    "components": {
+      "opencode": {"required": true},
+      "codex": {"required": true},
+      "rtk": {"required": true, "integration_files": ["{{codex.agents_path}}", "~/.codex/RTK.md"]},
+      "graphify": {"required": true},
+      "headroom": {"required": true}
+    }
+  },
   "disabled_units": [],
   "units": [
     {

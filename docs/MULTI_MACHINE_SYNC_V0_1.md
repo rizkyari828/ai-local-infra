@@ -680,3 +680,92 @@ verification. Nothing rebuilds automatically.
 Cross-machine runtime verification (work-mac and home-wsl), RTK AUTO runtime
 verification, Graphify AUTO agent behavior, and Headroom health/integration are M4.
 M3 makes no home-wsl runtime claims.
+
+## 18. Runtime Doctor V0.1 (delivered)
+
+Answers one question read-only: **"Is this machine ready for AI coding right
+now?"** It is diagnostic only and mutates nothing.
+
+```bash
+LAI_MACHINE=work-mac ./scripts/bootstrap doctor
+LAI_MACHINE=work-mac ./scripts/bootstrap doctor --json
+```
+
+### Doctor vs status
+
+Three commands, three semantics, deliberately separate:
+
+- `bootstrap status` — declarative desired-state alignment (`ALIGNED / DRIFTED /
+  MISSING / LOCAL-OVERRIDE / STALE / BLOCKED`).
+- `bootstrap graph status` — Graphify provenance/freshness only.
+- `bootstrap doctor` — runtime readiness (`PASS / WARN / FAIL / SKIP`).
+
+Doctor never applies config, creates backups, rebuilds Graphify, starts/stops
+Headroom (or anything else), launches OpenCode/Codex agent tasks, edits shell
+config, installs/updates tools, or writes repo files. It does not reuse bootstrap
+drift states; their semantics differ.
+
+### Diagnostic statuses
+
+- `PASS` — runtime prerequisite is healthy.
+- `WARN` — usable but outside the tested baseline, or a non-critical capability
+  missing (for example a dirty worktree or an unverified newer tool version).
+- `FAIL` — a required runtime prerequisite is broken.
+- `SKIP` — not applicable or intentionally unavailable (component not required).
+
+`repository.worktree` is `WARN` when dirty — coding normally dirties a tree, so a
+dirty tree never fails doctor. Graphify freshness may separately become `STALE`.
+
+### Exit codes
+
+- `0` — no `FAIL` checks (`PASS`/`WARN`/`SKIP` permitted); `ready` is true.
+- `1` — one or more `FAIL` checks; `ready` is false.
+- `2` — doctor could not execute (missing `LAI_MACHINE`, unknown machine,
+  unreadable config/command failure).
+
+### Known-good baseline
+
+`config/tool-baseline.yaml` is the declarative, versioned tested baseline (schema
+1) describing the versions and capabilities actually verified on the approved
+commit. It is a **tested baseline, not a hard pin**:
+
+- installed version `==` verified → `PASS`/verified.
+- installed version differs (newer or older) → `WARN` (exact-match is the safe
+  V0.1 default deliberately). Doctor never upgrades or downgrades anything.
+
+Versions legitimately differ per machine, so each tool's `verified_version` is the
+default (work-mac verified) and an optional `per_machine` map overrides it by
+machine id (for example `home-wsl`). Capability flags stay **separate** from
+versions: they record verified baseline behavior, never live runtime state.
+
+### Capability vs runtime AUTO
+
+The baseline capability flags (`rtk_auto`, `graphify_auto`, `headroom_proxy`,
+`headroom_mcp`, ...) record **verified baseline capability**, not live runtime
+state. Doctor reports current probes separately and never claims runtime AUTO from
+the baseline or from config alone. For example: RTK AUTO is baseline-verified and
+doctor reports the guidance/integration files present, but runtime AUTO is **not**
+re-tested by doctor.
+
+### Checked components
+
+Repository (HEAD, branch, clean/dirty, local remote-tracking alignment without
+network), bootstrap (managed-state alignment via `status` semantics + secret
+scan), OpenCode (binary, version, wrapper presence; never launches an agent),
+Codex (binary, version, `~/.codex` config paths readable; no account/model call),
+RTK (binary, version, integration files), Graphify (binary, version, external
+graph path safety + reused M3 freshness engine; never rebuilds), Headroom (binary,
+version, bounded HTTP `/health` on the configured loopback endpoint; never
+restarts), and the Codex Headroom MCP declaration (command resolvable; never
+executes the MCP or a model request).
+
+Requirement is per profile (`config/bootstrap.yaml` `doctor.components.<name>.required`;
+`false` yields `SKIP` for absent pieces). Doctor honors `LAI_MACHINE` and never
+guesses identity. It prints no secrets, tokens, credentials, full configs, or
+environment dumps.
+
+### Home WSL
+
+Portable support exists through the shared profile/config model, but **home-wsl is
+not runtime-verified here**. M4 home-wsl remains pending; doctor makes no home-wsl
+runtime claims and is not run against it in this milestone.

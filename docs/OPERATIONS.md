@@ -10,6 +10,10 @@ Real apply validates first. Qwen changes remain user-level. If the Ollama overri
 
 Backups are timestamped beneath `~/.local/state/local-ai-infra/backups/`. `rollback --dry-run` previews the newest backup; `rollback` restores it and restarts Ollama only if the system override was part of that backup. Keep this directory private because Qwen backups may contain credentials.
 
+## Runtime doctor (read-only)
+
+`LAI_MACHINE=work-mac ./scripts/bootstrap doctor` answers "is this machine ready for AI coding right now?" without mutating anything: no apply, no backups, no graph rebuild, no process start/stop, no agent launches. It reports `PASS`/`WARN`/`FAIL`/`SKIP` for repository, bootstrap, OpenCode, Codex, RTK, Graphify, Headroom, and the Codex Headroom MCP. `--json` emits a stable machine-readable report. Exit codes: `0` no `FAIL`, `1` some `FAIL`, `2` config/exec error. The tested baseline lives in `config/tool-baseline.yaml`; exact version match is `PASS`, any other version is `WARN` (never auto-upgrades/downgrades), and runtime AUTO is not re-proven. See [Multi-machine sync](MULTI_MACHINE_SYNC_V0_1.md) §18.
+
 ## Telemetry storage and hygiene
 
 v0.1 writes append-only JSONL. Each event is a flat, typed record with stable IDs, UTC time, event type, dimensions (project/client/model/profile/operation), numeric measures, outcome fields, and explicit runtime/config versions. The teacher/student extension adds `telemetry/escalations/runs.jsonl` with the same flat, null-capable shape, defined by `telemetry/schemas/escalation-run.schema.json`. See [Teacher/student learning loop](TEACHER_STUDENT_LOOP.md). This shape is intentionally friendly to columnar conversion:

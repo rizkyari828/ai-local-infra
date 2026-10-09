@@ -16,6 +16,7 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "common"))
 import bootstrap  # noqa: E402
+import doctor  # noqa: E402
 
 
 def with_machine(args: argparse.Namespace) -> dict[str, str]:
@@ -49,6 +50,10 @@ def cmd_graph_rebuild(args: argparse.Namespace) -> int:
     return bootstrap.cmd_graph_rebuild(with_machine(args))
 
 
+def cmd_doctor(args: argparse.Namespace) -> int:
+    return doctor.cmd_doctor(with_machine(args), as_json=args.json)
+
+
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     sub = result.add_subparsers(dest="command", required=True)
@@ -65,6 +70,8 @@ def parser() -> argparse.ArgumentParser:
     rollback_parser = add("rollback", "restore the latest bootstrap backup", cmd_rollback)
     rollback_parser.add_argument("--dry-run", action="store_true", help="preview the restore")
     add("secrets", "scan managed repo config/templates for obvious secrets", cmd_secrets)
+    doctor_parser = add("doctor", "read-only runtime readiness report (never mutates)", cmd_doctor)
+    doctor_parser.add_argument("--json", action="store_true", help="emit stable machine-readable JSON")
     graph = sub.add_parser("graph", help="graph freshness (read-only) and explicit rebuild")
     graph_sub = graph.add_subparsers(dest="graph_command", required=True)
     graph_status = graph_sub.add_parser("status", help="report graph freshness only")

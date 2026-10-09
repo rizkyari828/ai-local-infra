@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "baseline_version": "0.2.0",
+  "updated": "2026-10-09",
+  "notes": "Known-good tested baseline for the runtime doctor. This records versions and capabilities that were actually verified on each approved machine. It is a tested baseline, not a hard pin and not an enforcement target: doctor reports exact matches as PASS and any difference as WARN, never mutating, upgrading, or downgrading anything. Versions legitimately differ per machine under the multi-machine contract, so 'verified_version' is the default (work-mac verified) and the optional 'per_machine' map overrides it per machine id; capability flags stay separate from versions and describe verified baseline behavior, not live runtime state. Doctor must not claim runtime AUTO from this file alone. No secrets.",
+  "tools": {
+    "opencode": {
+      "binary": "opencode",
+      "wrapper": "oc",
+      "probe": ["--version"],
+      "verified_version": "1.18.35",
+      "per_machine": {
+        "home-wsl": "2.0.14"
+      },
+      "capability": {
+        "rtk_auto": true,
+        "graphify_auto": true,
+        "headroom_proxy": true,
+        "oc_wrapper": true
+      }
+    },
+    "codex": {
+      "binary": "codex",
+      "probe": ["--version"],
+      "verified_version": "0.159.3",
+      "per_machine": {
+        "home-wsl": "0.155.0"
+      },
+      "capability": {
+        "rtk": true,
+        "graphify": true,
+        "headroom_mcp": true
+      }
+    },
+    "rtk": {
+      "binary": "rtk",
+      "probe": ["--version"],
+      "verified_version": "0.49.0",
+      "capability": {
+        "filtered_shell": true
+      }
+    },
+    "graphify": {
+      "binary": "graphify",
+      "probe": ["--version"],
+      "verified_version": "0.9.65",
+      "per_machine": {
+        "home-wsl": "0.9.63"
+      },
+      "capability": {
+        "external_graph": true,
+        "provenance_manifest": true
+      }
+    },
+    "headroom": {
+      "binary": "headroom",
+      "probe": ["--version"],
+      "verified_version": "0.37.0",
+      "capability": {
+        "loopback_proxy": true,
+        "telemetry_disabled": true,
+        "memory_policy": true
+      }
+    }
+  }
+}
