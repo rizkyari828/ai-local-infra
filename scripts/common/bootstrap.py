@@ -11,6 +11,15 @@ and never restarts any process.
 
 from __future__ import annotations
 
+import sys
+
+if sys.version_info < (3, 11):  # stdlib tomllib; no vendored parser
+    raise SystemExit(
+        "local-ai-infra bootstrap requires Python >= 3.11 (found "
+        "{0}.{1}); use the scripts/bootstrap launcher or set LAI_PYTHON to a "
+        "supported interpreter.".format(*sys.version_info[:2])
+    )
+
 import copy
 import datetime as dt
 import functools

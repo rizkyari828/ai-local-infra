@@ -1,5 +1,24 @@
 # Operations
 
+## Python runtime
+
+`scripts/bootstrap` is a portable `sh` launcher over the standard-library-only
+Python CLI. It requires **Python >= 3.11** because `scripts/common/bootstrap.py`
+uses stdlib `tomllib`; Python 3.9/3.10 are rejected before import. The launcher
+finds an installed interpreter (`python3`, then `python3.13`/`python3.12`/
+`python3.11`), forwards all arguments and the exit code unchanged, never mutates
+`PATH`, and never installs or downloads a Python. Set `LAI_PYTHON=/path/to/python3`
+to force a specific interpreter. Running the module directly under an unsupported
+Python fails fast with a clear "requires Python >= 3.11" message.
+
+## Environment verification
+
+`./scripts/verify-environment` validates profiles, schemas, and limits (structural
+failures) and reports tool versions. It also probes the local Ollama endpoint
+`http://127.0.0.1:11434/api/tags`; an unreachable Ollama is an unrelated
+runtime-service failure (exit 1), **not** a Multi-Machine Sync blocker —
+`bootstrap status`/`apply`/`doctor` do not require Ollama.
+
 ## Inspect and apply
 
 Start with `./scripts/ai-profile status` or compare a profile explicitly with `--profile coding-routine`. `status` reports `MATCH`, `DRIFT`, or `UNKNOWN` for Qwen and Ollama and never repairs anything.

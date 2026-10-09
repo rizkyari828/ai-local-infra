@@ -1,96 +1,46 @@
-#!/usr/bin/env python3
-"""Status, dry-run, apply, and roll back portable multi-machine config.
+#!/bin/sh
+# Portable bootstrap launcher (multi-machine sync).
+#
+# Selects an already-installed CPython >= 3.11 and runs the Python CLI with the
+# original arguments and exit code. bootstrap.py uses stdlib ``tomllib``, which
+# only exists from Python 3.11; Python 3.9/3.10 are rejected up front instead of
+# failing with an obscure ``ModuleNotFoundError: tomllib``.
+#
+# It never mutates PATH, never installs anything, and never lets uv (or anything
+# else) download a Python. Set LAI_PYTHON to force an explicit interpreter.
+set -u
 
-Owns only declared managed blocks/keys, never whole user config directories.
-Reports Graphify freshness read-only (warn-only). Machine selection is explicit:
-set LAI_MACHINE (work-mac, home-wsl) or pass --machine. Status is read-only.
-See docs/MULTI_MACHINE_SYNC_V0_1.md.
-"""
+# Resolve this script's directory without relying on external tools.
+self=$0
+case $self in
+    */*) ;;
+    *) self=$(command -v "$self" 2>/dev/null) || self=$0 ;;
+esac
+here=${self%/*}
+[ "$here" = "$self" ] && here=.
+cli=$here/common/bootstrap_cli.py
 
-from __future__ import annotations
+version_ok() {
+    "$1" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null
+}
 
-import argparse
-import os
-import pathlib
-import sys
+if [ -n "${LAI_PYTHON:-}" ]; then
+    if version_ok "$LAI_PYTHON"; then
+        exec "$LAI_PYTHON" "$cli" "$@"
+    fi
+    printf 'bootstrap: LAI_PYTHON=%s is not a usable Python >= 3.11.\n' "$LAI_PYTHON" >&2
+    printf 'bootstrap: point LAI_PYTHON at an interpreter with tomllib (3.11+), e.g. python3.13.\n' >&2
+    exit 127
+fi
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "common"))
-import bootstrap  # noqa: E402
-import doctor  # noqa: E402
+# Prefer the generic python3 when it is new enough, then concrete versions.
+for cand in python3 python3.13 python3.12 python3.11; do
+    bin=$(command -v "$cand" 2>/dev/null) || continue
+    if version_ok "$bin"; then
+        exec "$bin" "$cli" "$@"
+    fi
+done
 
-
-def with_machine(args: argparse.Namespace) -> dict[str, str]:
-    env = dict(os.environ)
-    if getattr(args, "machine", None):
-        env["LAI_MACHINE"] = args.machine
-    return env
-
-
-def cmd_status(args: argparse.Namespace) -> int:
-    return bootstrap.cmd_status(with_machine(args))
-
-
-def cmd_apply(args: argparse.Namespace) -> int:
-    return bootstrap.cmd_apply(with_machine(args), dry_run=args.dry_run)
-
-
-def cmd_rollback(args: argparse.Namespace) -> int:
-    return bootstrap.cmd_rollback(with_machine(args), dry_run=args.dry_run)
-
-
-def cmd_secrets(args: argparse.Namespace) -> int:
-    return bootstrap.cmd_secrets()
-
-
-def cmd_graph_status(args: argparse.Namespace) -> int:
-    return bootstrap.cmd_graph_status(with_machine(args))
-
-
-def cmd_graph_rebuild(args: argparse.Namespace) -> int:
-    return bootstrap.cmd_graph_rebuild(with_machine(args))
-
-
-def cmd_doctor(args: argparse.Namespace) -> int:
-    return doctor.cmd_doctor(with_machine(args), as_json=args.json)
-
-
-def parser() -> argparse.ArgumentParser:
-    result = argparse.ArgumentParser(description=__doc__)
-    sub = result.add_subparsers(dest="command", required=True)
-
-    def add(name: str, help_text: str, func) -> argparse.ArgumentParser:
-        child = sub.add_parser(name, help=help_text)
-        child.add_argument("--machine", help="machine profile id (defaults to LAI_MACHINE)")
-        child.set_defaults(func=func)
-        return child
-
-    add("status", "read-only report of managed-unit states", cmd_status)
-    apply_parser = add("apply", "apply owned blocks/keys only", cmd_apply)
-    apply_parser.add_argument("--dry-run", action="store_true", help="preview without writing or backing up")
-    rollback_parser = add("rollback", "restore the latest bootstrap backup", cmd_rollback)
-    rollback_parser.add_argument("--dry-run", action="store_true", help="preview the restore")
-    add("secrets", "scan managed repo config/templates for obvious secrets", cmd_secrets)
-    doctor_parser = add("doctor", "read-only runtime readiness report (never mutates)", cmd_doctor)
-    doctor_parser.add_argument("--json", action="store_true", help="emit stable machine-readable JSON")
-    graph = sub.add_parser("graph", help="graph freshness (read-only) and explicit rebuild")
-    graph_sub = graph.add_subparsers(dest="graph_command", required=True)
-    graph_status = graph_sub.add_parser("status", help="report graph freshness only")
-    graph_status.add_argument("--machine", help="machine profile id (defaults to LAI_MACHINE)")
-    graph_status.set_defaults(func=cmd_graph_status)
-    graph_rebuild = graph_sub.add_parser("rebuild", help="explicitly rebuild the graph and write provenance")
-    graph_rebuild.add_argument("--machine", help="machine profile id (defaults to LAI_MACHINE)")
-    graph_rebuild.set_defaults(func=cmd_graph_rebuild)
-    return result
-
-
-def main() -> int:
-    try:
-        args = parser().parse_args()
-        return args.func(args)
-    except (bootstrap.BootstrapError, OSError) as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
-        return 2
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+printf 'bootstrap: no supported Python interpreter found (need Python >= 3.11 for tomllib).\n' >&2
+printf 'bootstrap: install Python 3.11+ or set LAI_PYTHON=/path/to/python3 (nothing was downloaded).\n' >&2
+exit 127

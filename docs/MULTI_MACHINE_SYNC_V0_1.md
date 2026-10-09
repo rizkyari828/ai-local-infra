@@ -541,7 +541,10 @@ Entry criteria: M1 approved. Exit criteria:
 
 Repo-native CLI `scripts/bootstrap` (Python stdlib only), matching the
 `scripts/ai-profile` style. `bootstrap/status` in §8 is realized as
-`scripts/bootstrap status`.
+`scripts/bootstrap status`. The entrypoint is a portable `sh` launcher that
+selects an installed Python >= 3.11 (stdlib `tomllib`; no vendored parser, no
+downloaded interpreter) and forwards arguments and exit code unchanged; set
+`LAI_PYTHON` to force an interpreter.
 
 ```bash
 LAI_MACHINE=work-mac ./scripts/bootstrap status
