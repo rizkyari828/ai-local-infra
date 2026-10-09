@@ -20,6 +20,25 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "common"))
 import routing  # noqa: E402
+import discovery  # noqa: E402
+
+
+def _capability_fields(rec: dict, surface: str | None) -> None:
+    """Annotate with capability/effort status. Read-only; never downgrades."""
+    rec["capability_status"] = None
+    rec["capability_source"] = None
+    rec["effort_status"] = None
+    if not (rec.get("provider") and rec.get("model")):
+        return
+    try:
+        cap = discovery.capability(rec["provider"], rec["model"], surface)
+    except discovery.DiscoveryError:
+        return
+    rec["capability_status"] = cap["status"]
+    rec["capability_source"] = cap["source"]
+    if surface:
+        rec["effort_status"] = discovery.effort_status(
+            rec["provider"], rec["model"], surface, rec["recommended_effort"].upper())
 
 
 def _escalation_label(policy: dict, rec: dict) -> str:
@@ -55,6 +74,7 @@ def cmd_route(args: argparse.Namespace) -> int:
         rec["task_class"], same_tier_attempts=args.attempts,
         succeeded=args.succeeded, policy=policy)
     rec["next_step"] = step
+    _capability_fields(rec, args.surface)
     if args.json:
         print(json.dumps(rec, indent=2, ensure_ascii=False))
         return 0
@@ -63,6 +83,11 @@ def cmd_route(args: argparse.Namespace) -> int:
     print(f"EFFORT: {rec['recommended_effort'].upper()}")
     print(f"ROLE: {rec['role'] or 'unmapped'}")
     print(f"RESOLVED MODEL: {_resolved_label(rec)}")
+    if rec.get("capability_status"):
+        print(f"CAPABILITY STATUS: {rec['capability_status']}"
+              + (f" (source: {rec['capability_source']})" if rec.get("capability_source") else ""))
+        if rec.get("effort_status"):
+            print(f"EFFORT STATUS: {rec['recommended_effort'].upper()} {rec['effort_status']}")
     if args.surface:
         print(f"SURFACE: {args.surface} ({rec.get('capability')})")
         print(f"SURFACE AVAILABILITY: {rec.get('availability')}")

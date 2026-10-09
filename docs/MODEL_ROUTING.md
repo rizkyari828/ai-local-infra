@@ -51,6 +51,13 @@ concepts; `config/model-routing.yaml` names no concrete model. Every surface
 (OpenCode, Codex CLI/VS Code/Desktop) is `RECOMMEND_ONLY` in V0.1: the router
 recommends, a human or agent applies it. No user-selected model is ever changed.
 
+Concrete resolution is backed by **capability discovery** (`./scripts/models`),
+which reports which providers/models are `KNOWN`/`AVAILABLE`/`VERIFIED` and which
+effort variants they expose, without calling any model. See
+[`MODEL_CAPABILITIES.md`](MODEL_CAPABILITIES.md). `scripts/route` surfaces this as
+`CAPABILITY STATUS` / `EFFORT STATUS` and never downgrades the symbolic
+recommendation when a tier is unavailable.
+
 ```bash
 ./scripts/route --task "design a cross-machine config resolver"
 ./scripts/route --task "rename a config key" --json

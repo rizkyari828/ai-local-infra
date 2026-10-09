@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "capabilities_version": "0.1.0",
+  "updated": "2026-10-09",
+  "notes": "Portable model capability discovery config (V0.1). Holds discovery rules only: provider aliases, model aliases, provider-native -> normalized effort mappings, surface declarations, and bounded manual overrides. No secrets, no account quota, and no machine-specific discovered catalog (that is local generated state). Kept separate from task classification and routing requirement: routing never reads provider/model identifiers. Do not write provider-specific logic into the classifier/router; add aliases/mappings/overrides here or a small discovery adapter.",
+  "effort_order": ["LOW", "MEDIUM", "HIGH", "VERY_HIGH", "MAX"],
+  "effort_mappings": {
+    "default": {"low": "LOW", "medium": "MEDIUM", "high": "HIGH", "max": "MAX"},
+    "anthropic": {"low": "LOW", "medium": "MEDIUM", "high": "HIGH", "xhigh": "VERY_HIGH", "max": "MAX"},
+    "deepseek": {"high": "HIGH", "max": "MAX"},
+    "ollama": {"low": "LOW", "medium": "MEDIUM", "high": "HIGH", "max": "MAX"},
+    "openai": {"low": "LOW", "medium": "MEDIUM", "high": "HIGH", "xhigh": "VERY_HIGH"}
+  },
+  "provider_aliases": {
+    "claude": "anthropic",
+    "local": "ollama"
+  },
+  "model_aliases": {},
+  "surfaces": {
+    "opencode": {"shares_config_with": null},
+    "codex-cli": {"shares_config_with": null},
+    "codex-vscode": {"shares_config_with": "codex-cli"},
+    "codex-desktop": {"shares_config_with": "codex-cli"}
+  },
+  "manual_overrides": []
+}
