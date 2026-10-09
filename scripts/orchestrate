@@ -17,11 +17,32 @@ from __future__ import annotations
 import argparse
 import json
 import pathlib
+import shutil
 import sys
+import urllib.error
+import urllib.request
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "common"))
 import orchestrator  # noqa: E402
 import execution  # noqa: E402
+import discovery  # noqa: E402
+import failover  # noqa: E402
+
+
+def _local_health() -> tuple[failover.Health, dict[str, "execution.Backend"]]:
+    """Cheap, no-inference runtime availability for the configured backends."""
+    config = discovery.load_config()
+    providers = {name: set(spec.get("providers", [])) for name, spec in config.get("backends", {}).items()}
+    binaries = {name: bool(shutil.which(name)) for name in providers}
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:11434/api/tags", timeout=1.5) as response:
+            ollama_models = {model["name"] for model in json.load(response).get("models", [])}
+    except (urllib.error.URLError, OSError, ValueError, KeyError):
+        ollama_models = None  # unreachable -> UNKNOWN (never assumed available)
+    health = failover.Health(binaries=binaries, providers=providers, ollama_models=ollama_models,
+                             codex_model=None)
+    backends = {name: execution.CliBackend(name, name) for name in providers}
+    return health, backends
 
 
 def _objective(args: argparse.Namespace) -> str:
@@ -35,7 +56,9 @@ def _constraints(args: argparse.Namespace) -> dict:
     return {"surface": args.surface, "min_tier": args.min_tier, "max_tier": args.max_tier,
             "local_only": args.local_only, "no_premium": args.no_premium,
             "read_only": getattr(args, "read_only", False),
-            "max_ai_calls": getattr(args, "max_ai_calls", None)}
+            "max_ai_calls": getattr(args, "max_ai_calls", None),
+            "prefer_provider": getattr(args, "prefer_provider", None),
+            "prefer_model": getattr(args, "prefer_model", None)}
 
 
 def cmd_plan(args: argparse.Namespace) -> int:
@@ -63,11 +86,16 @@ def cmd_run(args: argparse.Namespace) -> int:
         print("ERROR: invalid plan; run 'plan' to inspect diagnostics", file=sys.stderr)
         return 2
     backend = execution.backend_for(args.backend)
+    health, backends = _local_health()
+    if args.backend != "fake":
+        backends.setdefault(backend.name, backend)
     report = execution.execute_plan(
         plan, backend=backend, run_id=args.run_id, state_dir=args.state_dir,
         repo_root=pathlib.Path.cwd(), confirm=args.confirm, dry_run=args.dry_run,
         allow_dirty=args.allow_dirty, surface=args.surface, record_evidence=not args.no_evidence,
-        resume=args.resume, read_only=args.read_only, max_ai_calls=args.max_ai_calls)
+        resume=args.resume, read_only=args.read_only, max_ai_calls=args.max_ai_calls,
+        backends=backends, health=(None if args.backend == "fake" else health),
+        constraints=_constraints(args))
     if args.json:
         print(json.dumps(report, indent=2, ensure_ascii=False))
     else:
