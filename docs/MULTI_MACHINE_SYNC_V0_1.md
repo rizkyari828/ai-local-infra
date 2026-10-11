@@ -544,7 +544,10 @@ Repo-native CLI `scripts/bootstrap` (Python stdlib only), matching the
 `scripts/bootstrap status`. The entrypoint is a portable `sh` launcher that
 selects an installed Python >= 3.11 (stdlib `tomllib`; no vendored parser, no
 downloaded interpreter) and forwards arguments and exit code unchanged; set
-`LAI_PYTHON` to force an interpreter.
+`LAI_PYTHON` to force an interpreter. The selector lives once in
+`scripts/common/launch`; `scripts/bootstrap` and the user-facing CLIs
+(`orchestrate`, `learn`, `models`, `route`) all delegate to it, so the same
+supported-Python policy applies to every entrypoint.
 
 ```bash
 LAI_MACHINE=work-mac ./scripts/bootstrap status

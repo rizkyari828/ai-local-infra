@@ -21,7 +21,7 @@ import failover  # noqa: E402
 import lifecycle  # noqa: E402
 import orchestration_store  # noqa: E402
 
-ORCH = ROOT / "scripts" / "orchestrate"
+ORCH = ROOT / "scripts" / "common" / "orchestrate_cli.py"
 
 
 def _repo(tmp: pathlib.Path) -> pathlib.Path:

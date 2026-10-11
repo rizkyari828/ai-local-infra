@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+"""Model capability discovery CLI (read-only, offline).
+
+    ./scripts/models detect [--surface S] [--provider P] [--json]
+    ./scripts/models list   [--surface S] [--provider P] [--json]
+
+Catalog-only: reads models/roles.yaml, config/model-capabilities.yaml, and an
+optional local snapshot ($LAI_STATE_DIR/model-capabilities.json). It never calls a
+model or provider, never spends tokens, never installs/downloads, and never
+mutates configuration. See docs/MODEL_CAPABILITIES.md.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import pathlib
+import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import discovery  # noqa: E402
+
+
+def _declared_surfaces(config: dict) -> list[str]:
+    return list(config.get("surfaces", {}).keys())
+
+
+def _surfaces_for(row: dict, config: dict, wanted: str | None) -> list[str]:
+    if wanted:
+        return [wanted]
+    names = set(config.get("surfaces", {}).keys()) | set(row["surfaces"].keys())
+    return sorted(names)
+
+
+def cmd_list(args: argparse.Namespace, config: dict, snapshot: dict) -> int:
+    records = discovery.discover(config=config, snapshot=snapshot)
+    if args.provider:
+        provider = discovery.canonical_provider(args.provider, config)
+        records = [row for row in records if row["provider"] == provider]
+    if args.json:
+        print(json.dumps(_serialize(records, config, args.surface), indent=2, ensure_ascii=False))
+        return 0
+    for row in _serialize(records, config, args.surface):
+        surfaces = ",".join(f"{name}:{data['status']}" for name, data in sorted(row["surfaces"].items()))
+        print(f"{row['provider']}/{row['model']}  status={row['status']}  "
+              f"surfaces={surfaces or '-'}  sources={','.join(row['sources']) or '-'}")
+    return 0
+
+
+def cmd_detect(args: argparse.Namespace, config: dict, snapshot: dict) -> int:
+    serialized = _serialize(discovery.discover(config=config, snapshot=snapshot), config, args.surface)
+    if args.json:
+        print(json.dumps(serialized, indent=2, ensure_ascii=False))
+        return 0
+    for surface in [args.surface] if args.surface else _declared_surfaces(config):
+        print(f"SURFACE: {surface}")
+        for row in serialized:
+            info = row["surfaces"].get(surface)
+            if info is None:
+                continue
+            provider = row["provider"]
+            if args.provider and provider != discovery.canonical_provider(args.provider, config):
+                continue
+            natives = ", ".join(str(v["native"]) for v in row["variants"]) or "(none discovered)"
+            normalized = ", ".join(str(v["normalized"]) for v in row["variants"]) or "(none discovered)"
+            verification = ", ".join(
+                f"{v['normalized']}={discovery.effort_status(provider, row['model'], surface, v['normalized'], config=config, snapshot=snapshot)}"
+                for v in row["variants"]) or "(none discovered)"
+            print(f"  PROVIDER: {provider}")
+            print(f"  MODEL: {row['model']}")
+            print(f"  STATUS: {info['status']} (source: {info['source']})")
+            print(f"  NATIVE VARIANTS: {natives}")
+            print(f"  NORMALIZED EFFORT: {normalized}")
+            print(f"  VERIFICATION: {verification}")
+    return 0
+
+
+def _serialize(records: list[dict], config: dict, wanted_surface: str | None) -> list[dict]:
+    out = []
+    for row in records:
+        surfaces = {}
+        for surface in _surfaces_for(row, config, wanted_surface):
+            cap = discovery.capability(row["provider"], row["model"], surface, config=config)
+            surfaces[surface] = {"status": cap["status"], "source": cap["source"]}
+        out.append({
+            "provider": row["provider"],
+            "model": row["model"],
+            "status": row["status"],
+            "sources": row["sources"],
+            "roles": row["roles"],
+            "surfaces": surfaces,
+            "variants": row["variants"],
+        })
+    return out
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(description=__doc__)
+    sub = result.add_subparsers(dest="command", required=True)
+    for name, func, help_text in (("detect", cmd_detect, "show discovered capability per surface"),
+                                  ("list", cmd_list, "list discovered models")):
+        child = sub.add_parser(name, help=help_text)
+        child.add_argument("--surface", help="limit to one surface")
+        child.add_argument("--provider", help="limit to one provider (alias accepted)")
+        child.add_argument("--json", action="store_true", help="emit stable machine-readable JSON")
+        child.set_defaults(func=func)
+    return result
+
+
+def main() -> int:
+    args = parser().parse_args()
+    try:
+        config = discovery.load_config()
+        snapshot = discovery.load_snapshot()
+        return args.func(args, config, snapshot)
+    except (discovery.DiscoveryError, OSError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,10 +1,12 @@
 #!/bin/sh
 # Portable bootstrap launcher (multi-machine sync).
 #
-# Selects an already-installed CPython >= 3.11 and runs the Python CLI with the
-# original arguments and exit code. bootstrap.py uses stdlib ``tomllib``, which
-# only exists from Python 3.11; Python 3.9/3.10 are rejected up front instead of
-# failing with an obscure ``ModuleNotFoundError: tomllib``.
+# Thin wrapper over the shared supported-Python launcher (scripts/common/launch):
+# selects an already-installed CPython >= 3.11 and runs
+# scripts/common/bootstrap_cli.py with the original arguments and exit code.
+# bootstrap.py uses stdlib ``tomllib``, which only exists from Python 3.11;
+# Python 3.9/3.10 are rejected up front instead of failing with an obscure
+# ``ModuleNotFoundError: tomllib``.
 #
 # It never mutates PATH, never installs anything, and never lets uv (or anything
 # else) download a Python. Set LAI_PYTHON to force an explicit interpreter.
@@ -18,29 +20,5 @@ case $self in
 esac
 here=${self%/*}
 [ "$here" = "$self" ] && here=.
-cli=$here/common/bootstrap_cli.py
 
-version_ok() {
-    "$1" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null
-}
-
-if [ -n "${LAI_PYTHON:-}" ]; then
-    if version_ok "$LAI_PYTHON"; then
-        exec "$LAI_PYTHON" "$cli" "$@"
-    fi
-    printf 'bootstrap: LAI_PYTHON=%s is not a usable Python >= 3.11.\n' "$LAI_PYTHON" >&2
-    printf 'bootstrap: point LAI_PYTHON at an interpreter with tomllib (3.11+), e.g. python3.13.\n' >&2
-    exit 127
-fi
-
-# Prefer the generic python3 when it is new enough, then concrete versions.
-for cand in python3 python3.13 python3.12 python3.11; do
-    bin=$(command -v "$cand" 2>/dev/null) || continue
-    if version_ok "$bin"; then
-        exec "$bin" "$cli" "$@"
-    fi
-done
-
-printf 'bootstrap: no supported Python interpreter found (need Python >= 3.11 for tomllib).\n' >&2
-printf 'bootstrap: install Python 3.11+ or set LAI_PYTHON=/path/to/python3 (nothing was downloaded).\n' >&2
-exit 127
+exec "$here/common/launch" "$here/common/bootstrap_cli.py" "$@"

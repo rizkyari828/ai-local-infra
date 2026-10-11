@@ -11,6 +11,15 @@ finds an installed interpreter (`python3`, then `python3.13`/`python3.12`/
 to force a specific interpreter. Running the module directly under an unsupported
 Python fails fast with a clear "requires Python >= 3.11" message.
 
+The user-facing CLIs `./scripts/orchestrate`, `./scripts/learn`, `./scripts/models`,
+and `./scripts/route` use the same shared selector (`scripts/common/launch`) instead
+of a bare `#!/usr/bin/env python3` shebang. They pick a supported interpreter even
+when `env python3` is older (for example macOS Python 3.9) as long as any
+`python3.13`/`python3.12`/`python3.11` or `LAI_PYTHON` is installed, so the commands
+work unchanged across machines. When no interpreter >= 3.11 exists the launcher
+exits 127 with a clear message (minimum version plus `LAI_PYTHON` guidance) rather
+than an import error.
+
 ## Environment verification
 
 `./scripts/verify-environment` validates profiles, schemas, and limits (structural

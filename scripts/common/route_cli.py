@@ -1,0 +1,202 @@
+#!/usr/bin/env python3
+"""Recommend the cheapest sufficient model tier/effort for a task (read-only).
+
+Deterministic and offline: it classifies the task text with simple rules, applies
+the declarative policy in ``config/model-routing.yaml``, and prints a
+recommendation. The output keeps three layers separate: TASK CLASS (provider
+independent) -> RECOMMENDED TIER / EFFORT (symbolic) -> RESOLVED MODEL (a
+configured provider/model, informational in V0.1). It never calls a model or
+network and never echoes the raw task, so no prompt or secret leaks into output.
+
+Provider/model names come only from ``models/roles.yaml``. See docs/MODEL_ROUTING.md.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import pathlib
+import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import routing  # noqa: E402
+import discovery  # noqa: E402
+import evidence  # noqa: E402
+import outcomes  # noqa: E402
+import derived_knowledge as knowledge  # noqa: E402
+
+
+def _outcome_fields(rec: dict, decision_id: str | None) -> None:
+    """Compact observed-runtime learning + candidate, only if a local ledger exists."""
+    rec["decision_id"] = decision_id
+    rec["observed_learning"] = None
+    rec["candidate"] = None
+    if not rec.get("task_family"):
+        return
+    try:
+        if not evidence.db_path().exists():
+            return
+        learning_summary = outcomes.family_learning(rec["task_family"])
+        rec["observed_learning"] = {"samples": learning_summary["observed_runtime"],
+                                    "success": learning_summary["success"],
+                                    "escalations": learning_summary["escalations"]}
+        for candidate in outcomes.candidates()["candidates"]:
+            if candidate.get("task_family") == rec["task_family"] and candidate["type"] != "INSUFFICIENT_EVIDENCE":
+                rec["candidate"] = candidate["type"]
+                break
+    except (evidence.EvidenceError, knowledge.KnowledgeError):
+        pass
+
+
+def _knowledge_fields(rec: dict, task: str, policy: dict) -> None:
+    """Attach advisory historical evidence, lessons, and any approved learned
+    default. Learned defaults never drop below the safety floor or user override."""
+    rec["task_family"] = None
+    rec["historical_evidence"] = None
+    rec["relevant_lessons"] = []
+    rec["learned_default"] = None
+    rec["learned_default_applied"] = False
+    try:
+        rec["task_family"] = knowledge.task_family_for(task)
+        knowledge.apply_learned_default(rec)
+        if rec.get("learned_default_applied"):
+            resolution = routing.resolve_model(rec["recommended_tier"], policy)
+            rec.update({"role": resolution["role"], "model": resolution["model"],
+                        "provider": resolution["provider"], "resolved": resolution["resolved"]})
+        observations = knowledge.observations_for_family(rec["task_family"])
+        rec["historical_evidence"] = {
+            "task_family": rec["task_family"], "samples": len(observations),
+            "confidence": observations[0].get("confidence") if observations else None,
+            "source": observations[0].get("source") if observations else None,
+        }
+        rec["relevant_lessons"] = [lesson["lesson_id"] for lesson in knowledge.relevant_lessons(task)]
+    except knowledge.KnowledgeError:
+        pass
+
+
+def _capability_fields(rec: dict, surface: str | None) -> None:
+    """Annotate with capability/effort status. Read-only; never downgrades."""
+    rec["capability_status"] = None
+    rec["capability_source"] = None
+    rec["effort_status"] = None
+    if not (rec.get("provider") and rec.get("model")):
+        return
+    try:
+        cap = discovery.capability(rec["provider"], rec["model"], surface)
+    except discovery.DiscoveryError:
+        return
+    rec["capability_status"] = cap["status"]
+    rec["capability_source"] = cap["source"]
+    if surface:
+        rec["effort_status"] = discovery.effort_status(
+            rec["provider"], rec["model"], surface, rec["recommended_effort"].upper())
+
+
+def _escalation_label(policy: dict, rec: dict) -> str:
+    target = rec.get("escalation_to")
+    if not target:
+        return "none (report instead of retrying)"
+    entry = policy["task_classes"][target]
+    retries = rec.get("max_retries", 0)
+    return f"{target} / {entry['tier']} / {entry['effort']} after up to {retries} same-tier retries"
+
+
+def _resolved_label(rec: dict) -> str:
+    if rec.get("availability") == "UNAVAILABLE_ON_SURFACE":
+        return "UNAVAILABLE_ON_SURFACE"
+    if not rec.get("model"):
+        return "unmapped"
+    provider = rec.get("provider")
+    return f"{rec['model']} (provider: {provider})" if provider else rec["model"]
+
+
+def cmd_route(args: argparse.Namespace) -> int:
+    policy = routing.load_policy()
+    rec = routing.recommend(
+        args.task or "",
+        task_class=args.task_class,
+        requested_effort=args.effort,
+        requested_tier=args.tier,
+        user_model=args.model,
+        surface=args.surface,
+        policy=policy,
+    )
+    step = routing.escalation_step(
+        rec["task_class"], same_tier_attempts=args.attempts,
+        succeeded=args.succeeded, policy=policy)
+    rec["next_step"] = step
+    _knowledge_fields(rec, args.task or "", policy)
+    _outcome_fields(rec, args.decision_id)
+    _capability_fields(rec, args.surface)
+    if args.json:
+        print(json.dumps(rec, indent=2, ensure_ascii=False))
+        return 0
+    print(f"TASK CLASS: {rec['task_class']}")
+    print(f"RECOMMENDED TIER: {rec['recommended_tier']}")
+    print(f"EFFORT: {rec['recommended_effort'].upper()}")
+    print(f"ROLE: {rec['role'] or 'unmapped'}")
+    print(f"RESOLVED MODEL: {_resolved_label(rec)}")
+    if rec.get("capability_status"):
+        print(f"CAPABILITY STATUS: {rec['capability_status']}"
+              + (f" (source: {rec['capability_source']})" if rec.get("capability_source") else ""))
+        if rec.get("effort_status"):
+            print(f"EFFORT STATUS: {rec['recommended_effort'].upper()} {rec['effort_status']}")
+    if rec.get("task_family"):
+        evidence = rec.get("historical_evidence") or {}
+        detail = f"{evidence.get('samples', 0)} observation(s)"
+        if evidence.get("confidence"):
+            detail += f", confidence {evidence['confidence']}"
+        print(f"HISTORICAL EVIDENCE: {rec['task_family']} ({detail})")
+        if rec.get("relevant_lessons"):
+            print(f"RELEVANT LESSONS: {', '.join(rec['relevant_lessons'])}")
+        learned = rec.get("learned_default")
+        state = "applied" if rec.get("learned_default_applied") else ("available" if learned else "none")
+        print(f"LEARNED DEFAULT: {state}")
+    if rec.get("observed_learning"):
+        observed = rec["observed_learning"]
+        print(f"LEARNING: observed samples {observed['samples']}, success {observed['success']}, "
+              f"reasoning escalations {observed['escalations']}")
+        print("CANDIDATE: " + (f"{rec['candidate']} (review required)" if rec.get("candidate") else "none"))
+    if rec.get("decision_id"):
+        print(f"DECISION ID: {rec['decision_id']}")
+    if args.surface:
+        print(f"SURFACE: {args.surface} ({rec.get('capability')})")
+        print(f"SURFACE AVAILABILITY: {rec.get('availability')}")
+    if rec.get("user_model"):
+        print(f"USER MODEL: {rec['user_model']} ({rec['user_model_status']})")
+    print(f"ESCALATION: {_escalation_label(policy, rec)}")
+    print(f"NEXT STEP: {step['action']} ({step['reason']})")
+    print(f"RATIONALE: {rec['reason']}")
+    return 0
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(description=__doc__)
+    result.add_argument("--task", default="", help="task description (free text)")
+    result.add_argument("--class", dest="task_class",
+                        help="explicit task class override (wins over heuristics)")
+    result.add_argument("--effort", help="explicit requested effort floor: low|medium|high|max")
+    result.add_argument("--tier", help="explicit requested tier floor: FAST|BALANCED|STRONG|MAX")
+    result.add_argument("--model", help="explicit user-selected model (kept; conflicts reported)")
+    result.add_argument("--surface", help="target surface: opencode|codex-cli|codex-vscode|codex-desktop")
+    result.add_argument("--decision-id",
+                        help="stable execution id to correlate route -> outcome (no prompt content)")
+    result.add_argument("--verbose", action="store_true", help="include extra learning detail")
+    result.add_argument("--attempts", type=int, default=0,
+                        help="same-tier attempts already spent (for the next-step preview)")
+    result.add_argument("--succeeded", action="store_true", help="mark the task as already succeeded")
+    result.add_argument("--json", action="store_true", help="emit stable machine-readable JSON")
+    return result
+
+
+def main() -> int:
+    args = parser().parse_args()
+    try:
+        return cmd_route(args)
+    except (routing.RoutingError, OSError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

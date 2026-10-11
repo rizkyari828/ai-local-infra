@@ -1,0 +1,44 @@
+#!/bin/sh
+# Shared supported-Python launcher for repository CLI entrypoints.
+#
+# Selects an already-installed CPython >= 3.11 and runs ``launch <module.py>`` with
+# the remaining arguments and the same exit code. This is the single
+# interpreter-selection policy shared by ``scripts/bootstrap`` and the user-facing
+# CLIs (orchestrate/learn/models/route), so portability is defined once.
+#
+# It never mutates PATH, never installs anything, and never lets uv (or anything
+# else) download a Python. Set LAI_PYTHON to force an explicit interpreter.
+set -u
+
+if [ "$#" -eq 0 ]; then
+    printf 'launch: usage: launch <module.py> [args...]\n' >&2
+    exit 2
+fi
+
+module=$1
+shift
+
+version_ok() {
+    "$1" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null
+}
+
+if [ -n "${LAI_PYTHON:-}" ]; then
+    if version_ok "$LAI_PYTHON"; then
+        exec "$LAI_PYTHON" "$module" "$@"
+    fi
+    printf 'launch: LAI_PYTHON=%s is not a usable Python >= 3.11.\n' "$LAI_PYTHON" >&2
+    printf 'launch: point LAI_PYTHON at an interpreter with tomllib (3.11+), e.g. python3.13.\n' >&2
+    exit 127
+fi
+
+# Prefer the generic python3 when it is new enough, then concrete versions.
+for cand in python3 python3.13 python3.12 python3.11; do
+    bin=$(command -v "$cand" 2>/dev/null) || continue
+    if version_ok "$bin"; then
+        exec "$bin" "$module" "$@"
+    fi
+done
+
+printf 'launch: no supported Python interpreter found (need Python >= 3.11).\n' >&2
+printf 'launch: install Python 3.11+ or set LAI_PYTHON=/path/to/python3 (nothing was downloaded).\n' >&2
+exit 127
