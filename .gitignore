@@ -35,6 +35,9 @@ datasets/candidates/*.jsonl
 !datasets/rejected/.gitkeep
 !datasets/candidates/.gitkeep
 
+# OS artifacts
+.DS_Store
+
 # Tooling artifacts
 __pycache__/
 *.py[cod]
