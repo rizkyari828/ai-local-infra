@@ -4,17 +4,22 @@
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import shutil
 import subprocess
 import sys
 import urllib.error
 import urllib.request
+from typing import Any
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts/common"))
 import infra  # noqa: E402
 import telemetry  # noqa: E402
+
+OLLAMA_ENDPOINT = "http://127.0.0.1:11434/api/tags"
+NOT_CONFIGURED_BY_MACHINE_POLICY = "NOT_CONFIGURED_BY_MACHINE_POLICY"
 
 
 def version(command: list[str]) -> str:
@@ -24,6 +29,35 @@ def version(command: list[str]) -> str:
     result = subprocess.run(command, capture_output=True, text=True)
     text = (result.stdout or result.stderr).strip().splitlines()
     return text[0] if result.returncode == 0 and text else "UNAVAILABLE"
+
+
+def _descriptor_policy(machine: dict[str, Any]) -> str | None:
+    if machine.get("local_inference") == NOT_CONFIGURED_BY_MACHINE_POLICY:
+        return NOT_CONFIGURED_BY_MACHINE_POLICY
+    if (machine.get("provider_availability") or {}).get("ollama") is False:
+        return NOT_CONFIGURED_BY_MACHINE_POLICY
+    return None
+
+
+def machine_local_inference_policy() -> str | None:
+    """Machine-declared local inference policy (None = configured/unknown machine).
+
+    A machine that explicitly disables local inference (``local_inference`` or
+    ``provider_availability.ollama``) intentionally has no Ollama runtime, so the
+    health probe is skipped rather than reported as an environment failure. Machine
+    identity is ``LAI_MACHINE`` when set; otherwise the descriptor whose declared
+    ``repo_path`` is this exact repository is used (never guessed, only matched).
+    """
+    machine_id = os.environ.get("LAI_MACHINE")
+    if machine_id:
+        path = ROOT / "machines" / f"{machine_id}.yaml"
+        return _descriptor_policy(infra.load_json(path)) if path.exists() else None
+    for path in sorted((ROOT / "machines").glob("*.yaml")):
+        machine = infra.load_json(path)
+        declared = machine.get("repo_path")
+        if declared and os.path.expanduser(str(declared)) == str(ROOT):
+            return _descriptor_policy(machine)
+    return None
 
 
 def main() -> int:
@@ -50,18 +84,25 @@ def main() -> int:
         print("PASS limits config/limits.yaml")
     except infra.InfraError as exc:
         failures.append(str(exc))
-    for name, command in {
-        "python": ["python3", "--version"], "ollama": ["ollama", "--version"],
+    policy = machine_local_inference_policy()
+    tools = {
+        "python": ["python3", "--version"],
         "qwen": ["qwen", "--version"], "node": ["node", "--version"], "npm": ["npm", "--version"],
         "dotnet": ["dotnet", "--version"],
-    }.items():
+    }
+    if policy != NOT_CONFIGURED_BY_MACHINE_POLICY:
+        tools["ollama"] = ["ollama", "--version"]
+    for name, command in tools.items():
         print(f"{name}: {version(command)}")
-    endpoint = "http://127.0.0.1:11434/api/tags"
-    try:
-        with urllib.request.urlopen(endpoint, timeout=3) as response:
-            print(f"Ollama health: HTTP {response.status}")
-    except (urllib.error.URLError, TimeoutError) as exc:
-        failures.append(f"Ollama health unavailable: {exc}")
+    if policy == NOT_CONFIGURED_BY_MACHINE_POLICY:
+        print(f"Ollama: {NOT_CONFIGURED_BY_MACHINE_POLICY}")
+        print("Ollama health: SKIPPED_BY_POLICY")
+    else:
+        try:
+            with urllib.request.urlopen(OLLAMA_ENDPOINT, timeout=3) as response:
+                print(f"Ollama health: HTTP {response.status}")
+        except (urllib.error.URLError, TimeoutError) as exc:
+            failures.append(f"Ollama health unavailable: {exc}")
     if failures:
         for failure in failures:
             print(f"FAIL {failure}", file=sys.stderr)

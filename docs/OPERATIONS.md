@@ -14,10 +14,16 @@ Python fails fast with a clear "requires Python >= 3.11" message.
 ## Environment verification
 
 `./scripts/verify-environment` validates profiles, schemas, and limits (structural
-failures) and reports tool versions. It also probes the local Ollama endpoint
-`http://127.0.0.1:11434/api/tags`; an unreachable Ollama is an unrelated
-runtime-service failure (exit 1), **not** a Multi-Machine Sync blocker —
-`bootstrap status`/`apply`/`doctor` do not require Ollama.
+failures) and reports tool versions. On a machine that configures local inference,
+it also probes the local Ollama endpoint `http://127.0.0.1:11434/api/tags`; there an
+unreachable Ollama is an unrelated runtime-service failure (exit 1), **not** a
+Multi-Machine Sync blocker — `bootstrap status`/`apply`/`doctor` do not require
+Ollama. On a machine that declares local inference disabled by policy
+(`local_inference: NOT_CONFIGURED_BY_MACHINE_POLICY` or `provider_availability.ollama:
+false`), the Ollama health probe is skipped (`Ollama: NOT_CONFIGURED_BY_MACHINE_POLICY`,
+`Ollama health: SKIPPED_BY_POLICY`) and its absence is never an environment failure.
+Machine identity is `LAI_MACHINE`, or the descriptor whose declared `repo_path` is
+this repository; health checks are otherwise never weakened.
 
 ## Inspect and apply
 
