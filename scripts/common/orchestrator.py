@@ -72,7 +72,7 @@ class _Slicer:
                          "configuration", "resolver", "precedence", "migration", "concurrency"),
         "security": ("security", "authentication", "authorization", "auth"),
         "docs": ("doc", "docs", "documentation", "readme"),
-        "tests": ("test", "tests", "verify", "validate"),
+        "tests": ("test", "tests", "verify", "verif", "validate"),
         "final": ("report", "final", "summar"),
     }
 
@@ -91,6 +91,74 @@ class _Slicer:
                 self.used.add(index)
                 return clause
         return fallback
+
+    def remaining(self) -> list[str]:
+        """Master clauses no work stage claimed. They must not silently disappear."""
+        return [clause for index, clause in enumerate(self.clauses) if index not in self.used]
+
+
+# Deterministic-coverage vocabulary: tokens a deterministic operation legitimately
+# accounts for, so an objective is only treated as fully deterministic when nothing
+# requirement-bearing is left unexplained. Conservative; unknown tokens block it.
+_OP_EVIDENCE = {
+    "repository_state": ("repository", "repo", "branch", "head", "commit", "sha", "hash",
+                         "clean", "dirty", "state", "status", "working", "tree", "worktree"),
+    "git_head_matches": ("head", "commit", "sha", "hash", "equals", "matches", "is"),
+    "config_value_matches": ("config", "value", "key", "equals", "matches"),
+    "file_exists": ("exist", "exists", "file"),
+    "config_parse": ("config", "parse", "yaml", "yml", "json", "toml"),
+    "run_tests": ("test", "tests", "suite", "unit_tests"),
+}
+_COVERAGE_FILLER = frozenset((
+    "report", "check", "verify", "inspect", "review", "show", "list", "read", "current", "and",
+    "or", "the", "a", "an", "is", "are", "of", "in", "on", "to", "for", "with", "please",
+    "deterministic", "final", "result", "results", "whether", "if", "does", "do", "run", "also",
+    "then", "state", "given", "that", "this", "as", "by", "at", "equals", "matches",
+))
+_TOKEN_RE = re.compile(r"[a-z0-9_./-]+")
+
+
+def _tokens(text: str) -> list[str]:
+    """Requirement-bearing tokens; surrounding punctuation (e.g. a trailing period) is
+    stripped while internal '.', '/', '-' used by file paths are preserved."""
+    return [token.strip(".-/") for token in _TOKEN_RE.findall((text or "").lower()) if token.strip(".-/")]
+
+
+def _coverage_tokens(tasks: list[dict[str, Any]]) -> set[str]:
+    covered: set[str] = set(_COVERAGE_FILLER)
+    for task in tasks:
+        covered.update(_OP_EVIDENCE.get(task["operation"], ()))
+        for value in (task.get("args") or {}).values():
+            covered.update(_tokens(str(value)))
+    return covered
+
+
+def _deterministic_covers(objective: str, tasks: list[dict[str, Any]]) -> bool:
+    """A pure deterministic plan is only claimed when EVERY requirement-bearing token in
+    the objective is accounted for by the recognized deterministic operations. Anything
+    left (e.g. arithmetic, prose generation) means the objective is NOT fully
+    deterministic and must not be reported as a completed zero-AI task."""
+    if not tasks:
+        return False
+    covered = _coverage_tokens(tasks)
+    return all(token in covered for token in _tokens(objective))
+
+
+def _requirement_covered(clause: str, nodes: list[dict[str, Any]]) -> bool:
+    """A master clause is covered when an AI stage carries it verbatim, or every
+    requirement-bearing token is accounted for by a deterministic node's operation."""
+    normalized = " ".join((clause or "").lower().split())
+    if not normalized:
+        return True
+    for node in nodes:
+        if node.get("executor") == "TOOL_ONLY":
+            continue
+        if normalized in " ".join((node.get("objective_summary") or "").lower().split()):
+            return True
+    tool_tasks = [{"operation": (node.get("tool") or {}).get("operation"), "args": (node.get("tool") or {}).get("args")}
+                  for node in nodes if node.get("executor") == "TOOL_ONLY" and (node.get("tool") or {}).get("operation")]
+    covered = _coverage_tokens([t for t in tool_tasks if t["operation"] in _OP_EVIDENCE])
+    return all(token in covered for token in _tokens(normalized))
 
 
 # Execution intent (never inferred from loose substrings such as "config"/"configured").
@@ -198,6 +266,11 @@ def planner_decision(objective: str, *, constraints: Optional[dict[str, Any]] = 
 def _deterministic_plan(objective: str, constraints: dict[str, Any], decision: dict[str, Any]) -> Optional[dict[str, Any]]:
     tasks = deterministic_tools.classify_objective(objective)
     if not tasks:
+        return None
+    if not _deterministic_covers(objective, tasks):
+        # The objective carries requirements the deterministic operations do not fully
+        # account for (e.g. "check HEAD and calculate 2 plus 2"): never report a partial
+        # zero-AI completion. Fall through to mixed/intact AI handling.
         return None
     nodes: list[dict[str, Any]] = []
     for index, task in enumerate(tasks, start=1):
@@ -381,7 +454,11 @@ def decompose(objective: str, *, constraints: Optional[dict[str, Any]] = None) -
             final["acceptance_criteria"] = ["all deterministic acceptance satisfied"]
         nodes.append(final)
 
-    _assign_task_slices(nodes, slicer)
+    covered = _assign_task_slices(nodes, slicer)
+    if not covered or not all(_requirement_covered(clause, nodes) for clause in _clauses(objective)):
+        # Coverage cannot be proven without silently dropping a requirement: keep the
+        # whole objective intact in one bounded AI task instead of a lossy decomposition.
+        return _single_task_plan(objective, sig, decision, constraints)
     plan = _finish_plan(objective, nodes, decision, constraints)
     _attach_contracts(plan, objective)
     return plan
@@ -394,9 +471,14 @@ _SLICE_OPERATION = {"T1": "inspect", "T2": "analyze", "T2S": "review", "T3": "im
                     "D": "check"}
 
 
-def _assign_task_slices(nodes: list[dict[str, Any]], slicer: "_Slicer") -> None:
+def _assign_task_slices(nodes: list[dict[str, Any]], slicer: "_Slicer") -> bool:
     """Give each AI stage the bounded master clause that matches its work, so distinct
-    objectives with different requirements cannot collapse into one generic task."""
+    objectives with different requirements cannot collapse into one generic task.
+
+    Returns True when every master clause is covered: clauses a stage claimed, plus any
+    remaining clause absorbed by a primary AI stage. Returns False when a requirement
+    cannot be represented (no AI stage to absorb it), so the caller keeps the objective
+    intact instead of silently dropping it."""
     for node in nodes:
         if node.get("executor") == "TOOL_ONLY":
             continue
@@ -404,6 +486,17 @@ def _assign_task_slices(nodes: list[dict[str, Any]], slicer: "_Slicer") -> None:
         if kind is None:
             continue
         node["objective_summary"] = slicer.for_kind(kind, node["objective_summary"])
+    leftover = slicer.remaining()
+    ai_nodes = [node for node in nodes if node.get("executor") != "TOOL_ONLY"]
+    if not leftover:
+        return True
+    target = next((node for node in ai_nodes if node["task_id"] == "T3"), None)
+    if target is None and ai_nodes:
+        target = ai_nodes[-1]
+    if target is None:
+        return False
+    target["objective_summary"] = target["objective_summary"] + "; " + "; ".join(leftover)
+    return True
 
 
 def _single_task_plan(objective: str, sig: dict[str, bool], decision: dict[str, Any],
