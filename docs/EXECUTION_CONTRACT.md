@@ -32,8 +32,11 @@ The final worker input is built from the task contract, the validated context pa
 known dependency facts, and the acceptance instructions. The context whose identity and
 provenance are recorded **is the context delivered** (embedded in the prompt), and a
 deterministic `delivered_input_fingerprint` (over the contract, context identity,
-dependency fingerprints, and acceptance contract version) is stored with the context
-manifest. One explicit `workspace_root` flows end to end: repository identity, Git
+dependency **semantics**, and acceptance contract version) is stored with the context
+manifest. A dependency with an accepted-result fingerprint is identified by it; a
+dependency without one is identified by the bounded semantic payload actually delivered
+(status and summary), so rendering and fingerprinting can never diverge and ordering is
+deterministic. One explicit `workspace_root` flows end to end: repository identity, Git
 state, context retrieval, deterministic tools, worker `cwd`, mutation checks, and
 artifact validation.
 
@@ -60,6 +63,9 @@ Three deliberately separate concepts:
 acceptance is `PASSED`; acceptance `FAILED` yields `FAILURE` (`ACCEPTANCE_FAILED`); no
 independent acceptance yields `UNVERIFIED` (`ACCEPTANCE_UNVERIFIED`). Exit code 0 and
 non-empty stdout, model prose, or a model completion claim never imply acceptance.
+Acceptance evidence is typed: an unrecognized/malformed field type, or two recognized
+fields that disagree (for example `passed` versus `status`), yields `UNVERIFIED`, never
+`PASSED`. No favorable-field precedence may pick the friendlier of conflicting fields.
 `UNVERIFIED` work is neither success nor failure: it cannot be cached, cannot create
 positive quality evidence, and blocks dependent nodes and finalization. Finalization
 reflects upstream states and never manufactures success.
@@ -98,18 +104,25 @@ unresolved or unaccepted.
 ## Invocation accounting
 
 `worker_launches` increments at the actual launch boundary. A context rejection, policy
-rejection, cache hit, deterministic completion, or no-op consumes **zero**. The engine
-distinguishes logical AI tasks, worker launches, cache reuse, planner calls, retries,
-and fallbacks, and does not claim to bound model turns internal to an external
-coding-agent CLI (which it cannot observe). `--max-ai-calls` bounds worker CLI launches
-made by this engine.
+rejection, cache hit, deterministic completion, or no-op consumes **zero**. Every actual
+worker launch produces exactly one Attempt record — including cancellation, adapter
+exception, read-only violation, failure and timeout; a pre-launch rejection, cache hit or
+TOOL_ONLY completion produces none. The engine distinguishes logical AI tasks, worker
+launches, cache reuse, planner calls, retries, and fallbacks, and does not claim to bound
+model turns internal to an external coding-agent CLI (which it cannot observe).
+`--max-ai-calls` bounds worker CLI launches made by this engine.
 
 ## Resume safety
 
 State writes are atomic. Resume validates repository identity, HEAD, **and** plan/task
-contract identity, refusing a changed objective or contract. A mutating node whose
-terminal status was not durably recorded refuses resume as an uncertain mutation (a
-fail-closed, human-required outcome). Full durable recovery belongs to a later milestone.
+contract identity, refusing a changed objective or contract. A completed AI node is reused
+only after its reuse identity is re-derived from the CURRENT dependency state, so a
+deterministic dependency recomputed to a new fingerprint invalidates a stale descendant
+result instead of silently reusing it. Any mutating AI node whose worker actually launched
+without durable accepted completion — failure, timeout, adapter error or cancellation
+included — refuses resume as an uncertain mutation (a fail-closed, human-required
+outcome); a provably pre-launch rejection stays retry-safe. Full durable recovery belongs
+to a later milestone.
 
 ## Residual limits
 
