@@ -125,12 +125,14 @@ def model_performance(rows: Optional[list] = None, *, task_family: Optional[str]
                                         "model": row["model"], "native_variant": row["native_variant"],
                                         "normalized_effort": row["normalized_effort"],
                                         "task_family": row["task_family"], "samples": 0, "success": 0,
-                                        "reasoning_escalation": 0, "infra_failures": 0})
+                                        "unverified": 0, "reasoning_escalation": 0, "infra_failures": 0})
         entry["samples"] += 1
         entry["success"] += 1 if row["outcome"] == "SUCCESS" else 0
+        entry["unverified"] += 1 if row["outcome"] == "UNKNOWN" else 0
         entry["reasoning_escalation"] += 1 if _is_intelligence(row) else 0
         entry["infra_failures"] += 1 if row["failure_category"] in NON_INTELLIGENCE else 0
         entry["insufficient"] = entry["samples"] < 3
+        entry["success_ratio"] = _ratio(entry["success"], entry["samples"])
     return sorted(groups.values(), key=lambda row: (row["task_family"] or "", row["model"] or ""))
 
 
@@ -176,7 +178,7 @@ def candidates(rows: Optional[list] = None, *, db=None, state_dir=None) -> dict[
                                             len(attempts_at_tier), len(at_tier), 0, non_intel, blocking,
                                             f"{len(at_tier)}/{len(attempts_at_tier)} successes at {tier} "
                                             f"without reasoning escalation",
-                                            proposed_tier=tier))
+                                            proposed_tier=tier, ratio=ratio))
         else:
             lower = [tier for tier in _lower_tiers(current_tier)
                      if any(row["final_tier"] == tier for row in successes)]
@@ -186,16 +188,22 @@ def candidates(rows: Optional[list] = None, *, db=None, state_dir=None) -> dict[
                                         "lower tiers succeeded, but CRITICAL never auto-downgrades",
                                         proposed_tier=lower[0]))
 
-        # lower effort sufficient (same tier)
+        # lower effort sufficient (same tier). The denominator is EVERY observed runtime
+        # attempt at that effort (successes + failures + unverified), so a large
+        # unverified population cannot masquerade as high-confidence success.
         for effort in _lower_efforts(current_effort):
-            at_effort = [row for row in successes if (row["final_effort"] or "").upper() == effort
+            at_effort = [row for row in family_rows
+                         if (row["final_effort"] or "").upper() == effort
                          and row["final_tier"] == current_tier]
+            if not at_effort:
+                continue
+            effort_success = [row for row in at_effort if row["outcome"] == "SUCCESS"]
+            ratio = _ratio(len(effort_success), len(at_effort))
             if len(at_effort) >= (min_samples or 3) and not any(
-                    (row["final_effort"] or "").upper() == effort and _is_intelligence(row)
-                    for row in family_rows):
+                    _is_intelligence(row) for row in at_effort) and ratio >= min_ratio:
                 found.append(_candidate("LOWER_EFFORT_SUFFICIENT", family, current_tier, current_effort,
-                                        len(at_effort), len(at_effort), 0, non_intel, blocking,
-                                        f"{len(at_effort)} successes at {effort} effort",
+                                        len(at_effort), len(effort_success), 0, non_intel, blocking,
+                                        f"{len(effort_success)}/{len(at_effort)} successes at {effort} effort",
                                         proposed_effort=effort))
 
         # current tier too weak
@@ -221,7 +229,9 @@ def candidates(rows: Optional[list] = None, *, db=None, state_dir=None) -> dict[
                                         len(family_rows), len(successes), len(reasoning), {category: count},
                                         blocking, f"{count} recurring {category} (not model weakness)"))
 
-    # model/variant evidence
+    # model/variant evidence. Qualification uses the representative denominator
+    # (successes / all observed attempts), so unverified volume blocks a
+    # high-confidence "effective" claim.
     for row in model_performance(runtime):
         if row["insufficient"]:
             continue
@@ -230,29 +240,37 @@ def candidates(rows: Optional[list] = None, *, db=None, state_dir=None) -> dict[
                           "current": None, "proposed": None, "surface": row["surface"],
                           "provider": row["provider"], "model": row["model"],
                           "native_variant": row["native_variant"], "samples": row["samples"],
-                          "success": row["success"], "reasoning_failures": row["reasoning_escalation"],
+                          "success": row["success"], "unverified": row["unverified"],
+                          "success_ratio": row["success_ratio"],
+                          "reasoning_failures": row["reasoning_escalation"],
                           "non_intelligence_failures": row["infra_failures"], "confidence": "medium",
                           "reason": f"{row['reasoning_escalation']} reasoning escalations for {row['model']}",
                           "blocking": []})
-        elif row["success"] >= 3 and row["reasoning_escalation"] == 0:
+        elif (row["success"] >= 3 and row["reasoning_escalation"] == 0
+              and row["success_ratio"] >= 0.9):
             found.append({"type": "MODEL_VARIANT_EFFECTIVE", "task_family": row["task_family"],
                           "current": None, "proposed": None, "surface": row["surface"],
                           "provider": row["provider"], "model": row["model"],
                           "native_variant": row["native_variant"], "samples": row["samples"],
-                          "success": row["success"], "reasoning_failures": 0,
-                          "non_intelligence_failures": row["infra_failures"], "confidence": "medium",
-                          "reason": f"{row['success']} successes without reasoning escalation for {row['model']}",
+                          "success": row["success"], "unverified": row["unverified"],
+                          "success_ratio": row["success_ratio"],
+                          "reasoning_failures": 0,
+                          "non_intelligence_failures": row["infra_failures"],
+                          "confidence": "high" if row["samples"] >= 5 else "medium",
+                          "reason": f"{row['success']}/{row['samples']} successes without reasoning "
+                                    f"escalation for {row['model']}",
                           "blocking": []})
     return {"candidates": found, "count": len(found)}
 
 
 def _candidate(kind, family, tier, effort, samples, success, reasoning, non_intel, blocking, reason,
-               proposed_tier=None, proposed_effort=None) -> dict[str, Any]:
+               proposed_tier=None, proposed_effort=None, ratio=None) -> dict[str, Any]:
+    confident = samples >= 5 and (ratio is None or ratio >= 0.9)
     return {"type": kind, "task_family": family, "current": {"tier": tier, "effort": effort},
             "proposed": {"tier": proposed_tier, "effort": proposed_effort}, "samples": samples,
-            "success": success, "reasoning_failures": reasoning,
+            "success": success, "success_ratio": ratio, "reasoning_failures": reasoning,
             "non_intelligence_failures": dict(non_intel), "escalations": reasoning,
-            "confidence": "high" if samples >= 5 else "medium",
+            "confidence": "high" if confident else "medium",
             "reason": reason, "blocking": list(blocking)}
 
 

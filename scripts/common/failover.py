@@ -128,7 +128,10 @@ def resolve(required_tier: str, required_effort: str, specs: list[dict[str, Any]
         # never hardcoded in routing — supplied by local runtime capability.
         if candidate["provider"] == "codex" and not candidate.get("model") and health.codex_model:
             candidate["model"] = health.codex_model
-        candidate["verified"] = candidate["provider"] != "codex"  # codex account capability UNVERIFIED
+        # Concrete capability qualification is NOT proven by provider identity, backend
+        # availability, or tier-list membership. Until a reviewed qualification path
+        # exists (Master C), every candidate is retained as UNVERIFIED capability.
+        candidate["verified"] = False
         candidate["status"] = health.status(candidate)
         # Normalized effort is derived ONLY from the provider-native variant, never from the tier.
         try:
