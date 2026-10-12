@@ -86,16 +86,22 @@ Not every successful task is cached. An AI task is reusable only when **all** re
 conditions hold:
 
 - task completed `SUCCESS`, acceptance criteria satisfied
+- **acceptance `PASSED`** — an `UNVERIFIED` result (process completed without
+  independent acceptance) is never cached
+- **provenance matches** — a `SIMULATED` result can only be reused by another
+  simulation and can never satisfy a real/production lookup (and vice versa)
 - result is bounded and structured enough to reuse (an unstructured prose-only result is
   not cached)
 - input identity is known (semantic contract + context + dependencies + freshness)
 - repository/project identity matches
 - dependencies are complete (each dependency has a known accepted-result fingerprint)
-- freshness policy permits reuse; no unresolved failure / partial / read-only violation
+- freshness policy permits reuse; no unresolved failure / partial / read-only violation.
+  A `MUTATING` task is `RUNTIME_VOLATILE`: a cached "patch applied" summary is never
+  reused in place of a verified current postcondition
 - no explicit fresh-execution request
 
 Failure outcomes are **never** stored or returned as successful cached results:
-`FAILED`, `TIMEOUT`, `RATE_LIMIT`, `PROVIDER_503`, `ACCOUNT_MODEL_UNSUPPORTED`,
+`FAILED`, `UNVERIFIED`, `TIMEOUT`, `RATE_LIMIT`, `PROVIDER_503`, `ACCOUNT_MODEL_UNSUPPORTED`,
 `MODEL_UNAVAILABLE`, `BACKEND_UNAVAILABLE`, `PROVIDER_UNAVAILABLE`,
 `READ_ONLY_VIOLATION`, `PERMISSION_REQUIRED`, `CALL_BUDGET_EXHAUSTED`,
 `CONTEXT_BUDGET_INSUFFICIENT`, `CONTEXT_UNSAFE`, `AI_REQUIRED`, `PARTIAL`, `CANCELLED`.
@@ -160,9 +166,20 @@ into key material.
 ### Result fingerprint
 
 The accepted reusable result is projected to a bounded structure (summary, decisions,
-files changed, acceptance results, risk signals) with a deterministic fingerprint. It is
+files changed, acceptance results, risk signals) with a deterministic fingerprint. The
+text fields are **semantic** (whitespace-normalized, not presentation-truncated), so two
+materially different results cannot collide via a shared truncated prefix; presentation
+truncation is a separate concern. The fingerprint is
 used for downstream dependency identity, descendant invalidation, and integrity
 validation. It never depends on timestamps, run ids, or provider request ids.
+
+### Identity version and legacy entries
+
+Identity semantics are versioned (`task-semantic-v2`, `context-v2`, `input-v2`,
+`result-v2`, `acceptance-v2`, cache `schema_version 2`). When identity semantics change,
+the version is bumped and older rows are treated as **inert** — a lookup on a prior
+schema returns a safe miss (`CACHE_INVALID`) instead of an unproven reuse. Cache
+databases are never deleted to force this; versioning makes stale entries ineligible.
 
 ## Incremental DAG reuse
 
@@ -172,7 +189,8 @@ reason code:
 `UNCHANGED_INPUTS`, `SOURCE_CHANGED`, `CONTEXT_CHANGED`, `DEPENDENCY_CHANGED`,
 `KNOWLEDGE_CHANGED`, `CONTRACT_CHANGED`, `ACCEPTANCE_CHANGED`, `FRESHNESS_POLICY`,
 `CACHE_MISS`, `CACHE_INVALID`, `USER_FORCED_REFRESH`, `CAPABILITY_INCOMPATIBLE`,
-`REPOSITORY_MISMATCH`, `WEAKER_CAPABILITY`, `EXPLICIT_MODEL_REQUEST`.
+`REPOSITORY_MISMATCH`, `WEAKER_CAPABILITY`, `EXPLICIT_MODEL_REQUEST`,
+`SIMULATION_PROVENANCE_MISMATCH`.
 
 Descendants are **not** blindly rerun when an ancestor reruns. Invalidation follows the
 meaningful dependency data:

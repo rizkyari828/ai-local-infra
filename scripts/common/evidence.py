@@ -22,7 +22,7 @@ import infra  # scripts/common, on sys.path
 import derived_knowledge as knowledge  # scripts/common, on sys.path
 
 ROOT = infra.ROOT
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "3"
 BUSY_TIMEOUT_MS = 5000
 MAX_FIELD_TEXT = 200
 
@@ -32,10 +32,10 @@ EVIDENCE_FIELDS = (
     "normalized_effort", "initial_tier", "initial_effort", "final_tier", "final_effort",
     "outcome", "escalated", "failure_category", "source", "confidence", "completion_signal",
     "attempt_count", "user_override_tier", "user_override_effort", "user_override_model",
-    "execution_id", "lesson_ids", "routing_decision_id",
+    "execution_id", "lesson_ids", "routing_decision_id", "simulated",
 )
 _REQUIRED = ("observation_id", "recorded_at", "outcome", "source")
-_BOOL_FIELDS = ("escalated",)
+_BOOL_FIELDS = ("escalated", "simulated")
 _NUM_FIELDS = ("attempt_count",)
 _JSON_FIELDS = ("lesson_ids",)
 _TEXT_FIELDS = tuple(field for field in EVIDENCE_FIELDS if field not in _BOOL_FIELDS + _NUM_FIELDS + _JSON_FIELDS)
@@ -100,7 +100,7 @@ def _initialize(connection: sqlite3.Connection) -> None:
         "outcome TEXT NOT NULL, escalated INTEGER NOT NULL DEFAULT 0, failure_category TEXT,"
         "source TEXT NOT NULL, confidence TEXT, completion_signal TEXT, attempt_count INTEGER,"
         "user_override_tier TEXT, user_override_effort TEXT, user_override_model TEXT,"
-        "execution_id TEXT, lesson_ids TEXT, routing_decision_id TEXT)")
+        "execution_id TEXT, lesson_ids TEXT, routing_decision_id TEXT, simulated INTEGER)")
     _ensure_columns(connection, "evidence", EVIDENCE_FIELDS)
     connection.execute(
         "CREATE TABLE IF NOT EXISTS pending ("
@@ -162,8 +162,9 @@ def validate_observation(record: dict[str, Any]) -> dict[str, Any]:
     for field in _TEXT_FIELDS:
         if field in record:
             _clean_text(record.get(field), field)
-    if "escalated" in record and not isinstance(record["escalated"], bool):
-        raise EvidenceError("escalated must be true or false")
+    for field in _BOOL_FIELDS:
+        if field in record and not isinstance(record[field], bool):
+            raise EvidenceError(f"{field} must be true or false")
     return record
 
 

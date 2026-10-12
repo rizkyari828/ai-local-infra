@@ -153,7 +153,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     if report.get("error"):
         return 2
     final = report.get("final") or {}
-    return 1 if final.get("failed") or final.get("cancelled") else 0
+    return 1 if final.get("failed") or final.get("unverified") or final.get("cancelled") else 0
 
 
 def _tier(value: str) -> str:

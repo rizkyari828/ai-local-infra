@@ -84,8 +84,14 @@ Cache reuse events `CACHE_HIT`, `CACHE_MISS`, `CACHE_REJECTED`, `CACHE_ENTRY_WRI
 practical.
 
 Statuses are fixed sets: Run `PLANNED/RUNNING/SUCCEEDED/FAILED/BLOCKED/CANCELLED`;
-Task `PENDING/RUNNING/SUCCESS/FAILED/SKIPPED/NO_CHANGE_REQUIRED/AI_REQUIRED/BLOCKED`;
-Attempt `PENDING/RUNNING/SUCCESS/FAILED`. `NO_CHANGE_REQUIRED` is a status, not an
+Task `PENDING/RUNNING/SUCCESS/FAILED/SKIPPED/NO_CHANGE_REQUIRED/AI_REQUIRED/BLOCKED/CANCELLED/NOT_RUN/UNVERIFIED`;
+Attempt `PENDING/RUNNING/SUCCESS/FAILED/UNVERIFIED`. Every engine outcome is mapped
+explicitly into this canonical task vocabulary (`to_operational_task_status`): engine
+`FAILURE` → `FAILED`, an unaccepted completion → `UNVERIFIED`, and any unrecognised
+terminal status → `FAILED` — never silently dropped, so a failed/unverified/cancelled
+task never leaves its run `RUNNING`/`PENDING`. Event types map accordingly (`SUCCESS` /
+`NO_CHANGE_REQUIRED` → `TASK_COMPLETED*`; `AI_REQUIRED` → `TASK_AI_REQUIRED`; all other
+terminal task statuses → `TASK_FAILED`). `NO_CHANGE_REQUIRED` is a status, not an
 intelligence failure. Failure categories reuse the learning taxonomy (`RATE_LIMIT`,
 `PROVIDER_503`, `ACCOUNT_MODEL_UNSUPPORTED`, `REASONING_INSUFFICIENT`,
 `PERMISSION_REQUIRED`, `READ_ONLY_VIOLATION`, `CALL_BUDGET_EXHAUSTED`,

@@ -44,8 +44,21 @@ def _is_intelligence(row) -> bool:
     return row["failure_category"] == INTELLIGENCE_CATEGORY
 
 
+def _is_simulated(row) -> bool:
+    if "simulated" not in row.keys():
+        return False
+    value = row["simulated"]
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return value.strip().lower() not in ("", "0", "false")
+    return bool(value)
+
+
 def _is_runtime(row) -> bool:
-    return row["source"] == "observed_runtime"
+    """Real observed runtime evidence only: simulation/fake runs are never production
+    quality evidence and must not influence routing/capability decisions."""
+    return row["source"] == "observed_runtime" and not _is_simulated(row)
 
 
 def aggregate(rows: Optional[list] = None, *, db=None, state_dir=None) -> dict[str, Any]:
@@ -78,6 +91,7 @@ def family_learning(family: str, rows: Optional[list] = None, *, db=None, state_
         "success": sum(1 for row in rows if row["outcome"] == "SUCCESS"),
         "reasoning_failures": sum(1 for row in rows if _is_intelligence(row)),
         "non_intelligence_failures": sum(1 for row in rows if row["failure_category"] in NON_INTELLIGENCE),
+        "unknown": sum(1 for row in rows if row["outcome"] == "UNKNOWN"),
         "escalations": sum(1 for row in rows if row["escalated"]),
         "success_by_initial_tier": _success_by(rows, "initial_tier"),
         "success_by_final_tier": _success_by(rows, "final_tier"),
@@ -153,10 +167,15 @@ def candidates(rows: Optional[list] = None, *, db=None, state_dir=None) -> dict[
             for tier in _lower_tiers(current_tier):
                 at_tier = [row for row in successes if row["final_tier"] == tier]
                 weak = [row for row in reasoning if row["final_tier"] == tier]
-                if len(at_tier) >= min_samples and not weak and _ratio(len(at_tier), len(at_tier)) >= min_ratio:
+                # Denominator includes representative negatives/unknowns at that tier:
+                # a non-empty success set must not imply 100% success.
+                attempts_at_tier = [row for row in family_rows if row["final_tier"] == tier]
+                ratio = _ratio(len(at_tier), len(attempts_at_tier))
+                if len(at_tier) >= min_samples and not weak and ratio >= min_ratio:
                     found.append(_candidate("CHEAPER_TIER_SUFFICIENT", family, current_tier, current_effort,
-                                            len(at_tier), len(at_tier), 0, non_intel, blocking,
-                                            f"{len(at_tier)} successes at {tier} without reasoning escalation",
+                                            len(attempts_at_tier), len(at_tier), 0, non_intel, blocking,
+                                            f"{len(at_tier)}/{len(attempts_at_tier)} successes at {tier} "
+                                            f"without reasoning escalation",
                                             proposed_tier=tier))
         else:
             lower = [tier for tier in _lower_tiers(current_tier)

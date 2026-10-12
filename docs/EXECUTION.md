@@ -31,6 +31,14 @@ and failure classification. It receives a bounded request: `execution_id`, `task
 `objective_summary`, context manifest, dependency summaries, acceptance criteria,
 and working directory — never the raw master conversation.
 
+The request also carries the **complete task contract** (task-specific objective,
+operation, targets, permissions, dependencies, acceptance, capability requirement)
+and the **validated context pack**; the final worker prompt is built from them, so
+the context whose identity/provenance is recorded is the context actually delivered.
+`working directory` is the single explicit **workspace root** for the run (used for
+Git checks, context retrieval, deterministic tools, the worker `cwd`, and mutation
+checks). See `docs/EXECUTION_CONTRACT.md`.
+
 Discovered local support:
 
 | Backend | Non-interactive | Model select | Effort select | Mode |
@@ -63,9 +71,15 @@ never the raw worker response.
 
 ## Acceptance validation and failure classification
 
-A worker saying "done" is not enough: acceptance criteria are validated where
-deterministic checks exist, and only a bounded completion signal marks `SUCCESS`.
-Failures reuse the existing taxonomy. `INFRA_*` categories (`PROVIDER_503`,
+Process completion and task acceptance are **separate**. A backend exiting 0 with
+output is a *completed process*, not an accepted task. `_acceptance` classifies each
+node independently: `PASSED` only when every required criterion has explicit passing
+evidence, `FAILED` when a required criterion fails, and `UNVERIFIED` when the process
+completed but no independent acceptance exists. An `UNVERIFIED` node is neither
+success nor failure: it cannot create positive quality evidence, cannot be cached, and
+blocks downstream nodes/finalization. A model's prose ("I reviewed it.", "I cannot
+complete the requested work.") is never acceptance. Failures reuse the existing
+taxonomy. `INFRA_*` categories (`PROVIDER_503`,
 `RATE_LIMIT`, `TIMEOUT`, `STALE_SESSION`, `AUTH_FAILURE`, `SAFETY_GUARD`) never
 escalate intelligence — they are bounded-retried, then reported. Only
 `REASONING_INSUFFICIENT` escalates the affected node (BALANCED -> STRONG, etc.);
@@ -84,9 +98,12 @@ failures are recorded as non-intelligence evidence.
 ## Resume, cancellation, call bounds
 
 Run state is bounded and machine-local (`$LAI_STATE_DIR/orchestration/<run-id>/`,
-excluded from Git; no raw prompts/chats/transcripts/credentials). `--resume`
-reuses successful nodes, validating repository identity and HEAD; an incompatible
-repository refuses resume rather than reusing stale results. Cancellation marks the
+excluded from Git; no raw prompts/chats/transcripts/credentials, and persisted result
+tails are redacted). Writes are atomic. `--resume` reuses successful nodes only after
+validating repository identity, HEAD, AND the plan/task-contract identity (a changed
+objective or task contract refuses resume); a mutating node whose terminal status was
+not durably recorded refuses resume as an uncertain mutation. An incompatible
+repository or plan refuses resume rather than reusing stale results. Cancellation marks the
 current node `CANCELLED` and the rest `NOT_RUN` (no fabricated outcomes). Before a
 confirmed run, the call bounds are shown: planned AI nodes, conditional nodes, and
 the bounded retry/escalation maximum; workers are instructed not to spawn nested
@@ -107,10 +124,15 @@ and UI automation.
   never silently rewritten).
 - **Hard AI-call budget**: `--max-ai-calls N` is a hard ceiling shared across every
   real worker launch — initial nodes, same-tier retries, infra retries, reasoning
-  escalation, conditional nodes, and final integration. Before each launch the
+  escalation, conditional nodes, and final integration. The counter increments at the
+  actual worker launch boundary: a node rejected before launch (missing/invalid
+  context, policy rejection, cache hit, deterministic completion) consumes **zero**.
+  Before each launch the
   remaining budget is checked; if exhausted the node returns
   `CALL_BUDGET_EXHAUSTED`, downstream nodes are `NOT_RUN`, and state is preserved.
-  Planning/dry-run consume nothing. Bounds distinguish `planned_calls`,
+  Planning/dry-run consume nothing. The budget bounds worker CLI launches made by this
+  engine; it cannot bound model turns internal to an external coding-agent CLI, which
+  the engine cannot observe. Bounds distinguish `planned_calls`,
   `possible_conditional_calls`, `possible_retry_calls` from `hard_max_ai_calls`,
   `actual_calls_used`, `remaining_calls`. `--resume` never resets the counter: the
   persisted `calls_used` and ceiling are reused.
@@ -119,10 +141,14 @@ and UI automation.
   `REASONING_INSUFFICIENT`) and is **not** intelligence-escalated. No automatic
   permission approval is ever performed; the CLI timeout remains the final safety
   net.
-- **Read-only enforcement**: for `READ_ONLY` runs the orchestrator captures the
-  worktree before each node and rejects any tracked/untracked change as
+- **Read-only enforcement**: a `READ_ONLY` node keeps its restriction even inside a
+  `MIXED` graph. Before each such node the orchestrator captures the worktree paths
+  AND a content/state fingerprint (status + `git diff`), and rejects any change —
+  including further edits to a file that was already dirty — as
   `READ_ONLY_VIOLATION`, stopping downstream nodes and reporting the changed paths
-  without any automatic reset/revert. Where a backend supports it, a safe sandbox is
+  without any automatic reset/revert. Residual limit: this is post-hoc detection, not
+  a sandbox; ignored files and untracked content outside `git status` are not covered.
+  Where a backend supports it, a safe sandbox is
   propagated (Codex: `-s read-only`); OpenCode has no read-only flag (only the
   dangerous `--auto`), so OpenCode relies on orchestration + worker instructions +
   the post-node Git check.

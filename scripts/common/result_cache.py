@@ -36,15 +36,21 @@ import routing  # scripts/common, on sys.path (tier/effort order)
 ROOT = infra.ROOT
 DB_SUBDIR = "cache"
 DB_FILENAME = "result-cache.db"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 BUSY_TIMEOUT_MS = 5000
 MAX_RESULT_JSON = 8000  # bounded structured accepted result
 
-TASK_SEMANTIC_SCHEMA = "task-semantic-v1"
-CONTEXT_SCHEMA = "context-v1"
-INPUT_SCHEMA = "input-v1"
-RESULT_SCHEMA = "result-v1"
-ACCEPTANCE_CONTRACT_VERSION = "acceptance-v1"
+TASK_SEMANTIC_SCHEMA = "task-semantic-v2"
+CONTEXT_SCHEMA = "context-v2"
+INPUT_SCHEMA = "input-v2"
+RESULT_SCHEMA = "result-v2"
+ACCEPTANCE_CONTRACT_VERSION = "acceptance-v2"
+
+# Execution provenance. A simulation result is only ever reusable by another
+# simulation; it can never satisfy a real/production cache lookup or quality evidence.
+PROVENANCE_REAL = "REAL"
+PROVENANCE_SIMULATED = "SIMULATED"
+PROVENANCES = (PROVENANCE_REAL, PROVENANCE_SIMULATED)
 
 # Freshness / reuse semantics (repository-native names, conservative defaults).
 FRESHNESS_PURE = "PURE"
@@ -77,6 +83,7 @@ REASON_REPOSITORY_MISMATCH = "REPOSITORY_MISMATCH"
 REASON_WEAKER_CAPABILITY = "WEAKER_CAPABILITY"
 REASON_EXPLICIT_MODEL = "EXPLICIT_MODEL_REQUEST"
 REASON_RESULT_NOT_REUSABLE = "RESULT_NOT_REUSABLE"
+REASON_SIMULATION_MISMATCH = "SIMULATION_PROVENANCE_MISMATCH"
 
 # Volatile AI cues: current runtime state matters, so an old result must not be
 # reused. Conservative — an unrecognised task defaults to INPUT_BOUND, never PURE.
@@ -94,7 +101,7 @@ NEVER_REUSE_AS_SUCCESS = (
     "MODEL_UNAVAILABLE", "BACKEND_UNAVAILABLE", "PROVIDER_UNAVAILABLE",
     "READ_ONLY_VIOLATION", "PERMISSION_REQUIRED", "CALL_BUDGET_EXHAUSTED",
     "CONTEXT_BUDGET_INSUFFICIENT", "CONTEXT_UNSAFE", "AI_REQUIRED", "PARTIAL",
-    "CANCELLED", "BLOCKED", "NOT_RUN", "UNKNOWN", "SKIPPED", "FAILURE",
+    "CANCELLED", "BLOCKED", "NOT_RUN", "UNKNOWN", "SKIPPED", "FAILURE", "UNVERIFIED",
 )
 
 _INVALID = object()  # corruption / schema-incompatibility sentinel
@@ -150,6 +157,7 @@ def task_semantic_fingerprint(node: dict[str, Any], *,
         "objective_summary": objective,
         "acceptance_criteria": sorted(str(c) for c in (node.get("acceptance_criteria") or [])),
         "acceptance_contract": acceptance_contract,
+        "task_contract": node.get("task_contract"),
         "required_tier": routing_c.get("tier"),
         "required_effort": routing_c.get("effort"),
         "produces_artifacts": sorted(str(p) for p in (node.get("produces_artifacts") or [])),
@@ -197,14 +205,23 @@ def input_fingerprint(*, project_id: str, task_semantic_fingerprint: str,
 
 
 def _bounded_text(value: Any, limit: int = 400) -> str:
-    text = " ".join(str(value or "").split())
+    """PRESENTATION truncation only. Never used to derive a semantic identity."""
+    text = _normalize(value)
     return text if len(text) <= limit else text[: limit - 3] + "..."
+
+
+def _normalize(value: Any) -> str:
+    """Whitespace-normalized semantic text, NOT truncated: two materially different
+    results must not collide merely because they share a truncated prefix."""
+    return " ".join(str(value or "").split())
 
 
 def bounded_result(node: dict[str, Any], result: dict[str, Any]) -> Optional[dict[str, Any]]:
     """Extract the bounded, structured, reusable projection of an accepted result.
     Returns None when the result is not structured enough to reuse safely (e.g. an
-    unbounded prose blob or a partial/failed result)."""
+    unbounded prose blob or a partial/failed result). The text fields are semantic
+    (normalized, not presentation-truncated); storage stays bounded by
+    MAX_RESULT_JSON at write time."""
     if node.get("executor") == "TOOL_ONLY":
         payload = result.get("result")
         if not isinstance(payload, dict) or not payload:
@@ -216,8 +233,8 @@ def bounded_result(node: dict[str, Any], result: dict[str, Any]) -> Optional[dic
     if not all(bool(ok) for ok in acceptance.values()):
         return None
     return {
-        "summary": _bounded_text(result.get("summary")),
-        "decisions": [_bounded_text(entry) for entry in (result.get("decisions") or [])],
+        "summary": _normalize(result.get("summary")),
+        "decisions": [_normalize(entry) for entry in (result.get("decisions") or [])],
         "files_changed": sorted(str(f) for f in (result.get("files_changed") or [])),
         "acceptance_results": {str(k): bool(v) for k, v in sorted(acceptance.items())},
         "new_risk_signals": sorted(str(s) for s in (result.get("new_risk_signals") or [])),
@@ -252,6 +269,10 @@ def freshness_policy(node: dict[str, Any], *, constraints: Optional[dict[str, An
         # Cheap deterministic operations are recomputed from current state; a pure
         # operation must explicitly opt in to reuse.
         return FRESHNESS_RUNTIME_VOLATILE
+    if (node or {}).get("intent") == "MUTATING":
+        # A mutating task is never reused from a stale "patch applied" summary; reuse
+        # would require a verified current postcondition the cache cannot observe.
+        return FRESHNESS_RUNTIME_VOLATILE
     text = (node.get("objective_summary") or "").lower()
     if any(cue in text for cue in _VOLATILE_CUES):
         return FRESHNESS_RUNTIME_VOLATILE
@@ -268,6 +289,8 @@ def eligible_for_cache(node: dict[str, Any], result: dict[str, Any], *,
     """Deterministic gate for writing a reusable result. Never caches failed,
     partial, uncacheable-volatile, or non-structured results."""
     if result.get("status") in NEVER_REUSE_AS_SUCCESS or result.get("status") != "SUCCESS":
+        return False, REASON_RESULT_NOT_REUSABLE
+    if result.get("acceptance") and result.get("acceptance") != "PASSED":
         return False, REASON_RESULT_NOT_REUSABLE
     if result.get("failure_category"):
         return False, REASON_RESULT_NOT_REUSABLE
@@ -342,6 +365,12 @@ _MIGRATIONS: list[tuple[int, list[str]]] = [
         "CREATE INDEX IF NOT EXISTS idx_cache_semantic ON cache_entries(task_semantic_fingerprint)",
         "CREATE INDEX IF NOT EXISTS idx_cache_created ON cache_entries(created_at)",
     ]),
+    # v2: explicit execution provenance (REAL/SIMULATED) + hardened identity schemas.
+    # Entries written under v1 identity semantics become inert (schema mismatch =>
+    # safe miss) rather than silently reusable.
+    (2, [
+        "ALTER TABLE cache_entries ADD COLUMN result_provenance TEXT",
+    ]),
 ]
 
 
@@ -408,9 +437,12 @@ class ResultCache:
               original_provider: Optional[str] = None, original_model: Optional[str] = None,
               original_required_tier: Optional[str] = None, original_required_effort: Optional[str] = None,
               original_native_effort: Optional[str] = None,
-              original_normalized_effort: Optional[str] = None) -> str:
+              original_normalized_effort: Optional[str] = None,
+              result_provenance: str = PROVENANCE_REAL) -> str:
         if freshness_policy not in FRESHNESS_POLICIES:
             raise CacheError(f"unknown freshness policy: {freshness_policy}")
+        if result_provenance not in PROVENANCES:
+            raise CacheError(f"unknown result provenance: {result_provenance}")
         payload = _canonical(result)
         if len(payload) > MAX_RESULT_JSON:
             raise CacheError("result exceeds bounded cache size")
@@ -429,15 +461,15 @@ class ResultCache:
                   self._clean(original_required_effort, "original_required_effort"),
                   self._clean(original_native_effort, "original_native_effort"),
                   self._clean(original_normalized_effort, "original_normalized_effort"),
-                  freshness_policy, _now(), SCHEMA_VERSION)
+                  freshness_policy, result_provenance, _now(), SCHEMA_VERSION)
         with self.connection:
             self.connection.execute(
                 "INSERT INTO cache_entries (cache_entry_id, project_id, task_semantic_fingerprint,"
                 " input_fingerprint, context_manifest_fingerprint, result_fingerprint, result_type,"
                 " bounded_result, original_run_id, original_task_id, original_backend, original_provider,"
                 " original_model, original_required_tier, original_required_effort, original_native_effort,"
-                " original_normalized_effort, freshness_policy, created_at, schema_version)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", values)
+                " original_normalized_effort, freshness_policy, result_provenance, created_at, schema_version)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", values)
         return entry_id
 
     def lookup(self, project_id: str, input_fingerprint: str) -> Any:
@@ -488,7 +520,8 @@ def is_invalid(entry: Any) -> bool:
 def decide(*, store: ResultCache, project_id: str, node: dict[str, Any], identity: dict[str, Any],
            required_tier: Optional[str], required_effort: Optional[str], freshness: str,
            force_refresh: bool = False, explicit_model: bool = False,
-           allow_stronger_reuse: bool = True, dependencies_complete: bool = True) -> dict[str, Any]:
+           allow_stronger_reuse: bool = True, dependencies_complete: bool = True,
+           provenance: str = PROVENANCE_REAL) -> dict[str, Any]:
     """Deterministic per-node decision: REUSE vs RERUN with a bounded reason code.
     Unknown/uncertain state always falls back to RERUN (safe cache miss)."""
     base = {"task_id": node.get("task_id"), "decision": RERUN, "reason": None, "entry": None,
@@ -513,6 +546,9 @@ def decide(*, store: ResultCache, project_id: str, node: dict[str, Any], identit
         return {**base, "reason": REASON_CACHE_INVALID}
     if entry.get("project_id") != project_id:
         return {**base, "reason": REASON_REPOSITORY_MISMATCH}
+    if (entry.get("result_provenance") or PROVENANCE_REAL) != provenance:
+        # A simulation result must never satisfy a real lookup (nor the reverse).
+        return {**base, "reason": REASON_SIMULATION_MISMATCH}
     compatibility = capability_compatible(entry, required_tier=required_tier,
                                           required_effort=required_effort, allow_stronger=allow_stronger_reuse)
     if not compatibility["ok"]:

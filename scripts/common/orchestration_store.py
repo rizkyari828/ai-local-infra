@@ -39,7 +39,28 @@ RUN_STATUSES = ("PLANNED", "RUNNING", "SUCCEEDED", "FAILED", "BLOCKED", "CANCELL
 # CHAT_HANDOFF controller may have already spent AI calls the engine cannot see.
 ENTRY_MODES = ("CHAT_HANDOFF", "DIRECT_CLI", "AUTOMATION", "API_OR_UI_FUTURE")
 TASK_STATUSES = ("PENDING", "RUNNING", "SUCCESS", "FAILED", "SKIPPED", "NO_CHANGE_REQUIRED",
-                 "AI_REQUIRED", "BLOCKED")
+                 "AI_REQUIRED", "BLOCKED", "CANCELLED", "NOT_RUN", "UNVERIFIED")
+# One canonical terminal vocabulary. Every engine outcome maps here explicitly; an
+# unrecognised terminal status is recorded as FAILED, never silently dropped.
+TASK_TERMINAL_MAP = {
+    "SUCCESS": "SUCCESS", "NO_CHANGE_REQUIRED": "NO_CHANGE_REQUIRED", "AI_REQUIRED": "AI_REQUIRED",
+    "SKIPPED": "SKIPPED", "BLOCKED": "BLOCKED", "NOT_RUN": "NOT_RUN", "CANCELLED": "CANCELLED",
+    "UNVERIFIED": "UNVERIFIED", "FAILURE": "FAILED", "FAILED": "FAILED",
+}
+
+
+def to_operational_task_status(status: Optional[str]) -> str:
+    """Map any engine outcome into the one canonical operational task vocabulary."""
+    if status in TASK_TERMINAL_MAP:
+        return TASK_TERMINAL_MAP[status]
+    if status in TASK_STATUSES:
+        return status
+    return "FAILED"
+
+
+def is_task_success(status: Optional[str]) -> bool:
+    return to_operational_task_status(status) in ("SUCCESS", "NO_CHANGE_REQUIRED", "SKIPPED")
+
 EXECUTOR_TYPES = ("TOOL_ONLY", "AI")
 EVENT_TYPES = (
     "RUN_CREATED", "RUN_STARTED", "RUN_COMPLETED", "RUN_FAILED",
@@ -55,7 +76,8 @@ FAILURE_TAXONOMY = (
     "RATE_LIMIT", "PROVIDER_503", "TIMEOUT", "ACCOUNT_MODEL_UNSUPPORTED", "MODEL_UNAVAILABLE",
     "BACKEND_UNAVAILABLE", "PROVIDER_UNAVAILABLE", "REASONING_INSUFFICIENT", "PERMISSION_REQUIRED",
     "READ_ONLY_VIOLATION", "CALL_BUDGET_EXHAUSTED", "TOOL_EXECUTION_FAILED",
-    "DETERMINISTIC_CHECK_FAILED", "INSUFFICIENT_AI_CALL_BUDGET", "NO_CHANGE_REQUIRED",
+    "DETERMINISTIC_CHECK_FAILED", "ACCEPTANCE_FAILED", "ACCEPTANCE_UNVERIFIED",
+    "INSUFFICIENT_AI_CALL_BUDGET", "NO_CHANGE_REQUIRED",
     "AI_REQUIRED", "IMPLEMENTATION_ERROR", "INFRA_FAILURE", "AUTH_FAILURE", "SAFETY_GUARD",
     "STALE_SESSION", "CONFIG_DRIFT", "UNKNOWN_FAILURE",
 )
@@ -330,7 +352,7 @@ class OrchestrationStore:
         if status not in TASK_STATUSES:
             raise StoreError(f"unknown task status: {status}")
         event = {"SUCCESS": "TASK_COMPLETED", "NO_CHANGE_REQUIRED": "TASK_NO_CHANGE_REQUIRED",
-                 "AI_REQUIRED": "TASK_AI_REQUIRED", "FAILED": "TASK_FAILED"}.get(status, "TASK_COMPLETED")
+                 "AI_REQUIRED": "TASK_AI_REQUIRED"}.get(status, "TASK_FAILED")
         with self.connection:
             self.connection.execute(
                 "UPDATE tasks SET status=?, completed_at=?, failure_category=?, execution_source=?,"
@@ -584,7 +606,7 @@ def persist_run(plan: dict[str, Any], report: dict[str, Any], *, machine_id: str
                              is_retry=attempt.get("is_retry", False), is_fallback=attempt.get("is_fallback", False),
                              completion_signal=attempt.get("completion_signal"))
     for task_id, result in (report.get("nodes") or {}).items():
-        store.finish_task(run_id, task_id, result.get("status", "FAILED"),
+        store.finish_task(run_id, task_id, to_operational_task_status(result.get("status", "FAILED")),
                           failure_category=result.get("failure_category"),
                           execution_source=result.get("execution_source"),
                           cache_entry_id=result.get("cache_entry_id"),
@@ -611,7 +633,9 @@ def persist_run(plan: dict[str, Any], report: dict[str, Any], *, machine_id: str
                 store.cache_event(run_id, "CACHE_MISS", task_id=task_id,
                                   payload={"reason": decision.get("reason")})
     failed = report.get("final", {}).get("failed", 0)
-    run_status = "SUCCEEDED" if not failed and not report.get("error") else "FAILED"
+    statuses = [result.get("status") for result in (report.get("nodes") or {}).values()]
+    unresolved = [s for s in statuses if not is_task_success(s)]
+    run_status = "SUCCEEDED" if not unresolved and not failed and not report.get("error") else "FAILED"
     store.finish_run(run_id, run_status, used_ai_calls=report.get("calls_used"),
                      final_head=report.get("head"), failure_category=report.get("error"))
     if owns:

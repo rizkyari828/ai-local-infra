@@ -13,6 +13,7 @@ workers. Provider-specific invocation lives only inside a bounded adapter.
 from __future__ import annotations
 
 import json
+import hashlib
 import pathlib
 import shutil
 import subprocess
@@ -37,10 +38,41 @@ REASONING = "REASONING_INSUFFICIENT"
 IMPLEMENTATION = "IMPLEMENTATION_ERROR"
 NEXT_TIER = {"FAST": "BALANCED", "BALANCED": "STRONG", "STRONG": "MAX", "MAX": None}
 SUCCESS, FAILURE, SKIPPED, BLOCKED, NOT_RUN, CANCELLED = "SUCCESS", "FAILURE", "SKIPPED", "BLOCKED", "NOT_RUN", "CANCELLED"
+UNVERIFIED = "UNVERIFIED"  # process completed but independent task acceptance is unavailable
+ACCEPTED = (SUCCESS, "NO_CHANGE_REQUIRED")
+
+# Task acceptance is INDEPENDENT of process completion. A model's prose or exit code
+# is never acceptance; structured criteria that pass are the only auto-accepted signal.
+ACCEPTANCE_PASSED, ACCEPTANCE_FAILED, ACCEPTANCE_UNVERIFIED = "PASSED", "FAILED", "UNVERIFIED"
 
 WORKER_ISOLATION_NOTE = ("Execute only this node's objective. Do not re-plan the master "
                          "objective, do not spawn nested orchestrators or sub-agents, and return "
                          "a concise structured result.")
+
+_EXPLANATORY_ACCEPTANCE = ("i reviewed", "i cannot", "cannot complete", "unable to",
+                           "i was unable", "not able to complete")
+
+
+def _acceptance(node: dict[str, Any], result: dict[str, Any]) -> tuple[str, Optional[str]]:
+    """Classify task acceptance independently of the process exit status.
+
+    PASSED      -> every required criterion has explicit evidence and passes
+    FAILED      -> explicit negative/incomplete evidence for a required criterion
+    UNVERIFIED  -> the process completed but no independent acceptance is available
+    """
+    acceptance = result.get("acceptance_results")
+    criteria = list(node.get("acceptance_criteria") or [])
+    if isinstance(acceptance, dict) and acceptance:
+        missing = [c for c in criteria if c not in acceptance]
+        if missing:
+            return ACCEPTANCE_UNVERIFIED, "acceptance evidence incomplete"
+        if all(bool(acceptance[c]) for c in criteria):
+            return ACCEPTANCE_PASSED, None
+        return ACCEPTANCE_FAILED, "acceptance criterion not satisfied"
+    summary = (result.get("summary") or "").lower()
+    if any(cue in summary for cue in _EXPLANATORY_ACCEPTANCE):
+        return ACCEPTANCE_UNVERIFIED, "worker did not claim task completion"
+    return ACCEPTANCE_UNVERIFIED, "no independent acceptance evidence"
 
 
 class ExecutionError(RuntimeError):
@@ -284,6 +316,37 @@ def _worktree_paths(root: pathlib.Path) -> set[str]:
     return {line[3:].strip() for line in status.splitlines() if line.strip()}
 
 
+def _git_raw(root: pathlib.Path, *args: str) -> str:
+    try:
+        result = subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True)
+    except OSError:
+        return ""
+    return result.stdout or ""
+
+
+def _worktree_fingerprint(root: pathlib.Path) -> str:
+    """Content+state fingerprint of the working tree. Unlike a changed-path diff, this
+    also detects further edits to files that were already dirty before the run, so a
+    read-only violation on an already-dirty file is still caught.
+
+    Known residual limit: ignored files and untracked content outside `git status`
+    output are not covered; this is post-hoc detection, not a sandbox."""
+    digest = hashlib.sha256()
+    for part in ("status --porcelain -z", "diff --no-color", "diff --cached --no-color"):
+        digest.update(part.encode())
+        digest.update(_git_raw(root, *part.split()).encode("utf-8", "replace"))
+        digest.update(b"\x00")
+    return digest.hexdigest()
+
+
+def workspace_root(root: Optional[pathlib.Path] = None) -> pathlib.Path:
+    """Resolve ONE explicit workspace root used for Git, context, tools and cwd."""
+    resolved = pathlib.Path(root or ROOT).expanduser()
+    if not resolved.exists() or not resolved.is_dir():
+        raise ExecutionError(f"WORKSPACE_INVALID: workspace root is not a directory: {resolved}")
+    return resolved.resolve()
+
+
 # --------------------------------------------------------------------------- #
 # Execution
 # --------------------------------------------------------------------------- #
@@ -310,7 +373,7 @@ def execute_plan(plan: dict[str, Any], *, backend: Backend, run_id: Optional[str
         raise ExecutionError("refusing to execute an invalid plan")
     if not confirm and not dry_run:
         raise ExecutionError("execution requires --confirm (or use --dry-run)")
-    repo_root = pathlib.Path(repo_root or ROOT)
+    repo_root = workspace_root(repo_root)
     tool_executor = tool_executor or deterministic.ToolExecutor(root=repo_root)
     state = repo_state(repo_root)
     enforce_read_only = read_only or plan.get("intent") == "READ_ONLY"
@@ -349,10 +412,22 @@ def execute_plan(plan: dict[str, Any], *, backend: Backend, run_id: Optional[str
     run_id = run_id or uuid.uuid4().hex[:12]
     report["run_id"] = run_id
     run_dir = pathlib.Path(state_dir or infra.STATE_DIR) / "orchestration" / run_id
+    plan_fingerprint = _plan_fingerprint(plan)
+    state["plan_fingerprint"] = plan_fingerprint
+    state["intent"] = plan.get("intent")
     previous = _load_state(run_dir) if resume else None
     if resume and previous:
         if previous.get("head") != state["head"] or previous.get("repo") != state["root"]:
             report["error"] = "REFUSE_RESUME: repository HEAD/identity changed; refusing to reuse stale results"
+            return report
+        if previous.get("plan_fingerprint") != plan_fingerprint:
+            report["error"] = ("REFUSE_RESUME: plan/task contract identity changed; refusing to reuse "
+                               "stale results")
+            return report
+        uncertain = _uncertain_mutation(plan, previous)
+        if uncertain:
+            report["error"] = (f"REFUSE_RESUME_UNCERTAIN_MUTATION: {uncertain} may have mutated before "
+                               "acceptance was recorded; human review required")
             return report
     results: dict[str, dict[str, Any]] = dict(previous["nodes"]) if (resume and previous) else {}
     # Hard budget: resume never resets the counter; take the smaller of persisted/requested ceiling.
@@ -364,6 +439,11 @@ def execute_plan(plan: dict[str, Any], *, backend: Backend, run_id: Optional[str
         budget = {"max": max_ai_calls, "used": 0}
     report["max_ai_calls"] = budget["max"]
     resolutions = {b["task_id"]: b for b in bindings}
+    # Provenance of this execution's results: simulated results are isolated from real
+    # production reuse/evidence and can never satisfy a real cache lookup.
+    run_provenance = (result_cache.PROVENANCE_SIMULATED
+                      if getattr(backend, "mode", "SUPPORTED") == "SIMULATED"
+                      else result_cache.PROVENANCE_REAL)
 
     attempts: list[dict[str, Any]] = []
     context_manifests: dict[str, dict[str, Any]] = {}
@@ -408,7 +488,8 @@ def execute_plan(plan: dict[str, Any], *, backend: Backend, run_id: Optional[str
                     store=store, project_id=repo_identity, node=node, identity=identity,
                     required_tier=resolution.get("tier"), required_effort=node["routing"]["effort"],
                     freshness=freshness, force_refresh=force_refresh, explicit_model=explicit_model,
-                    allow_stronger_reuse=allow_stronger_reuse, dependencies_complete=dependencies_complete)
+                    allow_stronger_reuse=allow_stronger_reuse, dependencies_complete=dependencies_complete,
+                    provenance=run_provenance)
                 cache_meta["decisions"].append(_bounded_decision(decision))
                 if decision["decision"] == result_cache.REUSE:
                     cache_meta["hits"] += 1
@@ -440,7 +521,7 @@ def execute_plan(plan: dict[str, Any], *, backend: Backend, run_id: Optional[str
                 fp, bounded, rtype = _annotate_result(node, node_result)
                 if store is not None and identity is not None and fp is not None:
                     _write_cache(store, node, identity, freshness, node_result, bounded, rtype, fp,
-                                 attempts, run_id, repo_identity, cache_meta)
+                                 attempts, run_id, repo_identity, cache_meta, run_provenance)
             if node_result["status"] in ("CALL_BUDGET_EXHAUSTED", "READ_ONLY_VIOLATION"):
                 report["error"] = node_result["status"]
                 _mark_not_run(plan, task_id, results)
@@ -459,8 +540,28 @@ def execute_plan(plan: dict[str, Any], *, backend: Backend, run_id: Optional[str
     report["cache_reused"] = cache_meta["hits"]
     report["real_ai_calls"] = budget["used"]
     report["final"] = _final_summary(plan, results)
+    report["accounting"] = _accounting(plan, report, cache_meta["hits"])
     _save_state(run_dir, _state_blob(run_id, state, results, budget))
     return report
+
+
+def _accounting(plan: dict[str, Any], report: dict[str, Any], cache_hits: int) -> dict[str, Any]:
+    """Truthful invocation accounting. `worker_launches` increments at the actual
+    launch boundary; it does NOT claim to bound model turns internal to an external
+    coding-agent CLI, which the engine cannot observe."""
+    attempts = report.get("attempts") or []
+    planner = (plan.get("planner_mode") or {}).get("mode")
+    return {
+        "logical_ai_tasks": sum(1 for node in plan["nodes"] if node.get("executor") != "TOOL_ONLY"),
+        "worker_launches": report.get("calls_used", 0),
+        "provider_inference_requests": None,  # not observable through an agent CLI
+        "cache_reuses": cache_hits,
+        "planner_calls": 0 if planner in (None, "NONE", "DETERMINISTIC") else 1,
+        "retries": sum(1 for a in attempts if a.get("is_retry")),
+        "fallbacks": sum(1 for a in attempts if a.get("is_fallback")),
+        "tool_only_tasks": sum(1 for node in plan["nodes"] if node.get("executor") == "TOOL_ONLY"),
+        "hard_budget_semantics": "bounds worker CLI launches made by this engine",
+    }
 
 
 def _mark_not_run(plan: dict[str, Any], current: str, results: dict[str, dict[str, Any]]) -> None:
@@ -561,6 +662,7 @@ def _reused_result(node: dict[str, Any], decision: dict[str, Any]) -> dict[str, 
     entry = decision["entry"]
     result = entry.get("result") or {}
     return {"task_id": node["task_id"], "status": SUCCESS, "failure_category": None,
+            "acceptance": "PASSED",
             "summary": result.get("summary", ""), "decisions": result.get("decisions", []),
             "files_changed": result.get("files_changed", []),
             "acceptance_results": result.get("acceptance_results", {}),
@@ -594,7 +696,7 @@ def _success_attempt(attempts: list[dict[str, Any]], task_id: str) -> dict[str, 
 
 
 def _write_cache(store, node, identity, freshness, result, bounded, rtype, result_fp,
-                 attempts, run_id, project_id, cache_meta) -> None:
+                 attempts, run_id, project_id, cache_meta, run_provenance) -> None:
     eligible, reason = result_cache.eligible_for_cache(node, result, freshness=freshness)
     if not eligible:
         cache_meta["rejected"] += 1
@@ -614,7 +716,9 @@ def _write_cache(store, node, identity, freshness, result, bounded, rtype, resul
             original_required_tier=(node.get("routing") or {}).get("tier"),
             original_required_effort=(node.get("routing") or {}).get("effort"),
             original_native_effort=provenance.get("native_effort"),
-            original_normalized_effort=provenance.get("normalized_effort"))
+            original_normalized_effort=provenance.get("normalized_effort"),
+            result_provenance=(result_cache.PROVENANCE_SIMULATED if provenance.get("simulated")
+                               else run_provenance))
     except result_cache.CacheError:
         cache_meta["rejected"] += 1
         cache_meta["decisions"].append({"task_id": node["task_id"], "decision": "WRITE_REJECTED",
@@ -630,7 +734,77 @@ def _write_cache(store, node, identity, freshness, result, bounded, rtype, resul
 def _state_blob(run_id: str, state: dict[str, Any], results: dict[str, dict[str, Any]],
                 budget: dict[str, Any]) -> dict[str, Any]:
     return {"run_id": run_id, "head": state["head"], "repo": state["root"], "nodes": results,
-            "calls_used": budget["used"], "hard_max_ai_calls": budget["max"]}
+            "calls_used": budget["used"], "hard_max_ai_calls": budget["max"],
+            "intent": state.get("intent"), "plan_fingerprint": state.get("plan_fingerprint")}
+
+
+def _plan_fingerprint(plan: dict[str, Any]) -> str:
+    """Identity of the plan + task contracts, so the same repository HEAD cannot resume
+    an entirely different objective/task contract."""
+    material = {
+        "intent": plan.get("intent"),
+        "objective_summary": plan.get("objective_summary"),
+        "nodes": [{
+            "task_id": node.get("task_id"),
+            "executor": node.get("executor"),
+            "contract": node.get("task_contract") or {"objective": node.get("objective_summary")},
+            "acceptance": list(node.get("acceptance_criteria") or []),
+            "tool": node.get("tool"),
+            "routing": (node.get("routing") or {}),
+        } for node in plan.get("nodes", [])],
+    }
+    return hashlib.sha256(json.dumps(material, sort_keys=True, default=str)
+                          .encode("utf-8", "replace")).hexdigest()[:32]
+
+
+def _uncertain_mutation(plan: dict[str, Any], previous: dict[str, Any]) -> Optional[str]:
+    """A mutating node with no durable terminal record may have mutated before a crash;
+    its side effect is unknown, so a resume must not silently replay it."""
+    recorded = previous.get("nodes") or {}
+    for node in plan.get("nodes", []):
+        if node.get("intent") != "MUTATING":
+            continue
+        status = (recorded.get(node["task_id"]) or {}).get("status")
+        if status is None or status in (UNVERIFIED, CANCELLED, "RUNNING"):
+            return node["task_id"]
+    return None
+
+
+def _save_state(run_dir: pathlib.Path, state: dict[str, Any]) -> None:
+    """Atomic local write: a crash never leaves a partially written state.json."""
+    run_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    target = _state_path(run_dir)
+    temp = target.with_suffix(".json.tmp")
+    temp.write_text(json.dumps(_redact_state(state), ensure_ascii=False), encoding="utf-8")
+    temp.replace(target)
+
+
+def _redact_state(state: dict[str, Any]) -> dict[str, Any]:
+    """Apply the secret policy to persisted textual tails (never raw worker output)."""
+    redacted = dict(state)
+    nodes: dict[str, Any] = {}
+    for task_id, result in (state.get("nodes") or {}).items():
+        if isinstance(result, dict):
+            entry = dict(result)
+            if isinstance(entry.get("summary"), str):
+                entry["summary"] = _redact_tail(entry["summary"])
+            if isinstance(entry.get("decisions"), list):
+                entry["decisions"] = [_redact_tail(item) if isinstance(item, str) else item
+                                      for item in entry["decisions"]]
+            nodes[task_id] = entry
+        else:
+            nodes[task_id] = result
+    redacted["nodes"] = nodes
+    return redacted
+
+
+def _redact_tail(text: str) -> str:
+    if not knowledge.learning.contains_secret_like(text):
+        return text
+    lines = []
+    for line in text.splitlines():
+        lines.append("[REDACTED]" if knowledge.learning.contains_secret_like(line) else line)
+    return "\n".join(lines)
 
 
 def _conditional_active(node: dict[str, Any], deps: list[str], results: dict[str, dict[str, Any]]) -> bool:
@@ -676,7 +850,11 @@ def _run_node(node, deps, results, backend, resolution, *, state_dir, record_evi
     attempt = 0
     infra_used = same_used = escalations = 0
     execution_id = uuid.uuid4().hex
-    before = _worktree_paths(repo_root) if enforce_read_only else None
+    # Node-level read-only scope: a READ_ONLY node keeps its restriction even inside a
+    # MIXED graph, and already-dirty files are compared by content, not just path.
+    read_only_scope = bool(enforce_read_only or node.get("intent") == "READ_ONLY")
+    before_paths = _worktree_paths(repo_root) if read_only_scope else None
+    before_fp = _worktree_fingerprint(repo_root) if read_only_scope else None
     native = candidate["native_variant"]
     normalized = None
     if native:
@@ -699,11 +877,8 @@ def _run_node(node, deps, results, backend, resolution, *, state_dir, record_evi
                              "CALL_BUDGET_EXHAUSTED", initial_tier, tier, attempt, escalations,
                              decision_id, resolution, state_dir, record_evidence)
         attempt += 1
-        budget["used"] += 1
-        res = {"provider": candidate["provider"], "model": candidate["model"],
-               "native_variant": candidate["native_variant"]}
-        request = _request(node, res, dependency_summaries, execution_id, tier, current_backend,
-                           read_only=node.get("intent") == "READ_ONLY")
+        # The context is validated BEFORE the launch boundary: a rejected/missing
+        # context consumes no AI-call budget and counts as zero invocations.
         if prebuilt_context is not None:
             context_result = prebuilt_context
         else:
@@ -721,6 +896,7 @@ def _run_node(node, deps, results, backend, resolution, *, state_dir, record_evi
                 context_result = context_retrieval.build_pack(ctx_request, root=repo_root)
             except (context_retrieval.ContextError, OSError):
                 context_result = None
+        context_pack = None
         if context_result is not None:
             if context_manifests is not None:
                 context_manifests[node["task_id"]] = context_result["manifest"]
@@ -728,8 +904,18 @@ def _run_node(node, deps, results, backend, resolution, *, state_dir, record_evi
                 return _finalize(node, {"summary": f"context {context_result['status']}"}, FAILURE,
                                  context_result["status"], initial_tier, tier, attempt, escalations,
                                  decision_id, resolution, state_dir, record_evidence)
-            request["context_pack"] = context_result["pack"]
-            request["context_manifest"] = context_result["manifest"]
+            context_pack = context_result["pack"]
+        res = {"provider": candidate["provider"], "model": candidate["model"],
+               "native_variant": candidate["native_variant"]}
+        request = _request(node, res, dependency_summaries, execution_id, tier, current_backend,
+                           working_dir=repo_root, context_pack=context_pack,
+                           context_manifest=(context_result or {}).get("manifest"),
+                           read_only=node.get("intent") == "READ_ONLY")
+        if context_manifests is not None:
+            manifest = context_manifests.setdefault(node["task_id"], context_result["manifest"]
+                                                    if context_result is not None else {})
+            manifest["delivered_input_fingerprint"] = request["delivered_input_fingerprint"]
+        budget["used"] += 1  # actual worker/model launch boundary
         try:
             result = current_backend.execute(request)
         except KeyboardInterrupt:
@@ -737,33 +923,56 @@ def _run_node(node, deps, results, backend, resolution, *, state_dir, record_evi
         except Exception as exc:  # adapter bug/crash: never a false SUCCESS, never an orphan
             result = {"task_id": node["task_id"], "status": FAILURE, "failure_category": "UNKNOWN_FAILURE",
                       "summary": f"adapter error: {type(exc).__name__}"}
-        if enforce_read_only:
-            changed = sorted(_worktree_paths(repo_root) - (before or set()))
-            if changed:
-                return _finalize(node, {"summary": "read-only violation: " + ", ".join(changed[:5])},
+        candidate = {**candidate, "simulated": getattr(current_backend, "mode", "SUPPORTED") == "SIMULATED"}
+        if read_only_scope:
+            changed = sorted(_worktree_paths(repo_root) - (before_paths or set()))
+            content_changed = _worktree_fingerprint(repo_root) != before_fp
+            if changed or content_changed:
+                detail = ", ".join(changed[:5]) or "content changed in an already-dirty file"
+                return _finalize(node, {"summary": "read-only violation: " + detail},
                                  "READ_ONLY_VIOLATION", "READ_ONLY_VIOLATION", initial_tier, tier,
-                                 attempt, escalations, decision_id, resolution, state_dir, record_evidence)
+                                 attempt, escalations, decision_id, resolution, state_dir, record_evidence,
+                                 candidate=candidate)
         category = result.get("failure_category")
-        success = _is_success(node, result)
+        process_ok = result.get("status") == SUCCESS and bool(result.get("completion_signal"))
+        acceptance_state, acceptance_reason = (ACCEPTANCE_UNVERIFIED, "process did not complete")
+        if process_ok:
+            acceptance_state, acceptance_reason = _acceptance(node, result)
+        accepted = process_ok and acceptance_state == ACCEPTANCE_PASSED
         if attempts is not None:
+            attempt_status = ("SUCCESS" if accepted
+                              else UNVERIFIED if acceptance_state == ACCEPTANCE_UNVERIFIED and process_ok
+                              else "FAILED")
+            attempt_category = None if accepted else (
+                category or ("ACCEPTANCE_UNVERIFIED" if attempt_status == UNVERIFIED else "ACCEPTANCE_FAILED"))
             attempts.append({
                 "task_id": node["task_id"], "attempt_no": attempt,
                 "backend": current_backend.name, "provider": candidate["provider"],
                 "model": candidate["model"], "native_effort": candidate["native_variant"],
                 "normalized_effort": resolution.get("normalized_effort") if isinstance(resolution, dict) else None,
                 "required_tier": initial_tier, "required_effort": node["routing"]["effort"],
-                "status": "SUCCESS" if success else "FAILED",
-                "failure_category": None if success else (category or "UNKNOWN_FAILURE"),
+                "status": attempt_status, "failure_category": attempt_category,
                 "is_retry": attempt > 1 and current_backend.name == first_backend,
                 "is_fallback": current_backend.name != first_backend,
                 "completion_signal": result.get("completion_signal"),
+                "simulated": getattr(current_backend, "mode", "SUPPORTED") == "SIMULATED",
             })
-        if success:
+        if accepted:
             return _finalize(node, result, SUCCESS, None, initial_tier, tier, attempt, escalations,
-                             decision_id, resolution, state_dir, record_evidence)
+                             decision_id, resolution, state_dir, record_evidence, candidate=candidate)
+        if process_ok and acceptance_state == ACCEPTANCE_FAILED:
+            return _finalize(node, result, FAILURE, "ACCEPTANCE_FAILED", initial_tier, tier, attempt,
+                             escalations, decision_id, resolution, state_dir, record_evidence,
+                             candidate=candidate)
+        if process_ok and acceptance_state == ACCEPTANCE_UNVERIFIED:
+            # The process completed but no independent acceptance exists: this is not a
+            # task failure and never a task success. It cannot feed cache or learning.
+            return _finalize(node, result, UNVERIFIED, "ACCEPTANCE_UNVERIFIED", initial_tier, tier,
+                             attempt, escalations, decision_id, resolution, state_dir, record_evidence,
+                             candidate=candidate)
         if category == "PERMISSION_REQUIRED":
             return _finalize(node, result, FAILURE, category, initial_tier, tier, attempt, escalations,
-                             decision_id, resolution, state_dir, record_evidence)
+                             decision_id, resolution, state_dir, record_evidence, candidate=candidate)
         if category in INFRA_CATEGORIES:
             if infra_used < infra_retries:
                 infra_used += 1
@@ -777,7 +986,7 @@ def _run_node(node, deps, results, backend, resolution, *, state_dir, record_evi
                     infra_used = 0
                     continue
             return _finalize(node, result, FAILURE, category, initial_tier, tier, attempt, escalations,
-                             decision_id, resolution, state_dir, record_evidence)
+                             decision_id, resolution, state_dir, record_evidence, candidate=candidate)
         if category == REASONING:
             next_tier = NEXT_TIER.get(tier)
             if next_tier and escalations < 2:
@@ -793,12 +1002,13 @@ def _run_node(node, deps, results, backend, resolution, *, state_dir, record_evi
                         current_backend = registry[chosen["backend"]]
                 continue
             return _finalize(node, result, FAILURE, category, initial_tier, tier, attempt, escalations,
-                             decision_id, resolution, state_dir, record_evidence)
+                             decision_id, resolution, state_dir, record_evidence, candidate=candidate)
         if category == IMPLEMENTATION and same_used < same_tier_retries:
             same_used += 1
             continue
         return _finalize(node, result, FAILURE, category or "UNKNOWN_FAILURE", initial_tier, tier,
-                         attempt, escalations, decision_id, resolution, state_dir, record_evidence)
+                         attempt, escalations, decision_id, resolution, state_dir, record_evidence,
+                         candidate=candidate)
 
 
 def _run_tool_node(node, deps, results, tool_executor, *, state_dir, record_evidence) -> dict[str, Any]:
@@ -815,6 +1025,10 @@ def _run_tool_node(node, deps, results, tool_executor, *, state_dir, record_evid
                 "status": FAILURE, "failure_category": "TOOL_EXECUTION_FAILED",
                 "summary": f"{operation}: {type(exc).__name__}"}
     if operation == "finalize":
+        # Finalization must reflect upstream acceptance, never manufacture success.
+        unresolved = [dep for dep in deps
+                      if results.get(dep, {}).get("status") not in ACCEPTED + (SKIPPED,)]
+        ok = ok and not unresolved
         status = SUCCESS if ok else FAILURE
         category = None if ok else "DETERMINISTIC_CHECK_FAILED"
     elif operation == "config_value_matches" and result.get("matches"):
@@ -835,54 +1049,111 @@ def _run_tool_node(node, deps, results, tool_executor, *, state_dir, record_evid
     bounded = {key: result.get(key) for key in ("branch", "head", "clean", "matches", "parsed",
                                                 "exists", "ok", "actual") if key in result}
     return {"task_id": node["task_id"], "executor": "TOOL_ONLY", "operation": operation,
-            "status": status, "failure_category": category, "summary": operation, "result": bounded}
+            "status": status, "failure_category": category, "summary": operation, "result": bounded,
+            "acceptance": ("PASSED" if status in (SUCCESS, "NO_CHANGE_REQUIRED")
+                           else "FAILED" if status == FAILURE else "UNVERIFIED")}
 
 
 def _is_success(node: dict[str, Any], result: dict[str, Any]) -> bool:
-    """SUCCESS requires a bounded completion signal; exit code alone is never enough.
-    When the backend supplies acceptance_results, all criteria must pass."""
+    """Backwards-compatible helper: SUCCESS only when the process completed AND every
+    required criterion passed. Exit code (or prose) alone is never task success.
+
+    The execution path uses :func:`_acceptance` directly (it distinguishes FAILED from
+    UNVERIFIED); this remains for callers that only need the boolean."""
     if result.get("status") != SUCCESS or not result.get("completion_signal"):
         return False
-    acceptance = result.get("acceptance_results")
-    if acceptance:
-        return all(acceptance.get(criterion, False) for criterion in node["acceptance_criteria"])
-    return True
+    return _acceptance(node, result)[0] == ACCEPTANCE_PASSED
 
 
 def _request(node, resolution, dependency_summaries, execution_id, tier, backend,
-             read_only: bool = False) -> dict[str, Any]:
+             *, working_dir, context_pack=None, context_manifest=None, read_only: bool = False) -> dict[str, Any]:
+    contract = node.get("task_contract") or {}
+    manifest = context_manifest if context_manifest is not None else (node.get("context") or {}).get("manifest", [])
     return {
         "execution_id": execution_id, "task_id": node["task_id"], "task_family": node["task_family"],
         "task_class": node["task_class"], "tier": tier, "provider": resolution["provider"],
         "model": resolution["model"], "native_variant": resolution["native_variant"],
         "objective_summary": node["objective_summary"], "acceptance_criteria": node["acceptance_criteria"],
         "dependency_summaries": dependency_summaries, "knowledge_refs": node.get("knowledge_refs", []),
-        "context_manifest": (node.get("context") or {}).get("manifest", []), "working_dir": str(ROOT),
-        "read_only": read_only,
-        "prompt": _prompt(node, dependency_summaries, read_only=read_only),
+        "context_manifest": manifest, "context_pack": context_pack, "working_dir": str(working_dir),
+        "read_only": read_only, "task_contract": contract,
+        "delivered_input_fingerprint": delivered_input_fingerprint(node, dependency_summaries, manifest),
+        "prompt": _prompt(node, dependency_summaries, read_only=read_only, context_pack=context_pack),
     }
 
 
-def _prompt(node, dependency_summaries, read_only: bool = False) -> str:
+def delivered_input_fingerprint(node: dict[str, Any], dependency_summaries: list[dict[str, Any]],
+                                manifest: Optional[dict[str, Any]]) -> str:
+    """Deterministic identity of the FINAL safe semantic worker input: task contract,
+    validated context identity, known dependency facts and the acceptance contract.
+    Never a raw prompt. Same identity as the representation actually delivered."""
+    contract = node.get("task_contract") or {}
+    material = {
+        "contract_version": contract.get("contract_version"),
+        "objective": contract.get("objective") or node.get("objective_summary"),
+        "master_fingerprint": contract.get("master_fingerprint"),
+        "operation": contract.get("operation"),
+        "targets": contract.get("targets"),
+        "acceptance": list(node.get("acceptance_criteria") or []),
+        "acceptance_contract": result_cache.ACCEPTANCE_CONTRACT_VERSION,
+        "context": result_cache.context_identity(manifest),
+        "dependencies": sorted(fact["result_fingerprint"] for fact in (dependency_summaries or [])
+                               if fact.get("result_fingerprint")),
+    }
+    return hashlib.sha256(json.dumps(material, sort_keys=True, default=str)
+                          .encode("utf-8", "replace")).hexdigest()[:32]
+
+
+def _render_context_pack(context_pack: Optional[dict[str, Any]]) -> str:
+    if not context_pack:
+        return ""
+    lines = []
+    for item in context_pack.get("items") or []:
+        label = item.get("source_kind", "CONTEXT")
+        identifier = item.get("source_id") or ""
+        lines.append(f"[{label} {identifier}] {item.get('content', '')}")
+    return "\n".join(lines)
+
+
+def _prompt(node, dependency_summaries, read_only: bool = False,
+            context_pack: Optional[dict[str, Any]] = None) -> str:
+    contract = node.get("task_contract") or {}
     deps = "; ".join(f"{d['task_id']}: {d['summary']}" for d in dependency_summaries) or "none"
     guard = "\nRead-only task: do not modify, create, or delete any files." if read_only else ""
+    target_line = ", ".join(contract.get("targets") or []) or "none stated"
+    context_text = _render_context_pack(context_pack)
+    context_block = f"\nDelivered context:\n{context_text}" if context_text else ""
     return (f"{WORKER_ISOLATION_NOTE}{guard}\n\nObjective: {node['objective_summary']}\n"
-            f"Acceptance: {', '.join(node['acceptance_criteria'])}\nDependencies: {deps}")
+            f"Operation: {contract.get('operation', 'execute')}\nTargets: {target_line}\n"
+            f"Acceptance: {', '.join(node['acceptance_criteria'])}\nDependencies: {deps}"
+            f"{context_block}")
 
 
 def _finalize(node, result, status, category, initial_tier, final_tier, attempts, escalations,
-              decision_id, resolution, state_dir, record_evidence) -> dict[str, Any]:
+              decision_id, resolution, state_dir, record_evidence, *, candidate=None) -> dict[str, Any]:
+    acceptance_state = "PASSED" if status == SUCCESS else (
+        "UNVERIFIED" if status == UNVERIFIED else ("FAILED" if status == FAILURE else None))
     if record_evidence and decision_id:
-        outcome = SUCCESS if status == SUCCESS else ("UNKNOWN" if status == "UNKNOWN" else FAILURE)
+        outcome = SUCCESS if status == SUCCESS else ("UNKNOWN" if status in ("UNKNOWN", UNVERIFIED) else FAILURE)
         completion = result.get("completion_signal") if status == SUCCESS else None
         final_effort = (resolution or {}).get("normalized_effort") or node["routing"]["effort"]
+        # Attribute accepted evidence to the ACTUAL accepted/attempted candidate, not to
+        # the originally proposed one after failover.
+        attribution = candidate or {}
         try:
             evidence.finish(decision_id, outcome=outcome, completion_signal=completion,
                             final_tier=final_tier, final_effort=final_effort,
-                            failure_category=category, attempt_count=attempts, state_dir=state_dir)
+                            failure_category=category, attempt_count=attempts, state_dir=state_dir,
+                            surface=attribution.get("backend"),
+                            provider=attribution.get("provider"), model=attribution.get("model"),
+                            native_variant=attribution.get("native_variant"),
+                            normalized_effort=(resolution or {}).get("normalized_effort"),
+                            simulated=bool(attribution.get("simulated")))
         except evidence.EvidenceError:
             pass
     return {"task_id": node["task_id"], "status": status, "failure_category": category,
+            "acceptance": acceptance_state,
+            "acceptance_contract": result_cache.ACCEPTANCE_CONTRACT_VERSION,
             "summary": result.get("summary", ""), "decisions": result.get("decisions", []),
             "files_changed": result.get("files_changed", []),
             "acceptance_results": result.get("acceptance_results", {}),
@@ -893,13 +1164,15 @@ def _finalize(node, result, status, category, initial_tier, final_tier, attempts
 
 
 def _final_summary(plan: dict[str, Any], results: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    blockers = [r["task_id"] for r in results.values() if r.get("status") in (FAILURE, UNVERIFIED)]
     return {"total": len(plan["nodes"]),
             "succeeded": sum(1 for r in results.values() if r.get("status") == SUCCESS),
             "failed": sum(1 for r in results.values() if r.get("status") == FAILURE),
+            "unverified": sum(1 for r in results.values() if r.get("status") == UNVERIFIED),
             "blocked": sum(1 for r in results.values() if r.get("status") == BLOCKED),
             "skipped": sum(1 for r in results.values() if r.get("status") == SKIPPED),
             "cancelled": sum(1 for r in results.values() if r.get("status") == CANCELLED),
-            "unresolved_blockers": [r["task_id"] for r in results.values() if r.get("status") == FAILURE]}
+            "unresolved_blockers": blockers}
 
 
 def _state_path(run_dir: pathlib.Path) -> pathlib.Path:
@@ -914,11 +1187,6 @@ def _load_state(run_dir: pathlib.Path) -> Optional[dict[str, Any]]:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
-
-
-def _save_state(run_dir: pathlib.Path, state: dict[str, Any]) -> None:
-    run_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    _state_path(run_dir).write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
 
 
 def render_execution(report: dict[str, Any]) -> str:
@@ -944,6 +1212,7 @@ def render_execution(report: dict[str, Any]) -> str:
     if report.get("final"):
         final = report["final"]
         lines.append(f"FINAL: {final['succeeded']}/{final['total']} succeeded; "
+                     f"unverified {final.get('unverified', 0)}; "
                      f"blockers {final['unresolved_blockers'] or 'none'}")
     bounds = report.get("bounds", {})
     lines.append(f"CALL BOUNDS: planned {bounds.get('planned_ai_nodes')}, conditional "
