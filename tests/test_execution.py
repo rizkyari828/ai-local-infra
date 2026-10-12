@@ -164,13 +164,15 @@ class DagExecutionTests(unittest.TestCase):
         self.assertNotEqual("SUCCESS", report["nodes"]["T1"]["status"])
 
     def test_resume_skips_successful_nodes(self) -> None:
-        first = execution.FakeBackend(script={"T3": [{"status": "FAILURE", "failure_category": "UNKNOWN_FAILURE"}]})
+        # A failed READ_ONLY node is retry-safe on resume. (A failed launched MUTATING
+        # node is deliberately non-replayable now — see the pass-3 uncertainty tests.)
+        first = execution.FakeBackend(script={"T5": [{"status": "FAILURE", "failure_category": "UNKNOWN_FAILURE"}]})
         plan, report = self._run(first, run_id="r1", record_evidence=False)
-        self.assertEqual("FAILURE", report["nodes"]["T3"]["status"])
+        self.assertEqual("FAILURE", report["nodes"]["T5"]["status"])
         second = execution.FakeBackend()
         resume = execution.execute_plan(plan, backend=second, state_dir=self.state, repo_root=self.root,
                                         confirm=True, run_id="r1", resume=True, record_evidence=False)
-        self.assertEqual("SUCCESS", resume["nodes"]["T3"]["status"])
+        self.assertEqual("SUCCESS", resume["nodes"]["T5"]["status"])
         self.assertNotIn("T1", [call["task_id"] for call in second.calls])  # already-succeeded node skipped
 
     def test_resume_rejects_incompatible_head(self) -> None:
