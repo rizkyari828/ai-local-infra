@@ -41,6 +41,8 @@ import orchestration_store  # noqa: E402
 import result_cache  # noqa: E402
 import efficiency  # noqa: E402
 import lifecycle  # noqa: E402
+import human_acceptance  # noqa: E402
+import infra  # noqa: E402
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 
@@ -241,6 +243,19 @@ def parser() -> argparse.ArgumentParser:
     cache.add_argument("--state-dir", type=pathlib.Path, help="override local state root")
     cache.add_argument("--json", action="store_true")
     cache.set_defaults(func=cmd_cache)
+
+    accept = sub.add_parser("accept", help="record explicit human acceptance for a judgment result")
+    accept.add_argument("--run-id", required=True)
+    accept.add_argument("--task-id", required=True)
+    accept.add_argument("--reviewer")
+    decision = accept.add_mutually_exclusive_group()
+    decision.add_argument("--accept", action="store_true")
+    decision.add_argument("--reject", action="store_true")
+    accept.add_argument("--status", action="store_true", help="show the recorded decision (read-only)")
+    accept.add_argument("--note")
+    accept.add_argument("--state-dir", type=pathlib.Path, help="override local state root")
+    accept.add_argument("--json", action="store_true")
+    accept.set_defaults(func=cmd_accept)
     return result
 
 
@@ -303,6 +318,51 @@ def cmd_efficiency(args: argparse.Namespace) -> int:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
     print(json.dumps(data, indent=2, ensure_ascii=False) if args.json else _render_efficiency(data, args))
+    return 0
+
+
+def cmd_accept(args: argparse.Namespace) -> int:
+    run_dir = pathlib.Path(args.state_dir or infra.STATE_DIR) / "orchestration" / args.run_id
+    state, status = execution._load_resume_state(run_dir)
+    if status != execution._RESUME_OK:
+        print("ERROR: no durable run state for this run; nothing to accept", file=sys.stderr)
+        return 2
+    node = (state.get("nodes") or {}).get(args.task_id)
+    if not isinstance(node, dict):
+        print(f"ERROR: unknown task {args.task_id!r} in run {args.run_id!r}", file=sys.stderr)
+        return 2
+    delivered = node.get("resume_input_identity") or node.get("input_fingerprint")
+    result_identity = node.get("result_fingerprint")
+    contract_identity = state.get("plan_fingerprint")
+    if not (delivered and result_identity and contract_identity):
+        print("ERROR: result is not independently identifiable (missing contract/input/result "
+              "identity); explicit human acceptance is not possible", file=sys.stderr)
+        return 2
+    if args.status:
+        entry = human_acceptance.load(run_id=args.run_id, task_id=args.task_id, state_dir=args.state_dir)
+        print(json.dumps(entry, indent=2, ensure_ascii=False) if args.json else (
+            f"HUMAN ACCEPTANCE  {args.run_id}/{args.task_id}: "
+            + (entry.get("decision", "NONE") if entry else "NONE")
+            + (f"  reviewer={entry.get('reviewer')}  at {entry.get('accepted_at')}" if entry else "")))
+        return 0
+    if not args.accept and not args.reject:
+        print("ERROR: choose --accept or --reject (or --status)", file=sys.stderr)
+        return 2
+    if not args.reviewer:
+        print("ERROR: --reviewer is required to record acceptance", file=sys.stderr)
+        return 2
+    try:
+        entry = human_acceptance.record(
+            run_id=args.run_id, task_id=args.task_id,
+            decision=human_acceptance.ACCEPTED if args.accept else human_acceptance.REJECTED,
+            reviewer=args.reviewer, task_contract_identity=contract_identity,
+            delivered_input_identity=delivered, result_identity=result_identity,
+            note=args.note, state_dir=args.state_dir)
+    except human_acceptance.HumanAcceptanceError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    print(json.dumps(entry, indent=2, ensure_ascii=False) if args.json else (
+        f"HUMAN {entry['decision']}  {args.run_id}/{args.task_id}  reviewer={entry['reviewer']}"))
     return 0
 
 
