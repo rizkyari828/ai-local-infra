@@ -53,9 +53,12 @@ _CLAUSE_RE = re.compile(r"[;,]|\band\b", re.IGNORECASE)
 
 
 def _objective_fingerprint(objective: str) -> str:
-    """Stable identity of the whole master objective (never stored as raw text)."""
-    canonical = " ".join((objective or "").split())
-    return hashlib.sha256(canonical.encode("utf-8", "replace")).hexdigest()[:32]
+    """Stable identity of the whole master objective (never stored as raw text).
+
+    The authoritative objective text is hashed EXACTLY as provided: whitespace and
+    line structure are part of what the user asked for, so two requests that differ
+    only in executable text must not collapse to the same contract identity."""
+    return hashlib.sha256((objective or "").encode("utf-8", "replace")).hexdigest()[:32]
 
 
 def _clauses(objective: str) -> list[str]:
@@ -501,9 +504,10 @@ def _assign_task_slices(nodes: list[dict[str, Any]], slicer: "_Slicer") -> bool:
 
 def _single_task_plan(objective: str, sig: dict[str, bool], decision: dict[str, Any],
                       constraints: dict[str, Any]) -> dict[str, Any]:
-    # The authoritative executable objective is COMPLETE. A short display summary is kept
-    # separately so a storage/display convenience field never truncates task meaning.
-    objective_text = " ".join((objective or "").split())
+    # The authoritative executable objective is COMPLETE and LOSSLESS: the exact text
+    # drives the task contract, worker input and semantic identity. A short display
+    # summary is normalized separately and never rewrites executable meaning.
+    objective_text = objective or ""
     task_class = "CRITICAL" if sig["security"] else (
         "CORRECTNESS_SENSITIVE" if sig["architecture"] else "NORMAL")
     node = _node("T1", objective_text, task_class, [],
