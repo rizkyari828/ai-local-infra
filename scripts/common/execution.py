@@ -60,23 +60,51 @@ _EXPLANATORY_ACCEPTANCE = ("i reviewed", "i cannot", "cannot complete", "unable 
                            "i was unable", "not able to complete")
 
 # Acceptance values are STRICTLY typed. Only a real boolean, or a bounded structured
-# validator result, can mean pass/fail. Strings such as "true"/"false"/"yes"/"ok" and
-# numbers are UNKNOWN, never truthy booleans.
+# validator result with CONSISTENT recognized fields, can mean pass/fail. Strings such
+# as "true"/"false"/"yes"/"ok" and numbers are UNKNOWN, never truthy booleans.
 _ACCEPTANCE_STATUS_MAP = {"PASSED": True, "PASS": True, "FAILED": False, "FAIL": False}
+_ACCEPTANCE_BOOL_KEYS = ("passed", "ok", "success")
+
+
+def _normalize_signals(value: dict[str, Any]) -> tuple[bool, Optional[bool]]:
+    """Explicit typed acceptance schema for a mapping. Returns ``(recognized, verdict)``.
+
+    ``recognized`` is True when the mapping carries any acceptance signal field.
+    ``verdict`` is True/False only when every recognized field agrees and is correctly
+    typed; a malformed field type or any disagreement yields ``None`` (never PASS).
+    No favorable-field precedence: recognized fields that conflict reject the whole
+    result rather than picking the friendlier one."""
+    signals: list[bool] = []
+    recognized = False
+    for key in _ACCEPTANCE_BOOL_KEYS:
+        if key in value:
+            recognized = True
+            item = value[key]
+            if not isinstance(item, bool):
+                return True, None  # malformed recognized field type
+            signals.append(item)
+    if "status" in value:
+        recognized = True
+        status = value["status"]
+        if isinstance(status, str) and status.strip().upper() in _ACCEPTANCE_STATUS_MAP:
+            signals.append(_ACCEPTANCE_STATUS_MAP[status.strip().upper()])
+        else:
+            return True, None  # malformed recognized field type
+    if not recognized:
+        return False, None
+    if len(set(signals)) > 1:
+        return True, None  # conflicting recognized fields
+    return True, (signals[0] if signals else None)
 
 
 def _normalize_acceptance(value: Any) -> Optional[bool]:
     """Return True/False for a typed acceptance value, or None when the value is not a
-    valid acceptance signal (malformed / string / number -> UNKNOWN, never truthy)."""
+    valid acceptance signal (malformed / conflicting / string / number -> UNKNOWN)."""
     if isinstance(value, bool):
         return value
     if isinstance(value, dict):
-        for key in ("passed", "ok", "success"):
-            if isinstance(value.get(key), bool):
-                return value[key]
-        status = value.get("status")
-        if isinstance(status, str) and status.strip().upper() in _ACCEPTANCE_STATUS_MAP:
-            return _ACCEPTANCE_STATUS_MAP[status.strip().upper()]
+        recognized, verdict = _normalize_signals(value)
+        return verdict if recognized else None
     return None
 
 
@@ -87,8 +115,8 @@ def _acceptance(node: dict[str, Any], result: dict[str, Any]) -> tuple[str, Opti
     FAILED      -> explicit typed negative evidence for a required criterion
     UNVERIFIED  -> the process completed but no valid independent acceptance exists
 
-    A model's prose or a truthy string is never acceptance. Malformed acceptance is
-    UNVERIFIED, never SUCCESS.
+    A model's prose or a truthy string is never acceptance. Malformed or conflicting
+    acceptance is UNVERIFIED, never SUCCESS.
     """
     acceptance = result.get("acceptance_results")
     criteria = list(node.get("acceptance_criteria") or [])
@@ -97,6 +125,11 @@ def _acceptance(node: dict[str, Any], result: dict[str, Any]) -> tuple[str, Opti
             # No declared criteria means no acceptance contract to satisfy. An empty
             # criteria list must never vacuously pass ({"passed": false} case).
             return ACCEPTANCE_UNVERIFIED, "no acceptance criteria defined"
+        recognized, whole = _normalize_signals(acceptance)
+        if recognized and whole is None:
+            # A conflict/malformed recognized field anywhere in the acceptance object
+            # rejects the whole result, even if a criterion key happens to be typed.
+            return ACCEPTANCE_UNVERIFIED, "conflicting or malformed acceptance evidence"
         if any(c not in acceptance for c in criteria):
             return ACCEPTANCE_UNVERIFIED, "acceptance evidence incomplete"
         normalized = [_normalize_acceptance(acceptance[c]) for c in criteria]
@@ -289,20 +322,29 @@ def resolve_plan(plan: dict[str, Any], backend: Backend, surface: Optional[str] 
         tier = node["routing"]["tier"]
         effort = node["routing"]["effort"]
         if health is None:
+            # Alternate resolution path (no runtime health object). Hard policy is still
+            # enforced here at the shared authority boundary, so a remote candidate can
+            # never survive merely because the health-aware resolver did not run.
             resolution = routing.resolve_model(tier, routing.load_policy())
             resolved = backend.resolve(node, resolution["provider"], resolution["model"], effort)
             capability = None
             if surface:
                 capability = discovery.capability(resolution["provider"], resolution["model"], surface)["status"]
+            blocked = failover.policy_block(resolution["provider"], tier, constraints)
+            runnable = (bool(backend.available() and resolution["model"]) or backend.name == "fake") \
+                and blocked is None
             resolved.update({"task_id": node["task_id"], "tier": tier, "capability_status": capability,
-                             "runnable": bool(backend.available() and resolution["model"]) or backend.name == "fake"})
+                             "runnable": runnable,
+                             "reason": blocked or (None if runnable else "NO_COMPATIBLE_EXECUTION_BACKEND")})
             resolutions.append(resolved)
             continue
         # Runtime-availability-aware, capability-preserving candidate resolution.
         specs = failover.candidates_for_tier(tier)
         candidates = failover.resolve(tier, effort, specs, health, constraints=constraints)
         selected = failover.select(candidates)
-        runnable = bool(selected and (backends is None or selected["backend"] in backends))
+        # Post-resolution hard-policy check: the shared authority, not the path, decides.
+        blocked = failover.policy_block(selected["provider"], selected["tier"], constraints) if selected else None
+        runnable = bool(selected and not blocked and (backends is None or selected["backend"] in backends))
         resolutions.append({
             "task_id": node["task_id"], "tier": tier, "effort": effort, "candidates": candidates,
             "backend": selected["backend"] if selected else None,
@@ -311,7 +353,7 @@ def resolve_plan(plan: dict[str, Any], backend: Backend, surface: Optional[str] 
             "native_variant": selected.get("native_variant") if selected else None,
             "capability_status": selected["status"] if selected else None,
             "runnable": runnable,
-            "reason": None if runnable else "NO_CAPABILITY_PRESERVING_FALLBACK",
+            "reason": (blocked or "NO_CAPABILITY_PRESERVING_FALLBACK") if not runnable else None,
         })
     return resolutions
 
@@ -514,10 +556,21 @@ def execute_plan(plan: dict[str, Any], *, backend: Backend, run_id: Optional[str
     try:
         for task_id in plan["order"]:
             node = next(item for item in plan["nodes"] if item["task_id"] == task_id)
-            # Resume reuses only completed AI work whose relevant input identity was
-            # proven unchanged above. TOOL_ONLY nodes are recomputed from current state.
+            # Resume reuses only completed AI work whose relevant input identity is
+            # PROVEN unchanged against the CURRENT dependency state. Upstream dependencies
+            # (including recomputed TOOL_ONLY nodes) have already been resolved in this
+            # iteration order, so a recomputed dependency fingerprint that differs from the
+            # persisted one invalidates a stale descendant SUCCESS instead of reusing it.
             if (resume and node.get("executor") != "TOOL_ONLY"
                     and results.get(task_id, {}).get("status") in (SUCCESS, "NO_CHANGE_REQUIRED")):
+                if not _resume_reuse_valid(node, results, identity_project, state["head"], constraints,
+                                           repo_root):
+                    report["error"] = (f"REFUSE_RESUME_INPUT_CHANGED: current dependency/input state "
+                                       f"for {task_id} changed under the same HEAD; refusing to reuse "
+                                       "stale results")
+                    results[task_id] = {"status": NOT_RUN, "task_id": task_id}
+                    _mark_not_run(plan, task_id, results)
+                    break
                 continue
             deps = node["depends_on"]
             if any(results.get(dep, {}).get("status") not in (SUCCESS, SKIPPED, "NO_CHANGE_REQUIRED") for dep in deps):
@@ -529,7 +582,9 @@ def execute_plan(plan: dict[str, Any], *, backend: Backend, run_id: Optional[str
             if node.get("executor") == "TOOL_ONLY":
                 results[task_id] = _run_tool_node(node, deps, results, tool_executor,
                                                   state_dir=state_dir, record_evidence=record_evidence)
-                if store is not None and results[task_id]["status"] in (SUCCESS, "NO_CHANGE_REQUIRED"):
+                # Deterministic results always carry a fingerprint: descendant DAG identity
+                # must be complete regardless of whether the optional result cache is on.
+                if results[task_id]["status"] in (SUCCESS, "NO_CHANGE_REQUIRED"):
                     _annotate_result(node, results[task_id])
                 if results[task_id]["status"] in ("AI_REQUIRED", FAILURE):
                     report["error"] = results[task_id].get("failure_category") or "TOOL_EXECUTION_FAILED"
@@ -842,15 +897,27 @@ def _plan_fingerprint(plan: dict[str, Any]) -> str:
 
 
 def _uncertain_mutation(plan: dict[str, Any], previous: dict[str, Any]) -> Optional[str]:
-    """A mutating node with no durable terminal record may have mutated before a crash;
-    its side effect is unknown, so a resume must not silently replay it."""
+    """A mutating AI node whose worker actually launched but has no durable proof of
+    accepted completion may have mutated before the failure/crash. A process/adapter
+    failure, timeout or cancellation does NOT prove "no side effect occurred", so resume
+    must not auto-replay it. Only a durably accepted result, a node that provably never
+    launched (SAFE_TO_RETRY), or a node that was never reached is retry-safe.
+
+    TOOL_ONLY nodes are deterministic and out of scope here (recomputed from current
+    state, never replayed as an unverified side effect)."""
     recorded = previous.get("nodes") or {}
     for node in plan.get("nodes", []):
-        if node.get("intent") != "MUTATING":
+        if node.get("intent") != "MUTATING" or node.get("executor") == "TOOL_ONLY":
             continue
-        status = (recorded.get(node["task_id"]) or {}).get("status")
-        if status is None or status in (UNVERIFIED, CANCELLED, "RUNNING"):
-            return node["task_id"]
+        outcome = recorded.get(node["task_id"]) or {}
+        status = outcome.get("status")
+        if status in ACCEPTED:
+            continue  # durably accepted completion
+        if status in (SKIPPED, BLOCKED, NOT_RUN):
+            continue  # never reached this run, no side effect possible
+        if outcome.get("worker_launched") is False:
+            continue  # provably pre-launch (rejected before the boundary)
+        return node["task_id"]
     return None
 
 
@@ -912,6 +979,20 @@ def _resume_input_changed(plan: dict[str, Any], previous: dict[str, Any], repo_r
     return None
 
 
+def _resume_reuse_valid(node: dict[str, Any], results: dict[str, dict[str, Any]], project_id: str,
+                        head: Optional[str], constraints: Optional[dict[str, Any]],
+                        repo_root: pathlib.Path) -> bool:
+    """True only when a persisted completed AI result's reuse identity still matches the
+    CURRENT dependency/input state (recomputed from this run's results, not the persisted
+    facts). Any recomputed upstream dependency fingerprint change invalidates the reuse."""
+    stored = (results.get(node["task_id"]) or {}).get("resume_input_identity")
+    if not stored:
+        return False
+    dependency_summaries = _dependency_facts(node, results)
+    current = _resume_node_identity(node, dependency_summaries, repo_root, project_id, head, constraints)
+    return current == stored
+
+
 def _save_state(run_dir: pathlib.Path, state: dict[str, Any]) -> None:
     """Atomic local write: a crash never leaves a partially written state.json."""
     run_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -921,10 +1002,15 @@ def _save_state(run_dir: pathlib.Path, state: dict[str, Any]) -> None:
     temp.replace(target)
 
 
+_REDACTED_KEY = "[REDACTED_KEY]"
+
+
 def _redact_state(state: dict[str, Any]) -> dict[str, Any]:
-    """Recursively apply the secret policy to EVERY persisted textual value (summary,
-    decision, recommended_followups, diagnostics, nested lists/maps, ...). Non-text
-    metadata (numbers, booleans, None) and mapping KEYS are preserved unchanged."""
+    """Recursively apply the secret policy to EVERY persisted textual value AND mapping
+    key (summary, decision, recommended_followups, diagnostics, nested lists/maps, ...).
+    Non-text metadata (numbers, booleans, None) and non-sensitive keys stay unchanged; a
+    secret-bearing key is replaced deterministically so collisions never restore the raw
+    secret text."""
     return _redact_value(state)
 
 
@@ -932,10 +1018,25 @@ def _redact_value(value: Any) -> Any:
     if isinstance(value, str):
         return _redact_tail(value)
     if isinstance(value, dict):
-        return {key: _redact_value(item) for key, item in value.items()}
+        redacted: dict[Any, Any] = {}
+        for key, item in value.items():
+            safe_key = _redact_key(key)
+            if safe_key in redacted:
+                index = 2
+                while f"{safe_key}_{index}" in redacted:
+                    index += 1
+                safe_key = f"{safe_key}_{index}"
+            redacted[safe_key] = _redact_value(item)
+        return redacted
     if isinstance(value, list):
         return [_redact_value(item) for item in value]
     return value
+
+
+def _redact_key(key: Any) -> Any:
+    if isinstance(key, str) and knowledge.learning.contains_secret_like(key):
+        return _REDACTED_KEY
+    return key
 
 
 def _redact_tail(text: str) -> str:
@@ -968,12 +1069,14 @@ def _run_node(node, deps, results, backend, resolution, *, state_dir, record_evi
         return {"task_id": node["task_id"], "status": "READ_ONLY_VIOLATION",
                 "failure_category": "READ_ONLY_VIOLATION",
                 "summary": "mutating node refused under READ_ONLY intent",
-                "initial_tier": initial_tier, "final_tier": tier, "attempts": 0, "escalated": False}
+                "initial_tier": initial_tier, "final_tier": tier, "attempts": 0, "escalated": False,
+                "worker_launched": False, "mutation_outcome": "SAFE_TO_RETRY"}
     if budget["max"] is not None and budget["used"] >= budget["max"]:
         return {"task_id": node["task_id"], "status": "CALL_BUDGET_EXHAUSTED",
                 "failure_category": "CALL_BUDGET_EXHAUSTED",
                 "summary": "hard AI-call budget exhausted before launch",
-                "initial_tier": initial_tier, "final_tier": tier, "attempts": 0, "escalated": False}
+                "initial_tier": initial_tier, "final_tier": tier, "attempts": 0, "escalated": False,
+                "worker_launched": False, "mutation_outcome": "SAFE_TO_RETRY"}
     registry: dict[str, Backend] = dict(backends or {})
     if backend is not None:
         registry.setdefault(backend.name, backend)
@@ -988,8 +1091,14 @@ def _run_node(node, deps, results, backend, resolution, *, state_dir, record_evi
         dependency_summaries = [{"task_id": dep, "summary": results.get(dep, {}).get("summary", "")}
                                 for dep in deps]
     attempt = 0
+    launched = False  # set True at the actual worker-launch boundary
     infra_used = same_used = escalations = 0
     execution_id = uuid.uuid4().hex
+
+    def _finalize_node(*args, **kwargs):
+        # Thread the current launch fact into every terminal record so a MUTATING node
+        # records whether a side effect was even possible, without editing each call site.
+        return _finalize(*args, launched=launched, **kwargs)
     # Node-level read-only scope: a READ_ONLY node keeps its restriction even inside a
     # MIXED graph, and already-dirty files are compared by content, not just path.
     read_only_scope = bool(enforce_read_only or node.get("intent") == "READ_ONLY")
@@ -1014,7 +1123,7 @@ def _run_node(node, deps, results, backend, resolution, *, state_dir, record_evi
         if record_evidence else execution_id
     while True:
         if budget["max"] is not None and budget["used"] >= budget["max"]:
-            return _finalize(node, {"summary": "hard AI-call budget exhausted"}, FAILURE,
+            return _finalize_node(node, {"summary": "hard AI-call budget exhausted"}, FAILURE,
                              "CALL_BUDGET_EXHAUSTED", initial_tier, tier, attempt, escalations,
                              decision_id, resolution, state_dir, record_evidence)
         attempt += 1
@@ -1039,7 +1148,7 @@ def _run_node(node, deps, results, backend, resolution, *, state_dir, record_evi
                 # Required retrieval failed: STOP before any launch. No worker runs, no
                 # AI-call budget is consumed.
                 category = "CONTEXT_UNSAFE" if "escapes" in str(exc) else "CONTEXT_REQUIRED_SOURCE_MISSING"
-                return _finalize(node, {"summary": f"context retrieval failed: {type(exc).__name__}"},
+                return _finalize_node(node, {"summary": f"context retrieval failed: {type(exc).__name__}"},
                                  FAILURE, category, initial_tier, tier, attempt, escalations,
                                  decision_id, resolution, state_dir, record_evidence, candidate=candidate)
         context_pack = None
@@ -1047,7 +1156,7 @@ def _run_node(node, deps, results, backend, resolution, *, state_dir, record_evi
             if context_manifests is not None:
                 context_manifests[node["task_id"]] = context_result["manifest"]
             if context_result["status"] != context_retrieval.STATUS_READY:
-                return _finalize(node, {"summary": f"context {context_result['status']}"}, FAILURE,
+                return _finalize_node(node, {"summary": f"context {context_result['status']}"}, FAILURE,
                                  context_result["status"], initial_tier, tier, attempt, escalations,
                                  decision_id, resolution, state_dir, record_evidence)
             context_pack = context_result["pack"]
@@ -1062,7 +1171,7 @@ def _run_node(node, deps, results, backend, resolution, *, state_dir, record_evi
         delivered_limit = context_retrieval.load_budgets().get(
             (node.get("context") or {}).get("budget", "SMALL"))
         if delivered_limit is not None and len(request["prompt"]) > delivered_limit:
-            return _finalize(node, {"summary": "final delivered input exceeds context budget"}, FAILURE,
+            return _finalize_node(node, {"summary": "final delivered input exceeds context budget"}, FAILURE,
                              "CONTEXT_BUDGET_INSUFFICIENT", initial_tier, tier, attempt, escalations,
                              decision_id, resolution, state_dir, record_evidence, candidate=candidate)
         if context_manifests is not None:
@@ -1070,18 +1179,13 @@ def _run_node(node, deps, results, backend, resolution, *, state_dir, record_evi
                                                     if context_result is not None else {})
             manifest["delivered_input_fingerprint"] = request["delivered_input_fingerprint"]
         budget["used"] += 1  # actual worker/model launch boundary
-        try:
-            result = current_backend.execute(request)
-        except KeyboardInterrupt:
-            raise  # cancellation semantics are handled by the caller
-        except Exception as exc:  # adapter bug/crash: never a false SUCCESS, never an orphan
-            result = {"task_id": node["task_id"], "status": FAILURE, "failure_category": "UNKNOWN_FAILURE",
-                      "summary": f"adapter error: {type(exc).__name__}"}
-        candidate = {**candidate, "simulated": getattr(current_backend, "mode", "SUPPORTED") == "SIMULATED"}
+        launched = True
 
-        def _append_attempt(status_value: str, category_value: Optional[str]) -> None:
+        def _append_attempt(status_value: str, category_value: Optional[str],
+                            result_value: dict[str, Any]) -> None:
             """Truthful operational attempt accounting: if a worker CLI launch happened,
-            an Attempt row is recorded even when a later validation rejects the result."""
+            an Attempt row is recorded even when a later validation rejects the result or
+            the launch is cancelled/interrupted before any result exists."""
             if attempts is None:
                 return
             attempts.append({
@@ -1093,17 +1197,28 @@ def _run_node(node, deps, results, backend, resolution, *, state_dir, record_evi
                 "status": status_value, "failure_category": category_value,
                 "is_retry": attempt > 1 and current_backend.name == first_backend,
                 "is_fallback": current_backend.name != first_backend,
-                "completion_signal": result.get("completion_signal"),
+                "completion_signal": result_value.get("completion_signal"),
                 "simulated": getattr(current_backend, "mode", "SUPPORTED") == "SIMULATED",
             })
+
+        try:
+            result = current_backend.execute(request)
+        except KeyboardInterrupt:
+            # The launch already happened: account for it before propagating cancellation.
+            _append_attempt("CANCELLED", "CANCELLED", {})
+            raise  # cancellation semantics are handled by the caller
+        except Exception as exc:  # adapter bug/crash: never a false SUCCESS, never an orphan
+            result = {"task_id": node["task_id"], "status": FAILURE, "failure_category": "UNKNOWN_FAILURE",
+                      "summary": f"adapter error: {type(exc).__name__}"}
+        candidate = {**candidate, "simulated": getattr(current_backend, "mode", "SUPPORTED") == "SIMULATED"}
 
         if read_only_scope:
             changed = sorted(_worktree_paths(repo_root) - (before_paths or set()))
             content_changed = _worktree_fingerprint(repo_root) != before_fp
             if changed or content_changed:
                 detail = ", ".join(changed[:5]) or "content changed in an already-dirty file"
-                _append_attempt("FAILED", "READ_ONLY_VIOLATION")
-                return _finalize(node, {"summary": "read-only violation: " + detail},
+                _append_attempt("FAILED", "READ_ONLY_VIOLATION", result)
+                return _finalize_node(node, {"summary": "read-only violation: " + detail},
                                  "READ_ONLY_VIOLATION", "READ_ONLY_VIOLATION", initial_tier, tier,
                                  attempt, escalations, decision_id, resolution, state_dir, record_evidence,
                                  candidate=candidate)
@@ -1118,22 +1233,22 @@ def _run_node(node, deps, results, backend, resolution, *, state_dir, record_evi
                           else "FAILED")
         attempt_category = None if accepted else (
             category or ("ACCEPTANCE_UNVERIFIED" if attempt_status == UNVERIFIED else "ACCEPTANCE_FAILED"))
-        _append_attempt(attempt_status, attempt_category)
+        _append_attempt(attempt_status, attempt_category, result)
         if accepted:
-            return _finalize(node, result, SUCCESS, None, initial_tier, tier, attempt, escalations,
+            return _finalize_node(node, result, SUCCESS, None, initial_tier, tier, attempt, escalations,
                              decision_id, resolution, state_dir, record_evidence, candidate=candidate)
         if process_ok and acceptance_state == ACCEPTANCE_FAILED:
-            return _finalize(node, result, FAILURE, "ACCEPTANCE_FAILED", initial_tier, tier, attempt,
+            return _finalize_node(node, result, FAILURE, "ACCEPTANCE_FAILED", initial_tier, tier, attempt,
                              escalations, decision_id, resolution, state_dir, record_evidence,
                              candidate=candidate)
         if process_ok and acceptance_state == ACCEPTANCE_UNVERIFIED:
             # The process completed but no independent acceptance exists: this is not a
             # task failure and never a task success. It cannot feed cache or learning.
-            return _finalize(node, result, UNVERIFIED, "ACCEPTANCE_UNVERIFIED", initial_tier, tier,
+            return _finalize_node(node, result, UNVERIFIED, "ACCEPTANCE_UNVERIFIED", initial_tier, tier,
                              attempt, escalations, decision_id, resolution, state_dir, record_evidence,
                              candidate=candidate)
         if category == "PERMISSION_REQUIRED":
-            return _finalize(node, result, FAILURE, category, initial_tier, tier, attempt, escalations,
+            return _finalize_node(node, result, FAILURE, category, initial_tier, tier, attempt, escalations,
                              decision_id, resolution, state_dir, record_evidence, candidate=candidate)
         if category in INFRA_CATEGORIES:
             if infra_used < infra_retries:
@@ -1147,13 +1262,16 @@ def _run_node(node, deps, results, backend, resolution, *, state_dir, record_evi
                     current_backend = registry[next_candidate["backend"]]
                     infra_used = 0
                     continue
-            return _finalize(node, result, FAILURE, category, initial_tier, tier, attempt, escalations,
+            return _finalize_node(node, result, FAILURE, category, initial_tier, tier, attempt, escalations,
                              decision_id, resolution, state_dir, record_evidence, candidate=candidate)
         if category == REASONING:
             next_tier = NEXT_TIER.get(tier)
             if next_tier and escalations < 2:
                 tier = next_tier
                 escalations += 1
+                # Keep the candidate's capability tier in sync even on the alternate
+                # (no-health) path, so final evidence reflects the actual accepted tier.
+                candidate = {**candidate, "tier": tier}
                 if health is not None:
                     stronger = failover.resolve(next_tier, node["routing"]["effort"],
                                                 failover.candidates_for_tier(next_tier), health,
@@ -1163,14 +1281,14 @@ def _run_node(node, deps, results, backend, resolution, *, state_dir, record_evi
                         candidate = chosen
                         current_backend = registry[chosen["backend"]]
                 continue
-            return _finalize(node, result, FAILURE, category, initial_tier, tier, attempt, escalations,
+            return _finalize_node(node, result, FAILURE, category, initial_tier, tier, attempt, escalations,
                              decision_id, resolution, state_dir, record_evidence, candidate=candidate)
         if category == IMPLEMENTATION and same_used < same_tier_retries:
             same_used += 1
             continue
-        return _finalize(node, result, FAILURE, category or "UNKNOWN_FAILURE", initial_tier, tier,
-                         attempt, escalations, decision_id, resolution, state_dir, record_evidence,
-                         candidate=candidate)
+        return _finalize_node(node, result, FAILURE, category or "UNKNOWN_FAILURE", initial_tier, tier,
+                              attempt, escalations, decision_id, resolution, state_dir, record_evidence,
+                              candidate=candidate)
 
 
 def _run_tool_node(node, deps, results, tool_executor, *, state_dir, record_evidence) -> dict[str, Any]:
@@ -1245,6 +1363,23 @@ def _request(node, resolution, dependency_summaries, execution_id, tier, backend
     }
 
 
+def _canonical_dependencies(dependency_summaries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """ONE canonical dependency representation, used for BOTH rendering and delivered
+    identity. A dependency with a strong accepted-result fingerprint is identified by it
+    plus its semantic metadata; a dependency WITHOUT a fingerprint is identified by the
+    bounded semantic payload that is actually delivered to the worker (status + summary),
+    so rendering and fingerprinting can never diverge. Ordering is deterministic."""
+    entries: list[dict[str, Any]] = []
+    for dep in dependency_summaries or []:
+        entry: dict[str, Any] = {"task_id": dep.get("task_id"), "status": dep.get("status"),
+                                 "summary": dep.get("summary", "")}
+        fingerprint = dep.get("result_fingerprint")
+        if fingerprint:
+            entry["result_fingerprint"] = fingerprint
+        entries.append(entry)
+    return sorted(entries, key=lambda item: str(item.get("task_id")))
+
+
 def _canonical_semantics(node: dict[str, Any], dependency_summaries: list[dict[str, Any]],
                          manifest: Optional[dict[str, Any]]) -> dict[str, Any]:
     """ONE canonical semantic representation that feeds BOTH the rendered worker input
@@ -1263,8 +1398,7 @@ def _canonical_semantics(node: dict[str, Any], dependency_summaries: list[dict[s
         "acceptance_contract": result_cache.ACCEPTANCE_CONTRACT_VERSION,
         "capability_requirement": contract.get("capability_requirement"),
         "context": result_cache.context_identity(manifest),
-        "dependencies": sorted(fact["result_fingerprint"] for fact in (dependency_summaries or [])
-                               if fact.get("result_fingerprint")),
+        "dependencies": _canonical_dependencies(dependency_summaries),
     }
 
 
@@ -1293,7 +1427,7 @@ def _prompt(node, dependency_summaries, read_only: bool = False,
             context_pack: Optional[dict[str, Any]] = None,
             manifest: Optional[dict[str, Any]] = None) -> str:
     semantics = _canonical_semantics(node, dependency_summaries, manifest)
-    deps = "; ".join(f"{d['task_id']}: {d['summary']}" for d in dependency_summaries) or "none"
+    deps = "; ".join(f"{d['task_id']}: {d['summary']}" for d in semantics["dependencies"]) or "none"
     guard = "\nRead-only task: do not modify, create, or delete any files." if read_only else ""
     target_line = ", ".join(semantics.get("targets") or []) or "none stated"
     constraints = ", ".join(semantics.get("constraints") or []) or "none stated"
@@ -1311,9 +1445,13 @@ def _prompt(node, dependency_summaries, read_only: bool = False,
 
 
 def _finalize(node, result, status, category, initial_tier, final_tier, attempts, escalations,
-              decision_id, resolution, state_dir, record_evidence, *, candidate=None) -> dict[str, Any]:
+              decision_id, resolution, state_dir, record_evidence, *, candidate=None,
+              launched: bool = False) -> dict[str, Any]:
     acceptance_state = "PASSED" if status == SUCCESS else (
         "UNVERIFIED" if status == UNVERIFIED else ("FAILED" if status == FAILURE else None))
+    # FINAL evidence derives from the ACTUAL accepted/attempted candidate object, never from
+    # an independently mutable tier variable that can go stale across infrastructure failover.
+    accepted_tier = (candidate or {}).get("tier") or final_tier
     if record_evidence and decision_id:
         outcome = SUCCESS if status == SUCCESS else ("UNKNOWN" if status in ("UNKNOWN", UNVERIFIED) else FAILURE)
         completion = result.get("completion_signal") if status == SUCCESS else None
@@ -1329,7 +1467,7 @@ def _finalize(node, result, status, category, initial_tier, final_tier, attempts
         final_effort = normalized_effort or node["routing"]["effort"]
         try:
             evidence.finish(decision_id, outcome=outcome, completion_signal=completion,
-                            final_tier=final_tier, final_effort=final_effort,
+                            final_tier=accepted_tier, final_effort=final_effort,
                             failure_category=category, attempt_count=attempts, state_dir=state_dir,
                             surface=attribution.get("backend"),
                             provider=attribution.get("provider"), model=attribution.get("model"),
@@ -1338,16 +1476,24 @@ def _finalize(node, result, status, category, initial_tier, final_tier, attempts
                             simulated=bool(attribution.get("simulated")))
         except evidence.EvidenceError:
             pass
-    return {"task_id": node["task_id"], "status": status, "failure_category": category,
-            "acceptance": acceptance_state,
-            "acceptance_contract": result_cache.ACCEPTANCE_CONTRACT_VERSION,
-            "summary": result.get("summary", ""), "decisions": result.get("decisions", []),
-            "files_changed": result.get("files_changed", []),
-            "acceptance_results": result.get("acceptance_results", {}),
-            "new_risk_signals": result.get("new_risk_signals", []),
-            "recommended_followups": result.get("recommended_followups", []),
-            "initial_tier": initial_tier, "final_tier": final_tier, "attempts": attempts,
-            "escalated": final_tier != initial_tier, "escalations": escalations}
+    record = {"task_id": node["task_id"], "status": status, "failure_category": category,
+              "acceptance": acceptance_state,
+              "acceptance_contract": result_cache.ACCEPTANCE_CONTRACT_VERSION,
+              "summary": result.get("summary", ""), "decisions": result.get("decisions", []),
+              "files_changed": result.get("files_changed", []),
+              "acceptance_results": result.get("acceptance_results", {}),
+              "new_risk_signals": result.get("new_risk_signals", []),
+              "recommended_followups": result.get("recommended_followups", []),
+              "initial_tier": initial_tier, "final_tier": accepted_tier, "attempts": attempts,
+              "escalated": accepted_tier != initial_tier, "escalations": escalations}
+    if node.get("intent") == "MUTATING":
+        # Durable mutation-uncertainty fact: a real launch whose outcome was not durably
+        # accepted is potentially side-effecting and must never be auto-replayed on resume.
+        record["worker_launched"] = launched
+        record["mutation_outcome"] = ("MUTATION_ACCEPTED" if status == SUCCESS
+                                      else "MUTATION_OUTCOME_UNCERTAIN" if launched
+                                      else "SAFE_TO_RETRY")
+    return record
 
 
 def _final_summary(plan: dict[str, Any], results: dict[str, dict[str, Any]]) -> dict[str, Any]:

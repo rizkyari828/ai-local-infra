@@ -501,13 +501,17 @@ def _assign_task_slices(nodes: list[dict[str, Any]], slicer: "_Slicer") -> bool:
 
 def _single_task_plan(objective: str, sig: dict[str, bool], decision: dict[str, Any],
                       constraints: dict[str, Any]) -> dict[str, Any]:
-    objective_summary = _bounded_summary(objective, 200)
+    # The authoritative executable objective is COMPLETE. A short display summary is kept
+    # separately so a storage/display convenience field never truncates task meaning.
+    objective_text = " ".join((objective or "").split())
     task_class = "CRITICAL" if sig["security"] else (
         "CORRECTNESS_SENSITIVE" if sig["architecture"] else "NORMAL")
-    node = _node("T1", objective_summary, task_class, [],
+    node = _node("T1", objective_text, task_class, [],
                  acceptance=["the stated task's requested outcome is reached"],
-                 produces=["task_result"], family=knowledge.task_family_for(objective_summary))
-    node["objective_summary"] = objective_summary
+                 produces=["task_result"], family=knowledge.task_family_for(objective_text))
+    node["objective_summary"] = objective_text
+    node["title"] = _bounded_summary(objective_text, 200)
+    node["objective_display"] = node["title"]
     plan = _finish_plan(objective, [node], decision, constraints)
     _attach_contracts(plan, objective)
     return plan

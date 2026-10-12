@@ -111,6 +111,19 @@ class Health:
             self.tripped.add(f"{candidate['backend']}:{candidate['provider']}")
 
 
+def policy_block(provider: Optional[str], tier: Optional[str],
+                 constraints: Optional[dict[str, Any]]) -> Optional[str]:
+    """ONE shared hard-policy authority every resolved candidate must pass, regardless of
+    resolution path (health-aware, alternate, fallback or resume). A hard constraint that
+    cannot be satisfied fails resolution clearly instead of leaking a remote candidate."""
+    constraints = constraints or {}
+    if constraints.get("local_only") and provider != "ollama":
+        return "local_only"
+    if constraints.get("no_premium") and tier == "MAX":
+        return "no_premium"
+    return None
+
+
 def resolve(required_tier: str, required_effort: str, specs: list[dict[str, Any]],
             health: Health, *, constraints: Optional[dict[str, Any]] = None) -> list[dict[str, Any]]:
     """Annotate candidate specs. Runnable = capability-preserving + healthy + not tripped
@@ -146,10 +159,9 @@ def resolve(required_tier: str, required_effort: str, specs: list[dict[str, Any]
             blocking.append("below_effort_floor")
         if health.is_tripped(candidate):
             blocking.append("cooldown")
-        if constraints.get("no_premium") and candidate["tier"] == "MAX":
-            blocking.append("no_premium")
-        if constraints.get("local_only") and candidate["provider"] != "ollama":
-            blocking.append("local_only")
+        block = policy_block(candidate["provider"], candidate["tier"], constraints)
+        if block:
+            blocking.append(block)
         if candidate["status"] != BACKEND_HEALTHY:
             blocking.append(candidate["status"])
         candidate["blocking"] = blocking
