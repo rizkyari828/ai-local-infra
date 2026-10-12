@@ -157,17 +157,18 @@ class IncrementalDagTests(ReuseFixture):
         self.assertEqual({"T3", "T5"}, {c["task_id"] for c in backend.calls})
 
     def test_unknown_dependency_completeness_forces_conservative_rerun(self) -> None:
-        # T2 succeeds but returns an unstructured result (no acceptance map -> no
-        # fingerprint), so T5 cannot prove its dependency is unchanged and reruns.
+        # T2 completes but returns an unstructured result (no acceptance map -> no
+        # acceptance evidence, no fingerprint). The milestone contract makes such a
+        # result UNVERIFIED rather than SUCCESS, so T5 cannot prove its dependency is
+        # unchanged and stays unresolved instead of being silently reused.
         backend = execution.FakeBackend(script={"T2": [
             {"status": "SUCCESS", "completion_signal": "agent_reported",
              "acceptance_results": {}, "summary": "unstructured"}]})
         report = self._run(backend)
-        self.assertEqual("SUCCESS", report["nodes"]["T2"]["status"])
+        self.assertEqual("UNVERIFIED", report["nodes"]["T2"]["status"])
         self.assertNotIn("result_fingerprint", report["nodes"]["T2"])
-        t5 = next(d for d in report["cache"]["decisions"] if d["task_id"] == "T5")
-        self.assertEqual("RERUN", t5["decision"])
-        self.assertEqual("DEPENDENCY_CHANGED", t5["reason"])
+        self.assertEqual("BLOCKED", report["nodes"]["T5"]["status"])
+        self.assertIn("T2", report["final"]["unresolved_blockers"])
 
     def test_acceptance_change_invalidates(self) -> None:
         self._warm()
