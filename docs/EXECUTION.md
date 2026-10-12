@@ -75,15 +75,23 @@ Process completion and task acceptance are **separate**. A backend exiting 0 wit
 output is a *completed process*, not an accepted task. `_acceptance` classifies each
 node independently: `PASSED` only when every required criterion has explicit passing
 evidence, `FAILED` when a required criterion fails, and `UNVERIFIED` when the process
-completed but no independent acceptance exists. An `UNVERIFIED` node is neither
-success nor failure: it cannot create positive quality evidence, cannot be cached, and
-blocks downstream nodes/finalization. A model's prose ("I reviewed it.", "I cannot
-complete the requested work.") is never acceptance. Failures reuse the existing
-taxonomy. `INFRA_*` categories (`PROVIDER_503`,
+completed but no independent acceptance exists. The acceptance object is reconciled as
+ONE decision: an overall verdict (`status`/`passed`/`ok`/`success`) and the required
+criterion verdicts must agree, so a positive criterion can never override an overall
+`FAILED` verdict and an overall `PASSED` verdict can never hide a required criterion
+failure (no field precedence; conflicting/malformed evidence is never `PASSED`). An
+`UNVERIFIED` node is neither success nor failure: it cannot create positive quality
+evidence, cannot be cached, and blocks downstream nodes/finalization. A model's prose
+("I reviewed it.", "I cannot complete the requested work.") is never acceptance.
+Failures reuse the existing taxonomy. `INFRA_*` categories (`PROVIDER_503`,
 `RATE_LIMIT`, `TIMEOUT`, `STALE_SESSION`, `AUTH_FAILURE`, `SAFETY_GUARD`) never
-escalate intelligence — they are bounded-retried, then reported. Only
-`REASONING_INSUFFICIENT` escalates the affected node (BALANCED -> STRONG, etc.);
-siblings are untouched and a `MAX` node stops/reports.
+escalate intelligence — READ_ONLY work is bounded-retried, then reported; a launched
+MUTATING worker whose outcome is ambiguous is **not** retried or failed over in the
+same run, because a side effect may already exist. Only `REASONING_INSUFFICIENT`
+escalates the affected node (BALANCED -> STRONG, etc.) and only when an actual stronger
+candidate is selected; the same candidate is never relaunched under an upgraded label,
+and final capability metadata always comes from the accepted candidate. Siblings are
+untouched and a `MAX` node stops/reports.
 
 ## Conditional nodes, integration, outcome learning
 

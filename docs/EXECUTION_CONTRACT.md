@@ -24,7 +24,11 @@ Each executable node carries one bounded, structured `task_contract`:
 
 Simple intact AI objectives are preserved as one node carrying the real request; only
 genuinely multi-part objectives are decomposed, and each stage receives the bounded
-master clause that matches it. Raw chat and the raw master prompt are never persisted.
+master clause that matches it. The authoritative executable objective text is
+**lossless**: whitespace, line structure and indentation are not rewritten, the exact
+text drives the task contract, worker input and semantic identity, and only a separate
+display title is normalized/truncated. Raw chat and the raw master prompt are never
+persisted.
 
 ## Delivered worker input
 
@@ -90,7 +94,10 @@ qualified attempts. Simulation (`simulated` evidence rows), process-only success
 acceptance `UNKNOWN`/`UNVERIFIED`, cache reuse, and infrastructure success without task
 acceptance never produce positive quality evidence. Final accepted evidence is
 attributed to the **actual accepted candidate** (backend/provider/model/native and
-normalized effort), not the originally proposed model after failover.
+normalized effort, and its actual capability tier), not the originally proposed model
+after failover. An escalation request never upgrades the candidate's capability
+metadata: without a real stronger candidate the same candidate is not relaunched under
+a stronger label.
 
 ## Deterministic intent
 
@@ -106,7 +113,9 @@ unresolved or unaccepted.
 `worker_launches` increments at the actual launch boundary. A context rejection, policy
 rejection, cache hit, deterministic completion, or no-op consumes **zero**. Every actual
 worker launch produces exactly one Attempt record — including cancellation, adapter
-exception, read-only violation, failure and timeout; a pre-launch rejection, cache hit or
+exception, a `None`/malformed adapter result, a post-launch processing failure,
+read-only violation, failure and timeout; Attempt ownership is created at the launch
+boundary before the adapter result is interpreted. A pre-launch rejection, cache hit or
 TOOL_ONLY completion produces none. The engine distinguishes logical AI tasks, worker
 launches, cache reuse, planner calls, retries, and fallbacks, and does not claim to bound
 model turns internal to an external coding-agent CLI (which it cannot observe).
@@ -120,9 +129,11 @@ only after its reuse identity is re-derived from the CURRENT dependency state, s
 deterministic dependency recomputed to a new fingerprint invalidates a stale descendant
 result instead of silently reusing it. Any mutating AI node whose worker actually launched
 without durable accepted completion — failure, timeout, adapter error or cancellation
-included — refuses resume as an uncertain mutation (a fail-closed, human-required
-outcome); a provably pre-launch rejection stays retry-safe. Full durable recovery belongs
-to a later milestone.
+included — is treated as potentially side-effecting: it is not retried, failed over or
+escalated within the same run, and it refuses resume as an uncertain mutation (a
+fail-closed, human-required outcome). A provably pre-launch rejection stays retry-safe,
+and READ_ONLY retry/failover semantics are unchanged. Full durable recovery belongs to a
+later milestone.
 
 ## Residual limits
 
