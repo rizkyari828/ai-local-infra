@@ -222,7 +222,10 @@ class EscalationTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.tmp.cleanup()
 
-    def test_reasoning_failure_escalates_only_that_node(self) -> None:
+    def test_reasoning_failure_without_real_escalation_does_not_relabel(self) -> None:
+        # No health-aware candidate inventory exists, so no STRONG candidate can be
+        # proven. The same BALANCED candidate/model/effort must never be relaunched and
+        # relabeled as STRONG; the node terminates truthfully instead.
         backend = execution.FakeBackend(script={"T3": [
             {"status": "FAILURE", "failure_category": "REASONING_INSUFFICIENT"},
             {"status": "SUCCESS", "acceptance_results": {"requested change present": True,
@@ -230,10 +233,12 @@ class EscalationTests(unittest.TestCase):
         plan = orchestrator.decompose(MIXED)
         report = execution.execute_plan(plan, backend=backend, state_dir=self.state, repo_root=self.root,
                                         confirm=True, record_evidence=False)
-        self.assertEqual("SUCCESS", report["nodes"]["T3"]["status"])
-        self.assertEqual("STRONG", report["nodes"]["T3"]["final_tier"])
-        self.assertTrue(report["nodes"]["T3"]["escalated"])
-        self.assertEqual("BALANCED", report["nodes"]["T5"]["final_tier"])
+        self.assertEqual("FAILURE", report["nodes"]["T3"]["status"])
+        self.assertEqual("BALANCED", report["nodes"]["T3"]["final_tier"])
+        self.assertFalse(report["nodes"]["T3"]["escalated"])
+        calls = [call for call in backend.calls if call["task_id"] == "T3"]
+        self.assertEqual(1, len(calls))  # no synthetic escalation relaunch
+        self.assertEqual("BLOCKED", report["nodes"]["T5"]["status"])  # dependent node not run
 
     def test_infra_failure_does_not_escalate_intelligence(self) -> None:
         backend = execution.FakeBackend(script={"T1": [
@@ -246,14 +251,15 @@ class EscalationTests(unittest.TestCase):
         self.assertEqual("PROVIDER_503", report["nodes"]["T1"]["failure_category"])
         self.assertFalse(report["nodes"]["T1"]["escalated"])
 
-    def test_max_tier_stops_after_bounded_escalation(self) -> None:
+    def test_reasoning_failure_stops_when_no_stronger_candidate_is_available(self) -> None:
         backend = execution.FakeBackend(script={"T2": [
             {"status": "FAILURE", "failure_category": "REASONING_INSUFFICIENT"} for _ in range(5)]})
         plan = orchestrator.decompose(MIXED)
         report = execution.execute_plan(plan, backend=backend, state_dir=self.state, repo_root=self.root,
                                         confirm=True, record_evidence=False)
         self.assertEqual("FAILURE", report["nodes"]["T2"]["status"])
-        self.assertEqual("MAX", report["nodes"]["T2"]["final_tier"])
+        # Truthful actual candidate capability, not a synthetic escalation relabel.
+        self.assertEqual(report["nodes"]["T2"]["final_tier"], report["nodes"]["T2"]["initial_tier"])
         calls = [call for call in backend.calls if call["task_id"] == "T2"]
         self.assertLessEqual(len(calls), 4)  # bounded
 

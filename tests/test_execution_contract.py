@@ -335,7 +335,9 @@ class LearningProvenanceTests(ContractFixture):
         self.assertEqual([], outcomes.model_performance(state_dir=self.state))  # not production
 
     def test_failover_credits_the_actual_accepted_candidate(self) -> None:
-        plan = _plan([_ai("A1", "analyze", intent="MUTATING")], intent="MUTATING")
+        # READ_ONLY: infra failover is allowed to a capability-preserving candidate. A
+        # launched MUTATING node now fails closed instead (see pass-4 mutation tests).
+        plan = _plan([_ai("A1", "analyze")])
         failed = execution.FakeBackend(script={"A1": [{"task_id": "A1", "status": "FAILURE",
                                                        "failure_category": "RATE_LIMIT"}]})
         failed.name = "codex"

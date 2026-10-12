@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -15,6 +16,7 @@ sys.path.insert(0, str(ROOT / "scripts/common"))
 import orchestrator  # noqa: E402
 import execution  # noqa: E402
 import evidence  # noqa: E402
+import failover  # noqa: E402
 import derived_knowledge  # noqa: E402
 
 
@@ -110,12 +112,35 @@ class BudgetTests(unittest.TestCase):
         self.assertEqual("CALL_BUDGET_EXHAUSTED", report["nodes"]["T1"]["failure_category"])
 
     def test_escalation_cannot_exceed_budget(self) -> None:
-        backend = execution.FakeBackend(script={"T1": [
-            {"status": "FAILURE", "failure_category": "REASONING_INSUFFICIENT"},
+        # A REAL stronger candidate exists, so escalation is attempted; the hard budget
+        # then stops it before a second launch.
+        failed = execution.FakeBackend(script={"T1": [
+            {"status": "FAILURE", "failure_category": "REASONING_INSUFFICIENT"}]})
+        failed.name = "codex"
+        accepted = execution.FakeBackend(script={"T1": [
             {"status": "SUCCESS", "completion_signal": "agent_reported"}]})
-        report = self._run(BUG_OBJECTIVE, backend, max_ai_calls=1)
-        self.assertEqual(len(backend.calls), 1)
+        accepted.name = "opencode"
+        health = failover.Health(binaries={"codex": True, "opencode": True},
+                                 providers={"codex": {"codex"}, "opencode": {"deepseek"}},
+                                 codex_model="gpt-b")
+        balanced = [{"backend": "codex", "provider": "codex", "model": "gpt-b", "native_variant": "high",
+                     "tier": "BALANCED", "effort": "high"}]
+        strong = [{"backend": "opencode", "provider": "deepseek", "model": "deepseek-strong",
+                   "native_variant": "max", "tier": "STRONG", "effort": "max"}]
+        plan = orchestrator.decompose(BUG_OBJECTIVE)
+
+        def candidates(tier, config=None):
+            return strong if tier == "STRONG" else balanced
+
+        with unittest.mock.patch.object(execution.failover, "candidates_for_tier", side_effect=candidates):
+            report = execution.execute_plan(plan, backend=accepted, backends={"opencode": accepted, "codex": failed},
+                                            health=health, constraints={}, repo_root=self.root, confirm=True,
+                                            record_evidence=False, infra_retries=0, max_ai_calls=1,
+                                            state_dir=self.state, allow_dirty=True)
+        self.assertEqual(1, len(failed.calls))
+        self.assertEqual(0, len(accepted.calls))
         self.assertEqual("CALL_BUDGET_EXHAUSTED", report["nodes"]["T1"]["failure_category"])
+        self.assertEqual("BALANCED", report["nodes"]["T1"]["final_tier"])  # last actual candidate
 
     def test_dry_run_consumes_zero(self) -> None:
         backend = execution.FakeBackend()
