@@ -104,6 +104,10 @@ globally, and it does not attempt to intercept arbitrary OpenCode/Codex conversa
 - An interrupt/cancellation does not fabricate outcomes: downstream nodes are `NOT_RUN`
   and an in-flight evidence decision remains detectably `pending` (recoverable), per the
   existing semantics. Process exit alone is never treated as success.
+- Process completion and task acceptance are separate: a completed process without
+  independent acceptance is `UNVERIFIED` (not `SUCCESS`), which creates no positive
+  quality evidence, is never cached, and blocks downstream/finalization. See
+  `docs/EXECUTION_CONTRACT.md`.
 
 ## Outcome learning hooks
 
