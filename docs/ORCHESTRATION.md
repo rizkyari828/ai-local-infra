@@ -29,8 +29,23 @@ concrete models resolve later through discovery, exactly as plain routing does.
 `task_id`, `title`, `task_family`, `task_class`, `objective_summary`, `depends_on`,
 `routing {tier, effort, role}`, `context {budget, include, excluded, manifest}`,
 `acceptance_criteria`, `risk_signals`, `conditional`, `status`, plus bounded
-`produces_artifacts` / `consumes_results_from`. The whole raw master prompt is
-never stored in a node.
+`produces_artifacts` / `consumes_results_from`, and one explicit `task_contract`. The
+whole raw master prompt is never stored in a node.
+
+## Complete task contract and preserved task meaning
+
+Each executable node carries one bounded **task contract** (`task-contract-v1`): its
+task-specific objective, operation, targets, constraints, acceptance, permissions,
+dependencies, context requirements, and capability requirement, plus a non-reversible
+fingerprint of the master objective. The contract is what the worker input is built
+from, so distinct requirements cannot collapse into one generic task.
+
+A **simple, intact AI objective** (a single work signal, no synthesis, no deterministic
+sub-goal) is preserved as ONE AI node whose objective is the actual request — it is not
+forced through the generic `inspect → implement → report` split. Multi-stage
+decomposition is used only when it adds value (two or more work signals, an AI planner,
+or synthesis), and each stage receives the bounded master clause that matches its work,
+so `alpha → 17` and `beta → 99` stay distinct tasks. See `docs/EXECUTION_CONTRACT.md`.
 
 ## DAG, not a flat list
 

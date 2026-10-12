@@ -149,16 +149,31 @@ def _item(source_kind: str, *, source_id: str, content: str, reason: str, requir
           knowledge_id: Optional[str] = None, priority: Optional[int] = None) -> dict[str, Any]:
     if source_kind not in SOURCE_KINDS:
         raise ContextError(f"unknown source kind: {source_kind}")
+    item = {"source_kind": source_kind, "source_id": source_id, "path": path, "symbol": symbol,
+            "range": line_range, "knowledge_id": knowledge_id, "reason": reason,
+            "priority": priority if priority is not None else SOURCE_PRIORITY[source_kind],
+            "required": bool(required), "content": content, "fingerprint": None,
+            "size": 0, "truncated": False, "redacted": False}
+    return _finalize_item(item, content)
+
+
+def _finalize_item(item: dict[str, Any], content: str) -> dict[str, Any]:
+    """Redact + bound the FINAL delivered content, then fingerprint THAT content.
+
+    Any change to the final delivered characters (including inside merged ranges)
+    must change the item fingerprint; the fingerprint is never derived from
+    pre-merge or pre-sanitized content."""
     content, redacted = _redact(content)
     truncated = len(content) > MAX_ITEM_CHARS
     if truncated:
         content = content[:MAX_ITEM_CHARS]
-    fp = _fingerprint(source_kind, source_id, path, symbol, content)
-    return {"source_kind": source_kind, "source_id": source_id, "path": path, "symbol": symbol,
-            "range": line_range, "knowledge_id": knowledge_id, "reason": reason,
-            "priority": priority if priority is not None else SOURCE_PRIORITY[source_kind],
-            "required": bool(required), "content": content, "fingerprint": fp,
-            "size": len(content), "truncated": truncated, "redacted": redacted}
+    item["content"] = content
+    item["size"] = len(content)
+    item["truncated"] = truncated
+    item["redacted"] = redacted
+    item["fingerprint"] = _fingerprint(item["source_kind"], item["source_id"], item["path"],
+                                       item["symbol"], content)
+    return item
 
 
 def _symbol_range(path: pathlib.Path, symbol: str, context: int = 40) -> Optional[tuple[int, int]]:
@@ -265,8 +280,15 @@ def retrieve(request: ContextRequest, *, root: Optional[pathlib.Path] = None,
     return items, fallback_used, None
 
 
-def deduplicate(items: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
-    """Merge identical content across sources and overlapping file ranges."""
+def deduplicate(items: list[dict[str, Any]], *,
+                root: Optional[pathlib.Path] = None) -> tuple[list[dict[str, Any]], int]:
+    """Merge identical content across sources and overlapping file ranges.
+
+    Overlap merging re-reads the authoritative file from the SAME workspace root the
+    context was retrieved from, then re-redacts and re-fingerprints the merged final
+    content. Sanitization therefore always applies to the final delivered content and
+    a previously removed secret can never reappear through a merge."""
+    root = pathlib.Path(root or ROOT)
     by_fingerprint: dict[str, dict[str, Any]] = {}
     dropped = 0
     for item in items:
@@ -295,9 +317,12 @@ def deduplicate(items: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]
             if next_range[0] <= cur_range[1] + 1:  # overlapping/adjacent
                 end = max(cur_range[1], next_range[1])
                 current["range"] = [cur_range[0], end]
-                current["content"] = _read_range(pathlib.Path(ROOT) / path, current["range"][0], end) \
-                    if (ROOT / path).exists() else current["content"] + "\n" + nxt["content"]
-                current["size"] = len(current["content"])
+                target = _safe_path(root, path)
+                if target.exists():
+                    content = _read_range(target, current["range"][0], end)
+                else:
+                    content = current["content"] + "\n" + nxt["content"]
+                _finalize_item(current, content)
                 current["required"] = current["required"] or nxt["required"]
                 dropped += nxt["size"]
             else:
@@ -358,7 +383,7 @@ def build_pack(request: ContextRequest, *, root: Optional[pathlib.Path] = None,
     budgets = budgets or load_budgets()
     graph_status = graph_status or graphify_status(root, (request.get("repository") or {}).get("head"))
     items, fallback_used, error = retrieve(request, root=root, graph_status=graph_status)
-    items, dropped_duplicates = deduplicate(items)
+    items, dropped_duplicates = deduplicate(items, root=root)
     kept, omitted, fits = enforce_budget(items, request["context_budget"], budgets)
     used_graphify = False  # deterministic retrieval used; Graphify is advisory only in V0.1
     status = validate(kept, fits=fits, required_error=error, graph_status=graph_status,

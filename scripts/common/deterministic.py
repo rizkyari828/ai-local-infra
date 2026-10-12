@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+import re
 import subprocess
 import sys
 from typing import Any, Optional
@@ -172,21 +173,78 @@ class ToolExecutor:
 
 # --------------------------------------------------------------------------- #
 # Conservative objective -> deterministic task mapping (explicit/safe only)
+#
+# Complete intent coverage: a deterministic operation is only claimed when the
+# WHOLE request can be satisfied deterministically. Partial understanding (a
+# comparison we cannot evaluate, or an explanatory request that keyword-overlaps
+# a repo probe) must NOT be reported as a completed deterministic task.
 # --------------------------------------------------------------------------- #
 
-_REPO_STATE_PHRASES = ("branch", "head", "clean state", "clean-state", "clean tree",
-                       "repository state", "repo state")
+_STRONG_REPO_STATE = (
+    "repository state", "repo state", "clean state", "clean tree", "clean working",
+    "working tree", "git status", "git state", "current branch", "current head",
+    "current commit", "branch and head", "head and branch",
+)
+_WEAK_REPO_STATE = ("branch", "head", "commit sha")
 _TEST_PHRASES = ("run tests", "run the tests", "run focused tests", "run the test suite")
+_EXPLANATORY_CUES = ("explain", "describe", "why ", "how ", "walk through", "walkthrough",
+                     "teach", "summarize", "summarise")
+_EQUALITY_CUES = re.compile(r"(?:==|\bequals\b|\bmatches\b|\bis equal to\b|\bsame as\b)", re.IGNORECASE)
+_HASH = r"[0-9a-fA-F]{7,40}"
+_HEAD_MATCH = re.compile(
+    rf"\b(?:git\s+)?head\b[^0-9a-fA-F]{{0,24}}?(?:equals|matches|==|=|\bis\b)\s*[\"'`]?({_HASH})\b",
+    re.IGNORECASE)
+_HEAD_MATCH_REV = re.compile(
+    rf"[\"'`]?({_HASH})[\"'`]?\s*(?:equals|matches|==)\s*(?:the\s+)?(?:git\s+)?head\b", re.IGNORECASE)
+_CONFIG_VALUE = re.compile(
+    r"([A-Za-z0-9_./-]+\.(?:json|yaml|yml|toml))\s+(?:key\s+)?([A-Za-z0-9_.\-]+)"
+    r"\s+(?:equals|==|=|\bis\b)\s+[\"'`]?([^\"'`\s,]+)", re.IGNORECASE)
+_FILE_EXISTS = re.compile(r"\b(?:does|if)\s+([A-Za-z0-9_./-]+\.[A-Za-z0-9]+)\s+exist", re.IGNORECASE)
+
+
+def _has_explanatory_cue(text: str) -> bool:
+    lowered = text.lower()
+    return any(cue in lowered for cue in _EXPLANATORY_CUES)
 
 
 def classify_objective(text: str, *, root: Optional[pathlib.Path] = None) -> list[dict[str, Any]]:
-    """Return deterministic tool tasks only for explicit, safe phrases. Never maps
-    arbitrary prose to a command. Config paths must be explicit and in-repo."""
+    """Return deterministic tool tasks only for explicit, safe phrases whose WHOLE
+    intent is captured. Never maps arbitrary prose to a command; never claims a
+    comparison or explanation was performed when only a partial probe matched."""
     root = pathlib.Path(root or ROOT)
     lowered = (text or "").lower()
+    if not lowered.strip() or _has_explanatory_cue(text):
+        return []
     tasks: list[dict[str, Any]] = []
-    if any(phrase in lowered for phrase in _REPO_STATE_PHRASES):
+    equality = _EQUALITY_CUES.search(text) is not None
+    understood_equality = False
+
+    head_match = _HEAD_MATCH.search(text) or _HEAD_MATCH_REV.search(text)
+    if head_match:
+        tasks.append({"executor": "TOOL_ONLY", "operation": "git_head_matches",
+                      "args": {"expected": head_match.group(1).lower()}})
+        understood_equality = True
+
+    config_match = _CONFIG_VALUE.search(text)
+    if config_match and (root / config_match.group(1)).exists():
+        tasks.append({"executor": "TOOL_ONLY", "operation": "config_value_matches",
+                      "args": {"path": config_match.group(1), "key": config_match.group(2),
+                               "expected": config_match.group(3)}})
+        understood_equality = True
+
+    # A stated equality we could not evaluate must not be reported as done.
+    if equality and not understood_equality:
+        return []
+
+    filename_match = _FILE_EXISTS.search(text)
+    if filename_match:
+        tasks.append({"executor": "TOOL_ONLY", "operation": "file_exists",
+                      "args": {"path": filename_match.group(1)}})
+
+    if any(phrase in lowered for phrase in _STRONG_REPO_STATE) or (
+            sum(1 for cue in _WEAK_REPO_STATE if cue in lowered) >= 2):
         tasks.append({"executor": "TOOL_ONLY", "operation": "repository_state", "args": {}})
+
     for token in (text or "").split():
         token = token.strip(".,;:()[]{}\"'`")
         if token.endswith((".yaml", ".json", ".toml")) and (root / token).exists():

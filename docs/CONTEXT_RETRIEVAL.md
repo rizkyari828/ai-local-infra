@@ -72,12 +72,21 @@ Graphify as advisory.
 ## Deduplication, delta, quality
 
 Content fingerprints canonicalize identical items across paths; overlapping/adjacent
-ranges for the same file merge into one item. Within a pack, a current fact supersedes an
+ranges for the same file merge into one item. Merging re-reads the authoritative file
+from the **same workspace root** the context was retrieved from, re-applies redaction,
+and re-fingerprints the merged final content — so a fingerprint is never derived from
+pre-merge or pre-sanitized content, a change inside a merged range always changes the
+item fingerprint and manifest identity, and content removed as sensitive cannot
+reappear through a merge. Within a pack, a current fact supersedes an
 older equivalent (e.g. the same HEAD appears once). Cross-call "memory" is **not**
 assumed: a fresh worker call receives required context even if a prior attempt saw it.
 Retry/failover reuses the same validated base pack (rebuilding only if required inputs
 changed) and may add a new bounded failure fact. Quality floor: if analysis genuinely
 needs several files/components, use MEDIUM/LARGE; never squeeze correctness into TINY.
+
+Processing order is `retrieve → select → merge → sanitize/redact → normalize/bound →
+validate → FINAL CONTENT → hash`. The fingerprint always describes the final delivered
+content, which is the same content embedded in the worker input.
 
 ## Validation, security, cache-readiness
 

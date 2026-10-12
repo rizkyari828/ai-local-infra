@@ -13,6 +13,7 @@ decomposition semantics.
 
 from __future__ import annotations
 
+import hashlib
 import re
 from typing import Any, Optional
 
@@ -41,6 +42,56 @@ BASE_CONTEXT = {
 }
 NON_INTELLIGENCE_CATEGORIES = tuple(c for c in knowledge.FAILURE_CATEGORIES
                                     if c != "REASONING_INSUFFICIENT")
+
+# Complete task contract (Execution Contract Stabilization V0.1). One explicit,
+# bounded contract per executable node preserves the task-specific meaning the worker
+# needs; it never forwards the raw master prompt and never stores raw chat.
+CONTRACT_VERSION = "task-contract-v1"
+
+# Deterministic clause boundaries for assigning task-specific objective slices.
+_CLAUSE_RE = re.compile(r"[;,]|\band\b", re.IGNORECASE)
+
+
+def _objective_fingerprint(objective: str) -> str:
+    """Stable identity of the whole master objective (never stored as raw text)."""
+    canonical = " ".join((objective or "").split())
+    return hashlib.sha256(canonical.encode("utf-8", "replace")).hexdigest()[:32]
+
+
+def _clauses(objective: str) -> list[str]:
+    return [part.strip() for part in _CLAUSE_RE.split(objective or "") if part.strip()]
+
+
+class _Slicer:
+    """Assigns each work stage the bounded master clause that matches it (once)."""
+
+    _CUES = {
+        "implement": None,  # mutation verbs are checked structurally
+        "architecture": ("audit", "architecture", "cross-machine", "multi-machine", "review",
+                         "analy", "analyze", "inspect", "trace", "examine", "configured",
+                         "configuration", "resolver", "precedence", "migration", "concurrency"),
+        "security": ("security", "authentication", "authorization", "auth"),
+        "docs": ("doc", "docs", "documentation", "readme"),
+        "tests": ("test", "tests", "verify", "validate"),
+        "final": ("report", "final", "summar"),
+    }
+
+    def __init__(self, objective: str) -> None:
+        self.clauses = _clauses(objective)
+        self.used: set[int] = set()
+
+    def for_kind(self, kind: str, fallback: str) -> str:
+        cues = self._CUES.get(kind)
+        for index, clause in enumerate(self.clauses):
+            if index in self.used:
+                continue
+            low = clause.lower()
+            match = has_mutation(clause) if kind == "implement" else any(cue in low for cue in (cues or ()))
+            if match:
+                self.used.add(index)
+                return clause
+        return fallback
+
 
 # Execution intent (never inferred from loose substrings such as "config"/"configured").
 INTENT_READ_ONLY = "READ_ONLY"
@@ -172,6 +223,7 @@ def _deterministic_plan(objective: str, constraints: dict[str, Any], decision: d
     plan["quota_view"] = {"nodes": len(nodes), "expensive_nodes": 0, "cheap_nodes": 0,
                           "conditional_expensive_nodes": 0, "full_context_nodes": 0}
     _attach_budget(plan, constraints)
+    _attach_contracts(plan, objective)
     return plan
 
 
@@ -247,6 +299,9 @@ def decompose(objective: str, *, constraints: Optional[dict[str, Any]] = None) -
         if deterministic_plan is not None:
             return deterministic_plan
     sig = _signals(objective)
+    slicer = _Slicer(objective)
+    multi = (sum(1 for key in ("implement", "architecture", "security", "docs", "tests") if sig[key]) >= 2
+             or decision["mode"] == PLANNER_AI or _requires_synthesis(objective))
     nodes: list[dict[str, Any]] = []
     nodes.append(_node("T1", "Inspect repository and gather current state", "MECHANICAL", [],
                        acceptance=["repository state summarized", "relevant files identified"],
@@ -262,6 +317,11 @@ def decompose(objective: str, *, constraints: Optional[dict[str, Any]] = None) -
         nodes[0]["tool"] = {"operation": "repository_state", "args": {}}
         nodes[0]["routing"] = None
         nodes[0]["acceptance_criteria"] = ["repository state determined deterministically"]
+
+    # Simple intact AI objective: keep ONE bounded task that still carries the actual
+    # requirement instead of forcing a generic inspect -> implement -> report split.
+    if not multi and not deterministic_tasks and repo_state is None:
+        return _single_task_plan(objective, sig, decision, constraints)
 
     last_analysis = "T1"
     if sig["architecture"]:
@@ -320,6 +380,47 @@ def decompose(objective: str, *, constraints: Optional[dict[str, Any]] = None) -
             final["acceptance_criteria"] = ["all deterministic acceptance satisfied"]
         nodes.append(final)
 
+    _assign_task_slices(nodes, slicer)
+    plan = _finish_plan(objective, nodes, decision, constraints)
+    _attach_contracts(plan, objective)
+    return plan
+
+
+_SLICE_KIND = {"T2": "architecture", "T2S": "security", "T3": "implement", "T3E": "architecture",
+               "T4": "docs", "T5": "tests", "T6": "final"}
+_SLICE_OPERATION = {"T1": "inspect", "T2": "analyze", "T2S": "review", "T3": "implement",
+                    "T3E": "resolve", "T4": "document", "T5": "verify", "T6": "finalize",
+                    "D": "check"}
+
+
+def _assign_task_slices(nodes: list[dict[str, Any]], slicer: "_Slicer") -> None:
+    """Give each AI stage the bounded master clause that matches its work, so distinct
+    objectives with different requirements cannot collapse into one generic task."""
+    for node in nodes:
+        if node.get("executor") == "TOOL_ONLY":
+            continue
+        kind = _SLICE_KIND.get(node["task_id"])
+        if kind is None:
+            continue
+        node["objective_summary"] = slicer.for_kind(kind, node["objective_summary"])
+
+
+def _single_task_plan(objective: str, sig: dict[str, bool], decision: dict[str, Any],
+                      constraints: dict[str, Any]) -> dict[str, Any]:
+    objective_summary = _bounded_summary(objective, 200)
+    task_class = "CRITICAL" if sig["security"] else (
+        "CORRECTNESS_SENSITIVE" if sig["architecture"] else "NORMAL")
+    node = _node("T1", objective_summary, task_class, [],
+                 acceptance=["the stated task's requested outcome is reached"],
+                 produces=["task_result"], family=knowledge.task_family_for(objective_summary))
+    node["objective_summary"] = objective_summary
+    plan = _finish_plan(objective, [node], decision, constraints)
+    _attach_contracts(plan, objective)
+    return plan
+
+
+def _finish_plan(objective: str, nodes: list[dict[str, Any]], decision: dict[str, Any],
+                 constraints: dict[str, Any]) -> dict[str, Any]:
     plan = {"schema_version": 1, "objective_summary": _bounded_summary(objective),
             "planner": classify_planner(objective), "planner_mode": decision, "nodes": nodes,
             "intent": execution_intent(objective, read_only=bool(constraints.get("read_only")))}
@@ -335,6 +436,42 @@ def decompose(objective: str, *, constraints: Optional[dict[str, Any]] = None) -
     plan["executor_mix"] = {"TOOL_ONLY": tool_only, "AI": len(nodes) - tool_only}
     _attach_budget(plan, constraints)
     return plan
+
+
+def _contract_targets(node: dict[str, Any]) -> list[str]:
+    targets: list[str] = []
+    for key in ("context_refs", "config_refs", "symbol_refs"):
+        for ref in node.get(key) or []:
+            value = ref.get("path") if isinstance(ref, dict) else None
+            if value and value not in targets:
+                targets.append(value)
+    return targets
+
+
+def _attach_contracts(plan: dict[str, Any], objective: str) -> None:
+    """Attach the one explicit COMPLETE TASK CONTRACT each executable node uses."""
+    master = _objective_fingerprint(objective)
+    for node in plan["nodes"]:
+        routing_c = node.get("routing") or {}
+        node["task_contract"] = {
+            "contract_version": CONTRACT_VERSION,
+            "task_id": node["task_id"],
+            "objective": node["objective_summary"],
+            "master_fingerprint": master,
+            "operation": _SLICE_OPERATION.get(node["task_id"],
+                                              (node.get("tool") or {}).get("operation") or "execute"),
+            "targets": _contract_targets(node),
+            "constraints": list(constraints_list(plan)),
+            "acceptance": list(node.get("acceptance_criteria") or []),
+            "permissions": node.get("intent"),
+            "dependencies": list(node.get("depends_on") or []),
+            "context_budget": (node.get("context") or {}).get("budget"),
+            "capability_requirement": {"tier": routing_c.get("tier"), "effort": routing_c.get("effort")},
+        }
+
+
+def constraints_list(plan: dict[str, Any]) -> list[str]:
+    return [f"intent:{plan.get('intent')}"]
 
 
 def _intent_conflicts(nodes: list[dict[str, Any]], intent: str) -> list[str]:
