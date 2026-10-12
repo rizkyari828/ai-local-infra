@@ -148,7 +148,8 @@ PLANNER_AI = "AI"
 
 _AI_TERMS = ("architecture", "security", "review", "design", "debug", "root cause", "concurrency",
              "persistence", "migration", "decide", "integrat", "refactor", "implement", "fix",
-             "optimi", "diagnos", "ambigu", "unknown", "unclear", "underspecified")
+             "optimi", "diagnos", "ambigu", "unknown", "unclear", "underspecified",
+             "explain", "describe", "summariz", "summaris", "walk through")
 _PLANNER_AI_TERMS = ("security-sensitive", "ambiguous", "multiple architectures", "unknown architecture",
                      "unclear", "underspecified", "root cause", "major architecture")
 
