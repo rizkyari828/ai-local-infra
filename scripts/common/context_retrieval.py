@@ -333,31 +333,38 @@ def deduplicate(items: list[dict[str, Any]], *,
 
 
 def enforce_budget(items: list[dict[str, Any]], budget: str, budgets: dict[str, int]) -> tuple[list[dict], list[dict], bool]:
-    """Ceiling, not target. Drop lowest-priority OPTIONAL first; never drop required."""
+    """Ceiling, not target. Required items are never dropped; optional items are added
+    only while they fit, so optional context can NEVER push the final pack over budget.
+    When required context alone exceeds the ceiling the pack is refused (fits=False)."""
     limit = budgets.get(budget, budgets["SMALL"])
-    ordered = sorted(items, key=lambda i: (i["priority"], not i["required"]))
-    kept: list[dict[str, Any]] = []
+    required = sorted((item for item in items if item["required"]), key=lambda i: i["priority"])
+    optional = sorted((item for item in items if not item["required"]), key=lambda i: i["priority"])
+    required_total = sum(item["size"] for item in required)
+    if required_total > limit:
+        return required, optional, False  # required context cannot fit
+    used = required_total
+    kept_optional: list[dict[str, Any]] = []
     omitted: list[dict[str, Any]] = []
-    used = 0
-    for item in ordered:
-        if used + item["size"] <= limit or item["required"]:
-            kept.append(item)
+    for item in optional:
+        if used + item["size"] <= limit:
+            kept_optional.append(item)
             used += item["size"]
         else:
             omitted.append(item)
-    required_total = sum(i["size"] for i in items if i["required"])
-    if required_total > limit:
-        return kept, omitted, False  # required context cannot fit
-    # Re-sort kept by priority for a stable pack.
-    kept.sort(key=lambda i: i["priority"])
+    kept = sorted(required + kept_optional, key=lambda i: i["priority"])
     return kept, omitted, True
 
 
 def validate(items: list[dict[str, Any]], *, fits: bool, required_error: Optional[str],
-             graph_status: str, used_graphify: bool) -> str:
+             graph_status: str, used_graphify: bool, required_truncated: bool = False) -> str:
     if required_error:
         return STATUS_UNSAFE if "escapes" in required_error else STATUS_MISSING
     if not fits:
+        return STATUS_BUDGET
+    if required_truncated:
+        # Required content would be materially truncated: fail closed rather than
+        # deliver a silently incomplete pack. No bounded/truncated representation is
+        # opted in by the task contract in this milestone.
         return STATUS_BUDGET
     if used_graphify and graph_status in (GRAPHIFY_STALE, GRAPHIFY_INVALID):
         return STATUS_STALE
@@ -386,8 +393,9 @@ def build_pack(request: ContextRequest, *, root: Optional[pathlib.Path] = None,
     items, dropped_duplicates = deduplicate(items, root=root)
     kept, omitted, fits = enforce_budget(items, request["context_budget"], budgets)
     used_graphify = False  # deterministic retrieval used; Graphify is advisory only in V0.1
+    required_truncated = any(i["truncated"] for i in kept if i["required"])
     status = validate(kept, fits=fits, required_error=error, graph_status=graph_status,
-                      used_graphify=used_graphify)
+                      used_graphify=used_graphify, required_truncated=required_truncated)
     manifest = {
         "task_id": request["task_id"], "executor_type": request["executor_type"],
         "context_budget": request["context_budget"], "budget_limit": budgets.get(request["context_budget"]),
@@ -395,7 +403,8 @@ def build_pack(request: ContextRequest, *, root: Optional[pathlib.Path] = None,
         "required_count": sum(1 for i in kept if i["required"]),
         "optional_count": sum(1 for i in kept if not i["required"]),
         "omitted_count": len(omitted), "duplicate_chars_avoided": dropped_duplicates,
-        "required_fits": fits, "graphify_status": graph_status, "graphify_used": used_graphify,
+        "required_fits": fits, "required_truncated": required_truncated,
+        "graphify_status": graph_status, "graphify_used": used_graphify,
         "fallback_used": fallback_used or graph_status != GRAPHIFY_CURRENT,
         "items": [{"source_kind": i["source_kind"], "source_id": i["source_id"], "path": i["path"],
                    "symbol": i["symbol"], "range": i["range"], "fingerprint": i["fingerprint"],

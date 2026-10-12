@@ -84,6 +84,10 @@ REASON_WEAKER_CAPABILITY = "WEAKER_CAPABILITY"
 REASON_EXPLICIT_MODEL = "EXPLICIT_MODEL_REQUEST"
 REASON_RESULT_NOT_REUSABLE = "RESULT_NOT_REUSABLE"
 REASON_SIMULATION_MISMATCH = "SIMULATION_PROVENANCE_MISMATCH"
+# Mutating work may only be reused when a *current* verified postcondition proves the
+# desired state already exists. No such verifier exists in this milestone, so every
+# mutating task is a hard MISS regardless of freshness overrides.
+REASON_MUTATION_UNVERIFIED = "MUTATION_POSTCONDITION_UNVERIFIED"
 
 # Volatile AI cues: current runtime state matters, so an old result must not be
 # reused. Conservative — an unrecognised task defaults to INPUT_BOUND, never PURE.
@@ -258,6 +262,11 @@ def result_fingerprint(result_type_value: str, bounded: dict[str, Any]) -> str:
 
 
 def freshness_policy(node: dict[str, Any], *, constraints: Optional[dict[str, Any]] = None) -> str:
+    # HARD mutation rule (non-overridable): a mutating task's desired state can never be
+    # proven by a stored result, so reuse is refused before any freshness override can
+    # weaken it. This is checked FIRST, above explicit node/constraint overrides.
+    if (node or {}).get("intent") == "MUTATING":
+        return FRESHNESS_RUNTIME_VOLATILE
     explicit = (node or {}).get("freshness_policy")
     if explicit in FRESHNESS_POLICIES:
         return explicit
@@ -268,10 +277,6 @@ def freshness_policy(node: dict[str, Any], *, constraints: Optional[dict[str, An
     if (node or {}).get("executor") == "TOOL_ONLY":
         # Cheap deterministic operations are recomputed from current state; a pure
         # operation must explicitly opt in to reuse.
-        return FRESHNESS_RUNTIME_VOLATILE
-    if (node or {}).get("intent") == "MUTATING":
-        # A mutating task is never reused from a stale "patch applied" summary; reuse
-        # would require a verified current postcondition the cache cannot observe.
         return FRESHNESS_RUNTIME_VOLATILE
     text = (node.get("objective_summary") or "").lower()
     if any(cue in text for cue in _VOLATILE_CUES):
@@ -288,6 +293,10 @@ def eligible_for_cache(node: dict[str, Any], result: dict[str, Any], *,
                        freshness: str) -> tuple[bool, Optional[str]]:
     """Deterministic gate for writing a reusable result. Never caches failed,
     partial, uncacheable-volatile, or non-structured results."""
+    if (node or {}).get("intent") == "MUTATING":
+        # A mutating result is never stored as reusable: without a current verified
+        # postcondition it can never be safely reused, so writing it is pure risk.
+        return False, REASON_MUTATION_UNVERIFIED
     if result.get("status") in NEVER_REUSE_AS_SUCCESS or result.get("status") != "SUCCESS":
         return False, REASON_RESULT_NOT_REUSABLE
     if result.get("acceptance") and result.get("acceptance") != "PASSED":
@@ -533,6 +542,11 @@ def decide(*, store: ResultCache, project_id: str, node: dict[str, Any], identit
         return {**base, "reason": REASON_USER_FORCED_REFRESH}
     if explicit_model:
         return {**base, "reason": REASON_EXPLICIT_MODEL}
+    # HARD mutation rule: no freshness policy (INPUT_BOUND included) may bypass the
+    # need to establish the current desired state. Without a verified postcondition a
+    # mutating node always executes.
+    if (node or {}).get("intent") == "MUTATING":
+        return {**base, "reason": REASON_MUTATION_UNVERIFIED}
     if not dependencies_complete:
         return {**base, "reason": REASON_DEPENDENCY_CHANGED}
     if freshness not in REUSABLE_FRESHNESS:
