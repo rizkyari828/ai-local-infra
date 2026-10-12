@@ -125,8 +125,8 @@ def _acceptance(node: dict[str, Any], result: dict[str, Any]) -> tuple[str, Opti
             # No declared criteria means no acceptance contract to satisfy. An empty
             # criteria list must never vacuously pass ({"passed": false} case).
             return ACCEPTANCE_UNVERIFIED, "no acceptance criteria defined"
-        recognized, whole = _normalize_signals(acceptance)
-        if recognized and whole is None:
+        recognized, overall = _normalize_signals(acceptance)
+        if recognized and overall is None:
             # A conflict/malformed recognized field anywhere in the acceptance object
             # rejects the whole result, even if a criterion key happens to be typed.
             return ACCEPTANCE_UNVERIFIED, "conflicting or malformed acceptance evidence"
@@ -135,6 +135,16 @@ def _acceptance(node: dict[str, Any], result: dict[str, Any]) -> tuple[str, Opti
         normalized = [_normalize_acceptance(acceptance[c]) for c in criteria]
         if any(value is None for value in normalized):
             return ACCEPTANCE_UNVERIFIED, "malformed or untyped acceptance evidence"
+        if recognized:
+            # ONE coherent decision from the FULL object: an overall verdict and the
+            # required criterion verdicts must agree. A positive criterion can never
+            # override an overall FAILED verdict, and an overall PASSED verdict can never
+            # hide a required criterion failure. No field precedence.
+            if overall is False:
+                return ACCEPTANCE_FAILED, "overall acceptance verdict failed"
+            if any(value is False for value in normalized):
+                return ACCEPTANCE_FAILED, "required criterion failed despite a positive overall verdict"
+            return ACCEPTANCE_PASSED, None
         if all(normalized):
             return ACCEPTANCE_PASSED, None
         return ACCEPTANCE_FAILED, "acceptance criterion not satisfied"
@@ -1092,6 +1102,7 @@ def _run_node(node, deps, results, backend, resolution, *, state_dir, record_evi
                                 for dep in deps]
     attempt = 0
     launched = False  # set True at the actual worker-launch boundary
+    last_launched: Optional[dict[str, Any]] = None  # candidate that actually ran, not merely selected
     infra_used = same_used = escalations = 0
     execution_id = uuid.uuid4().hex
 
@@ -1123,9 +1134,11 @@ def _run_node(node, deps, results, backend, resolution, *, state_dir, record_evi
         if record_evidence else execution_id
     while True:
         if budget["max"] is not None and budget["used"] >= budget["max"]:
+            # No launch happens here: capability metadata stays with the last candidate that
+            # was actually attempted, never with a candidate that was only selected.
             return _finalize_node(node, {"summary": "hard AI-call budget exhausted"}, FAILURE,
-                             "CALL_BUDGET_EXHAUSTED", initial_tier, tier, attempt, escalations,
-                             decision_id, resolution, state_dir, record_evidence)
+                                  "CALL_BUDGET_EXHAUSTED", initial_tier, tier, attempt, escalations,
+                                  decision_id, resolution, state_dir, record_evidence, candidate=last_launched)
         attempt += 1
         # The context is validated BEFORE the launch boundary: a rejected/missing
         # context consumes no AI-call budget and counts as zero invocations.
@@ -1181,109 +1194,140 @@ def _run_node(node, deps, results, backend, resolution, *, state_dir, record_evi
         budget["used"] += 1  # actual worker/model launch boundary
         launched = True
 
-        def _append_attempt(status_value: str, category_value: Optional[str],
-                            result_value: dict[str, Any]) -> None:
-            """Truthful operational attempt accounting: if a worker CLI launch happened,
-            an Attempt row is recorded even when a later validation rejects the result or
-            the launch is cancelled/interrupted before any result exists."""
-            if attempts is None:
-                return
-            attempts.append({
+        # Attempt ownership is created AT the launch boundary, BEFORE any interpretation
+        # of the adapter result. A None/malformed return or a post-launch normalization
+        # error can therefore never lose the fact that a worker was actually launched.
+        attempt_row: Optional[dict[str, Any]] = None
+        if attempts is not None:
+            attempt_row = {
                 "task_id": node["task_id"], "attempt_no": attempt,
                 "backend": current_backend.name, "provider": candidate["provider"],
                 "model": candidate["model"], "native_effort": candidate["native_variant"],
                 "normalized_effort": candidate.get("normalized_effort"),
                 "required_tier": initial_tier, "required_effort": node["routing"]["effort"],
-                "status": status_value, "failure_category": category_value,
+                "status": "LAUNCHED", "failure_category": None,
                 "is_retry": attempt > 1 and current_backend.name == first_backend,
                 "is_fallback": current_backend.name != first_backend,
-                "completion_signal": result_value.get("completion_signal"),
+                "completion_signal": None,
                 "simulated": getattr(current_backend, "mode", "SUPPORTED") == "SIMULATED",
-            })
+            }
+            attempts.append(attempt_row)
+
+        def _settle_attempt(status_value: str, category_value: Optional[str],
+                            result_value: Optional[dict[str, Any]] = None) -> None:
+            """Finalize the attempt row created at launch. Never depends on the adapter
+            result being parseable."""
+            if attempt_row is None:
+                return
+            attempt_row["status"] = status_value
+            attempt_row["failure_category"] = category_value
+            if isinstance(result_value, dict):
+                attempt_row["completion_signal"] = result_value.get("completion_signal")
 
         try:
             result = current_backend.execute(request)
         except KeyboardInterrupt:
             # The launch already happened: account for it before propagating cancellation.
-            _append_attempt("CANCELLED", "CANCELLED", {})
+            _settle_attempt("CANCELLED", "CANCELLED")
             raise  # cancellation semantics are handled by the caller
         except Exception as exc:  # adapter bug/crash: never a false SUCCESS, never an orphan
             result = {"task_id": node["task_id"], "status": FAILURE, "failure_category": "UNKNOWN_FAILURE",
                       "summary": f"adapter error: {type(exc).__name__}"}
+        if not isinstance(result, dict):
+            # A malformed adapter result is a truthful failure, never a crash and never a
+            # lost launch: the attempt row already exists.
+            result = {"task_id": node["task_id"], "status": FAILURE, "failure_category": "UNKNOWN_FAILURE",
+                      "summary": f"malformed adapter result: {type(result).__name__}"}
         candidate = {**candidate, "simulated": getattr(current_backend, "mode", "SUPPORTED") == "SIMULATED"}
+        last_launched = candidate  # the candidate that actually ran this attempt
 
-        if read_only_scope:
-            changed = sorted(_worktree_paths(repo_root) - (before_paths or set()))
-            content_changed = _worktree_fingerprint(repo_root) != before_fp
-            if changed or content_changed:
-                detail = ", ".join(changed[:5]) or "content changed in an already-dirty file"
-                _append_attempt("FAILED", "READ_ONLY_VIOLATION", result)
-                return _finalize_node(node, {"summary": "read-only violation: " + detail},
-                                 "READ_ONLY_VIOLATION", "READ_ONLY_VIOLATION", initial_tier, tier,
-                                 attempt, escalations, decision_id, resolution, state_dir, record_evidence,
-                                 candidate=candidate)
-        category = result.get("failure_category")
-        process_ok = result.get("status") == SUCCESS and bool(result.get("completion_signal"))
-        acceptance_state, acceptance_reason = (ACCEPTANCE_UNVERIFIED, "process did not complete")
-        if process_ok:
-            acceptance_state, acceptance_reason = _acceptance(node, result)
-        accepted = process_ok and acceptance_state == ACCEPTANCE_PASSED
-        attempt_status = ("SUCCESS" if accepted
-                          else UNVERIFIED if acceptance_state == ACCEPTANCE_UNVERIFIED and process_ok
-                          else "FAILED")
-        attempt_category = None if accepted else (
-            category or ("ACCEPTANCE_UNVERIFIED" if attempt_status == UNVERIFIED else "ACCEPTANCE_FAILED"))
-        _append_attempt(attempt_status, attempt_category, result)
+        try:
+            if read_only_scope:
+                changed = sorted(_worktree_paths(repo_root) - (before_paths or set()))
+                content_changed = _worktree_fingerprint(repo_root) != before_fp
+                if changed or content_changed:
+                    detail = ", ".join(changed[:5]) or "content changed in an already-dirty file"
+                    _settle_attempt("FAILED", "READ_ONLY_VIOLATION", result)
+                    return _finalize_node(node, {"summary": "read-only violation: " + detail},
+                                          "READ_ONLY_VIOLATION", "READ_ONLY_VIOLATION", initial_tier, tier,
+                                          attempt, escalations, decision_id, resolution, state_dir, record_evidence,
+                                          candidate=candidate)
+            category = result.get("failure_category")
+            process_ok = result.get("status") == SUCCESS and bool(result.get("completion_signal"))
+            acceptance_state, acceptance_reason = (ACCEPTANCE_UNVERIFIED, "process did not complete")
+            if process_ok:
+                acceptance_state, acceptance_reason = _acceptance(node, result)
+            accepted = process_ok and acceptance_state == ACCEPTANCE_PASSED
+            attempt_status = ("SUCCESS" if accepted
+                              else UNVERIFIED if acceptance_state == ACCEPTANCE_UNVERIFIED and process_ok
+                              else "FAILED")
+            attempt_category = None if accepted else (
+                category or ("ACCEPTANCE_UNVERIFIED" if attempt_status == UNVERIFIED else "ACCEPTANCE_FAILED"))
+        except Exception as exc:  # post-launch processing failure: attempt already owns the launch
+            _settle_attempt("FAILED", "UNKNOWN_FAILURE", {})
+            return _finalize_node(node, {"summary": f"result processing failed: {type(exc).__name__}"},
+                                  FAILURE, "UNKNOWN_FAILURE", initial_tier, tier, attempt, escalations,
+                                  decision_id, resolution, state_dir, record_evidence, candidate=candidate)
+        _settle_attempt(attempt_status, attempt_category, result)
         if accepted:
             return _finalize_node(node, result, SUCCESS, None, initial_tier, tier, attempt, escalations,
-                             decision_id, resolution, state_dir, record_evidence, candidate=candidate)
+                                  decision_id, resolution, state_dir, record_evidence, candidate=candidate)
         if process_ok and acceptance_state == ACCEPTANCE_FAILED:
             return _finalize_node(node, result, FAILURE, "ACCEPTANCE_FAILED", initial_tier, tier, attempt,
-                             escalations, decision_id, resolution, state_dir, record_evidence,
-                             candidate=candidate)
+                                  escalations, decision_id, resolution, state_dir, record_evidence,
+                                  candidate=candidate)
         if process_ok and acceptance_state == ACCEPTANCE_UNVERIFIED:
             # The process completed but no independent acceptance exists: this is not a
             # task failure and never a task success. It cannot feed cache or learning.
             return _finalize_node(node, result, UNVERIFIED, "ACCEPTANCE_UNVERIFIED", initial_tier, tier,
-                             attempt, escalations, decision_id, resolution, state_dir, record_evidence,
-                             candidate=candidate)
+                                  attempt, escalations, decision_id, resolution, state_dir, record_evidence,
+                                  candidate=candidate)
         if category == "PERMISSION_REQUIRED":
             return _finalize_node(node, result, FAILURE, category, initial_tier, tier, attempt, escalations,
-                             decision_id, resolution, state_dir, record_evidence, candidate=candidate)
+                                  decision_id, resolution, state_dir, record_evidence, candidate=candidate)
+        # Once a MUTATING worker has actually launched, an ambiguous terminal result may
+        # already have caused a side effect: retry, failover or escalation would risk
+        # applying it twice. Automatic replay is refused unless the failure is provably
+        # pre-launch. READ_ONLY work keeps its existing bounded retry semantics.
+        mutating_uncertain = bool(launched and node.get("intent") == "MUTATING")
         if category in INFRA_CATEGORIES:
-            if infra_used < infra_retries:
-                infra_used += 1
-                continue
-            # Capability-preserving backend failover (never downgrades the tier floor).
-            if candidates is not None and health is not None:
-                next_candidate = failover.failover(candidates, candidate, health, category)
-                if next_candidate and next_candidate["backend"] in registry:
-                    candidate = next_candidate
-                    current_backend = registry[next_candidate["backend"]]
-                    infra_used = 0
+            if not mutating_uncertain:
+                if infra_used < infra_retries:
+                    infra_used += 1
                     continue
+                # Capability-preserving backend failover (never downgrades the tier floor).
+                if candidates is not None and health is not None:
+                    next_candidate = failover.failover(candidates, candidate, health, category)
+                    if next_candidate and next_candidate["backend"] in registry:
+                        candidate = next_candidate
+                        current_backend = registry[next_candidate["backend"]]
+                        infra_used = 0
+                        continue
             return _finalize_node(node, result, FAILURE, category, initial_tier, tier, attempt, escalations,
-                             decision_id, resolution, state_dir, record_evidence, candidate=candidate)
+                                  decision_id, resolution, state_dir, record_evidence, candidate=candidate)
         if category == REASONING:
-            next_tier = NEXT_TIER.get(tier)
-            if next_tier and escalations < 2:
-                tier = next_tier
-                escalations += 1
-                # Keep the candidate's capability tier in sync even on the alternate
-                # (no-health) path, so final evidence reflects the actual accepted tier.
-                candidate = {**candidate, "tier": tier}
-                if health is not None:
+            chosen = None
+            next_tier = None
+            if not mutating_uncertain:
+                next_tier = NEXT_TIER.get(tier)
+                if next_tier and escalations < 2 and health is not None:
                     stronger = failover.resolve(next_tier, node["routing"]["effort"],
                                                 failover.candidates_for_tier(next_tier), health,
                                                 constraints=constraints)
-                    chosen = failover.select(stronger)
-                    if chosen and chosen["backend"] in registry:
-                        candidate = chosen
-                        current_backend = registry[chosen["backend"]]
+                    selected = failover.select(stronger)
+                    if selected and selected["backend"] in registry:
+                        chosen = selected
+            if chosen is not None:
+                # Real capability escalation: accepted metadata comes from the ACTUALLY
+                # selected stronger candidate, never from a relabeled same candidate.
+                tier = next_tier
+                escalations += 1
+                candidate = chosen
+                current_backend = registry[chosen["backend"]]
                 continue
             return _finalize_node(node, result, FAILURE, category, initial_tier, tier, attempt, escalations,
-                             decision_id, resolution, state_dir, record_evidence, candidate=candidate)
-        if category == IMPLEMENTATION and same_used < same_tier_retries:
+                                  decision_id, resolution, state_dir, record_evidence, candidate=candidate)
+        if category == IMPLEMENTATION and not mutating_uncertain and same_used < same_tier_retries:
             same_used += 1
             continue
         return _finalize_node(node, result, FAILURE, category or "UNKNOWN_FAILURE", initial_tier, tier,
