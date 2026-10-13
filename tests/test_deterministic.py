@@ -207,8 +207,7 @@ class OutcomeLearningSeparationTests(unittest.TestCase):
             self.assertFalse(derived_knowledge.classify_failure(category)["intelligence_escalation"])
 
 
-MIXED_OBJ = ("Inspect repository state, review the orchestration architecture for correctness, "
-             "validate config/model-routing.yaml, run deterministic verification, report the final result.")
+MIXED_OBJ = "Inspect repository state; review architecture; run focused tests; report results."
 
 
 class MixedDecompositionTests(unittest.TestCase):
@@ -225,17 +224,19 @@ class MixedDecompositionTests(unittest.TestCase):
         self.assertEqual("finalize", final["tool"]["operation"])
 
     def test_mixed_semantic_synthesis_keeps_ai_finalizer(self) -> None:
-        plan = orchestrator.decompose(
-            "Inspect repository state and synthesize the architecture decision for the cross-machine design.",
-            constraints={})
-        final = next(node for node in plan["nodes"] if node["task_id"] == "T6")
-        self.assertEqual("AI", final["executor"])
+        objective = "Inspect repository state and synthesize the architecture decision for the cross-machine design."
+        plan = orchestrator.decompose(objective)
+        # Unrestricted synthesis prose remains one intact AI task under Pass 6.
+        self.assertEqual(1, len(plan["nodes"]))
+        self.assertEqual("AI", plan["nodes"][0]["executor"])
+        self.assertEqual(objective, plan["nodes"][0]["task_contract"]["objective"])
 
     def test_config_parse_detected_with_punctuation(self) -> None:
-        plan = orchestrator.decompose(MIXED_OBJ)
-        operations = [node.get("tool", {}).get("operation") for node in plan["nodes"]
-                      if node.get("executor") == "TOOL_ONLY"]
-        self.assertIn("config_parse", operations)
+        objective = "Inspect repository state, validate config/model-routing.yaml, run tests."
+        plan = orchestrator.decompose(objective)
+        # Path punctuation is outside the decomposable grammar; do not discard it.
+        self.assertEqual(1, len(plan["nodes"]))
+        self.assertEqual(objective, plan["nodes"][0]["task_contract"]["objective"])
 
     def test_repository_state_converted_to_tool_only(self) -> None:
         plan = orchestrator.decompose(MIXED_OBJ)

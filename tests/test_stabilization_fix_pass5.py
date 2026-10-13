@@ -83,7 +83,7 @@ class LiteralPreservationTests(Fixture):
         exact = 'Fix output to exactly "alpha  and  beta"; update docs; run tests.'
         plan = orchestrator.decompose(exact)
         objectives = _objectives(plan)
-        self.assertIn('Fix output to exactly "alpha  and  beta"', objectives)
+        self.assertEqual([exact], objectives)
         blob = " ".join(objectives)
         self.assertNotIn("alpha; beta", blob)
         self.assertNotIn('"alpha; beta"', blob)
@@ -91,28 +91,27 @@ class LiteralPreservationTests(Fixture):
     def test_double_quoted_comma_is_preserved(self) -> None:
         # 2. Literal comma preserved exactly.
         exact = 'Fix output to exactly "alpha,beta"; update docs; run tests.'
-        self.assertIn('Fix output to exactly "alpha,beta"', _objectives(orchestrator.decompose(exact)))
+        self.assertEqual([exact], _objectives(orchestrator.decompose(exact)))
 
     def test_double_quoted_semicolon_is_preserved(self) -> None:
         # 3. Literal semicolon preserved exactly.
         exact = 'Fix output to exactly "alpha;beta"; update docs; run tests.'
-        self.assertIn('Fix output to exactly "alpha;beta"', _objectives(orchestrator.decompose(exact)))
+        self.assertEqual([exact], _objectives(orchestrator.decompose(exact)))
 
     def test_single_quoted_text_is_preserved(self) -> None:
         # 4. Single-quoted variant.
         exact = "Fix output to exactly 'alpha and beta'; update docs; run tests."
-        self.assertIn("Fix output to exactly 'alpha and beta'", _objectives(orchestrator.decompose(exact)))
+        self.assertEqual([exact], _objectives(orchestrator.decompose(exact)))
 
     def test_backtick_code_literal_is_preserved(self) -> None:
         # 5. Backtick/code-literal variant.
         exact = "Fix output to exactly `alpha && beta`; update docs; run tests."
-        self.assertIn("Fix output to exactly `alpha && beta`", _objectives(orchestrator.decompose(exact)))
+        self.assertEqual([exact], _objectives(orchestrator.decompose(exact)))
 
     def test_multiple_separators_inside_one_literal_are_preserved(self) -> None:
         # 6. Several separators inside one literal stay literal.
         exact = 'Fix output to exactly "alpha, beta; gamma and delta"; update docs; run tests.'
-        self.assertIn('Fix output to exactly "alpha, beta; gamma and delta"',
-                      _objectives(orchestrator.decompose(exact)))
+        self.assertEqual([exact], _objectives(orchestrator.decompose(exact)))
 
     def test_whitespace_sensitive_literal_keeps_distinct_identity(self) -> None:
         # 7. "alpha  beta" must remain distinct from "alpha beta" in both master and
@@ -196,7 +195,7 @@ class AdversarialProbes(Fixture):
     def _literal_survives(self, literal: str) -> None:
         exact = f'Fix output to exactly {literal}; update docs; run tests.'
         objectives = _objectives(orchestrator.decompose(exact))
-        self.assertIn(f"Fix output to exactly {literal}", objectives)
+        self.assertEqual([exact], objectives)
 
     def test_q1_quoted_and(self) -> None:
         self._literal_survives('"x and y"')
