@@ -66,7 +66,7 @@ def _objective_fingerprint(objective: str) -> str:
 _PLAIN_PROSE_RE = re.compile(r"[A-Za-z0-9 ,;.-]+")
 _PLAIN_CLAUSE_RE = re.compile(r"[A-Za-z0-9]+(?:[- ][A-Za-z0-9]+)*[.]?")
 _PLAIN_TARGET_WORDS = frozenset((
-    "the current repository repo files state branch head commit config configuration "
+    "the current repository repo files state status branch head commit worktree config configuration "
     "docs documentation readme tests test suite focused unit architecture security "
     "security-sensitive authentication authorization cross-machine multi-machine "
     "ai infra infrastructure graphify resolver precedence migration concurrency "
@@ -85,10 +85,7 @@ def objective_is_provably_safe_for_decomposition(objective: str) -> bool:
         words = clause.rstrip(".").lower().split()
         if not _PLAIN_CLAUSE_RE.fullmatch(clause):
             return False
-        # Enumerated repository-state nouns may continue a plain reporting clause.
-        state_words = {"current", "branch", "head", "clean", "dirty", "state", "working", "tree"}
-        if set(words) <= state_words:
-            continue
+        # Every clause owns its explicit action; bare nouns cannot inherit intent.
         if words[0] not in actions:
             return False
         # A single named target or a controlled workflow phrase is positive proof;
@@ -149,7 +146,7 @@ class _Slicer:
     def for_kind(self, kind: str, *, reuse: bool = False) -> Optional[tuple[int, int, str]]:
         cues = self._CUES.get(kind) or ()
         for index, span in enumerate(self.spans):
-            if index in self.used and not reuse:
+            if (index in self.used) != reuse:
                 continue
             low = span[2].lower()
             match = has_mutation(span[2]) if kind == "implement" else any(cue in low for cue in cues)
@@ -170,6 +167,7 @@ _OP_EVIDENCE = {
     "file_exists": ("exist", "exists", "file"),
     "config_parse": ("config", "parse", "yaml", "yml", "json", "toml"),
     "run_tests": ("test", "tests", "suite", "unit_tests"),
+    "finalize": ("report", "final", "result", "results"),
 }
 _COVERAGE_FILLER = frozenset((
     "report", "check", "verify", "inspect", "review", "show", "list", "read", "current", "and",
@@ -200,10 +198,20 @@ def _deterministic_covers(objective: str, tasks: list[dict[str, Any]]) -> bool:
     the objective is accounted for by the recognized deterministic operations. Anything
     left (e.g. arithmetic, prose generation) means the objective is NOT fully
     deterministic and must not be reported as a completed zero-AI task."""
-    if not tasks:
+    clauses = _clauses(objective)
+    if not tasks or not clauses:
         return False
-    covered = _coverage_tokens(tasks)
-    return all(token in covered for token in _tokens(objective))
+    for clause in clauses:
+        action = clause.lower().split()[0]
+        tokens = set(_tokens(clause))
+        if not any(
+            (action == "run" if task["operation"] == "run_tests" else action in _READONLY_CUES)
+            and tokens <= _coverage_tokens([task])
+            and tokens.intersection(_OP_EVIDENCE.get(task["operation"], ()))
+            for task in tasks
+        ):
+            return False
+    return True
 
 
 # Execution intent (never inferred from loose substrings such as "config"/"configured").
@@ -218,11 +226,11 @@ _READONLY_CUES = ("inspect", "show", "verify", "review", "check", "list", "repor
 _MUTATION_VERBS = ("modify", "change", "implement", "fix", "update", "add", "remove", "delete",
                    "refactor", "rename", "patch", "write", "edit", "configure", "migrate",
                    "replace", "create", "apply", "install", "enable", "disable", "set", "bump",
-                   "upgrade", "downgrade", "align", "introduce", "restore")
+                   "upgrade", "downgrade", "align", "introduce", "restore", "move", "reset", "switch")
 # Negated mutation phrases ("do not modify", "without changing") never imply mutation.
 _NEGATION_RE = re.compile(
     r"\b(?:do not|don't|dont|without|never|no)\s+(?:\w+\s+){0,2}?"
-    r"(?:modify|change|edit|write|create|delete|remove|update|touch|alter)\b", re.IGNORECASE)
+    r"(?:modify|change|edit|write|create|delete|remove|update|touch|alter|move|reset|switch)\b", re.IGNORECASE)
 
 
 def _strip_negations(text: str) -> str:
@@ -527,11 +535,16 @@ def _assign_task_slices(nodes: list[dict[str, Any]], slicer: "_Slicer", objectiv
     Supporting inspection/finalization/review stages refer to existing spans; they
     never invent another executable objective. Unassigned clauses force intact fallback.
     """
+    if not slicer.spans or any(
+        text != objective[start:end] or not objective_is_provably_safe_for_decomposition(text)
+        for start, end, text in slicer.spans
+    ):
+        return False
     assigned: dict[str, tuple[int, int, str]] = {}
     # Typed tool clauses have ownership first; an analysis cue such as "inspect"
     # must not steal their span and leave the actual analysis clause unassigned.
     for node in nodes:
-        if node.get("executor") != "TOOL_ONLY":
+        if node.get("executor") != "TOOL_ONLY" or node.get("conditional"):
             continue
         task = node.get("tool") or {}
         covered = [(index, candidate) for index, candidate in enumerate(slicer.spans)
@@ -539,10 +552,15 @@ def _assign_task_slices(nodes: list[dict[str, Any]], slicer: "_Slicer", objectiv
         if covered:
             slicer.used.update(index for index, _ in covered)
             start, end = covered[0][1][0], covered[-1][1][1]
+            if not _deterministic_covers(objective[start:end], [task]):
+                return False
             assigned[node["task_id"]] = (start, end, objective[start:end])
+        elif task.get("operation") != "finalize":
+            # Only finalization may reuse an upstream span without owning its action.
+            return False
     for node in nodes:
         kind = _SLICE_KIND.get(node["task_id"])
-        if kind and node.get("executor") != "TOOL_ONLY":
+        if kind and node.get("executor") != "TOOL_ONLY" and not node.get("conditional"):
             span = slicer.for_kind(kind)
             if span is not None:
                 assigned[node["task_id"]] = span
@@ -558,6 +576,10 @@ def _assign_task_slices(nodes: list[dict[str, Any]], slicer: "_Slicer", objectiv
             return False
         node["objective_span"] = [span[0], span[1]]
         node["objective_summary"] = span[2]
+        if task_id in assigned:
+            # The owning stage's permissions follow the source action, not its generic title.
+            action = span[2].lower().split()[0]
+            node["intent"] = INTENT_MUTATING if action in _MUTATION_VERBS else INTENT_READ_ONLY
     return (len(slicer.used) == len(slicer.spans)
             and all(node["objective_summary"] == objective[slice(*node["objective_span"])]
                     for node in nodes))

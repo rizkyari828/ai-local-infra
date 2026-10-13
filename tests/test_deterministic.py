@@ -100,7 +100,7 @@ class ToolSafetyTests(unittest.TestCase):
 
 class PlannerBypassTests(unittest.TestCase):
     def test_simple_deterministic_bypasses_planner(self) -> None:
-        plan = orchestrator.decompose("Report current branch, HEAD, and clean state.")
+        plan = orchestrator.decompose("Report current branch, report HEAD, and inspect repository state.")
         self.assertEqual("NONE", plan["planner_mode"]["mode"])
         self.assertTrue(all(node.get("executor") == "TOOL_ONLY" for node in plan["nodes"]))
         self.assertEqual(0, plan["planning_budget"]["minimum_required_ai_calls"])
@@ -122,7 +122,7 @@ class PlannerBypassTests(unittest.TestCase):
 
 class BudgetAwarePlanningTests(unittest.TestCase):
     def test_zero_budget_all_tool_only_valid(self) -> None:
-        plan = orchestrator.decompose("Report branch, HEAD, clean state and run tests",
+        plan = orchestrator.decompose("Report current branch, report HEAD, inspect repository state and run tests",
                                       constraints={"max_ai_calls": 0})
         # no AI nodes -> valid even with a zero hard budget
         self.assertEqual(0, plan["planning_budget"]["minimum_required_ai_calls"])
@@ -193,7 +193,7 @@ class DeterministicExecutionTests(unittest.TestCase):
         self.assertIn(report["nodes"]["D1"]["status"], ("FAILURE", "AI_REQUIRED"))
 
     def test_deterministic_finalizer_and_failed_dependency(self) -> None:
-        plan = orchestrator.decompose("Report branch HEAD and clean state")
+        plan = orchestrator.decompose("Report branch HEAD and inspect repository state")
         report = execution.execute_plan(plan, backend=execution.FakeBackend(), state_dir=self.state,
                                         repo_root=self.root, confirm=True, record_evidence=False)
         self.assertEqual("SUCCESS", report["nodes"]["DF"]["status"])

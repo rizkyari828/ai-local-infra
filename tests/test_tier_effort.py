@@ -89,7 +89,7 @@ class AxisTests(unittest.TestCase):
 
 def orchestrator_plan():
     import orchestrator
-    return orchestrator.decompose("Report branch HEAD and clean state")
+    return orchestrator.decompose("Report branch HEAD and inspect repository state")
 
 
 class ExecutionEvidenceAxisTests(unittest.TestCase):

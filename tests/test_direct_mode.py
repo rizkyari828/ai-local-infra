@@ -84,7 +84,7 @@ class DirectFixture(unittest.TestCase):
 
 class DirectZeroAiTests(DirectFixture):
     def test_deterministic_true_zero_ai_via_run_direct(self) -> None:
-        plan, report = lifecycle.run_direct("Report current branch, HEAD, and clean state.",
+        plan, report = lifecycle.run_direct("Report current branch, report HEAD, and inspect repository state.",
                                             backend=execution.FakeBackend(), state_dir=self.state,
                                             repo_root=self.root, confirm=True, allow_dirty=True,
                                             entry_mode="DIRECT_CLI")
@@ -122,7 +122,7 @@ class DirectZeroAiTests(DirectFixture):
 class ChatHandoffTests(DirectFixture):
     def test_zero_additional_ai_but_not_true_zero(self) -> None:
         # A chat controller may already have spent AI calls the engine cannot see.
-        plan, report = lifecycle.run_direct("Report current branch, HEAD, and clean state.",
+        plan, report = lifecycle.run_direct("Report current branch, report HEAD, and inspect repository state.",
                                             backend=execution.FakeBackend(), state_dir=self.state,
                                             repo_root=self.root, confirm=True, allow_dirty=True,
                                             entry_mode="CHAT_HANDOFF")
@@ -156,7 +156,7 @@ class DirectSafetyTests(DirectFixture):
 
     def test_objective_file_input(self) -> None:
         objective_file = pathlib.Path(self.tmp.name) / "objective.txt"
-        objective_file.write_text("Report current branch, HEAD, and clean state.", encoding="utf-8")
+        objective_file.write_text("Report current branch, report HEAD, and inspect repository state.", encoding="utf-8")
         env = {"LAI_STATE_DIR": str(self.state), "LAI_MACHINE": "work-mac", "PATH": "/usr/bin:/bin"}
         result = subprocess.run([sys.executable, str(ORCH), "direct", "--objective-file", str(objective_file),
                                  "--backend", "fake", "--confirm", "--allow-dirty", "--json"],
@@ -340,7 +340,7 @@ class CacheHitLifecycleTests(DirectFixture):
 
 class ToolOnlyLifecycleTests(DirectFixture):
     def test_tool_only_lifecycle_no_model_evidence(self) -> None:
-        plan, report = lifecycle.run_direct("Report current branch, HEAD, and clean state.",
+        plan, report = lifecycle.run_direct("Report current branch, report HEAD, and inspect repository state.",
                                             backend=execution.FakeBackend(), state_dir=self.state,
                                             repo_root=self.root, confirm=True, allow_dirty=True,
                                             record_evidence=True, entry_mode="DIRECT_CLI")
