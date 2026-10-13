@@ -50,6 +50,7 @@ CONTRACT_VERSION = "task-contract-v1"
 
 # Deterministic clause boundaries for assigning task-specific objective slices.
 _CLAUSE_RE = re.compile(r"[;,]|\band\b", re.IGNORECASE)
+_QUOTE_CHARS = ("'", '"', "`")
 
 
 def _objective_fingerprint(objective: str) -> str:
@@ -61,8 +62,73 @@ def _objective_fingerprint(objective: str) -> str:
     return hashlib.sha256((objective or "").encode("utf-8", "replace")).hexdigest()[:32]
 
 
-def _clauses(objective: str) -> list[str]:
-    return [part.strip() for part in _CLAUSE_RE.split(objective or "") if part.strip()]
+def _protected_spans(text: str) -> Optional[list[tuple[int, int]]]:
+    """Character spans of authoritative/literal regions that decomposition must not
+    touch: quoted text, backtick literals, fenced code and indented code lines.
+
+    Returns None when a region is unbalanced (e.g. an unterminated quote), because
+    safe splitting then cannot be proven. Conservative by design: an unknown region
+    blocks decomposition instead of risking a rewrite of executable text."""
+    spans: list[tuple[int, int]] = []
+    index, length = 0, len(text)
+    while index < length:
+        if text.startswith("```", index):
+            end = text.find("```", index + 3)
+            if end == -1:
+                return None
+            spans.append((index, end + 3))
+            index = end + 3
+            continue
+        char = text[index]
+        if char in _QUOTE_CHARS:
+            cursor = index + 1
+            while cursor < length and text[cursor] != char:
+                cursor += 2 if text[cursor] == "\\" else 1
+            if cursor >= length:
+                return None
+            spans.append((index, cursor + 1))
+            index = cursor + 1
+            continue
+        if char == "\n":
+            cursor, indent = index + 1, 0
+            while cursor < length and text[cursor] in " \t":
+                cursor += 1
+                indent += 1
+            if indent and cursor < length and text[cursor] != "\n":
+                end = text.find("\n", cursor)
+                end = length if end == -1 else end
+                spans.append((cursor, end))
+                index = end
+                continue
+        index += 1
+    return spans
+
+
+def _clauses(objective: str) -> Optional[list[str]]:
+    """Exact source span between each clause separator, where a separator is a
+    comma, semicolon or standalone "and" OUTSIDE any protected literal region.
+    Separators inside quotes/backticks/code are literal content, never boundaries.
+
+    Returns None when lossless splitting cannot be proven; the caller must then keep
+    the original objective intact rather than reconstruct executable text."""
+    text = objective or ""
+    spans = _protected_spans(text)
+    if spans is None:
+        return None
+    protected = lambda position: any(start <= position < end for start, end in spans)
+    clauses: list[str] = []
+    start = 0
+    for match in _CLAUSE_RE.finditer(text):
+        if protected(match.start()):
+            continue
+        segment = text[start:match.start()].strip()
+        if segment:
+            clauses.append(segment)
+        start = match.end()
+    tail = text[start:].strip()
+    if tail:
+        clauses.append(tail)
+    return clauses
 
 
 class _Slicer:
@@ -79,8 +145,8 @@ class _Slicer:
         "final": ("report", "final", "summar"),
     }
 
-    def __init__(self, objective: str) -> None:
-        self.clauses = _clauses(objective)
+    def __init__(self, clauses: list[str]) -> None:
+        self.clauses = clauses
         self.used: set[int] = set()
 
     def for_kind(self, kind: str, fallback: str) -> str:
@@ -376,7 +442,13 @@ def decompose(objective: str, *, constraints: Optional[dict[str, Any]] = None) -
         if deterministic_plan is not None:
             return deterministic_plan
     sig = _signals(objective)
-    slicer = _Slicer(objective)
+    clauses = _clauses(objective)
+    if clauses is None:
+        # Protected/literal text cannot be split without risking a rewrite of what the
+        # user literally asked for: keep the authoritative objective intact.
+        return _single_task_plan(objective, sig, decision, constraints)
+    lossless_only = bool(_protected_spans(objective))
+    slicer = _Slicer(clauses)
     multi = (sum(1 for key in ("implement", "architecture", "security", "docs", "tests") if sig[key]) >= 2
              or decision["mode"] == PLANNER_AI or _requires_synthesis(objective))
     nodes: list[dict[str, Any]] = []
@@ -457,8 +529,8 @@ def decompose(objective: str, *, constraints: Optional[dict[str, Any]] = None) -
             final["acceptance_criteria"] = ["all deterministic acceptance satisfied"]
         nodes.append(final)
 
-    covered = _assign_task_slices(nodes, slicer)
-    if not covered or not all(_requirement_covered(clause, nodes) for clause in _clauses(objective)):
+    covered = _assign_task_slices(nodes, slicer, lossless_only=lossless_only)
+    if not covered or not all(_requirement_covered(clause, nodes) for clause in clauses):
         # Coverage cannot be proven without silently dropping a requirement: keep the
         # whole objective intact in one bounded AI task instead of a lossy decomposition.
         return _single_task_plan(objective, sig, decision, constraints)
@@ -474,14 +546,19 @@ _SLICE_OPERATION = {"T1": "inspect", "T2": "analyze", "T2S": "review", "T3": "im
                     "D": "check"}
 
 
-def _assign_task_slices(nodes: list[dict[str, Any]], slicer: "_Slicer") -> bool:
+def _assign_task_slices(nodes: list[dict[str, Any]], slicer: "_Slicer",
+                        *, lossless_only: bool = False) -> bool:
     """Give each AI stage the bounded master clause that matches its work, so distinct
     objectives with different requirements cannot collapse into one generic task.
 
     Returns True when every master clause is covered: clauses a stage claimed, plus any
     remaining clause absorbed by a primary AI stage. Returns False when a requirement
     cannot be represented (no AI stage to absorb it), so the caller keeps the objective
-    intact instead of silently dropping it."""
+    intact instead of silently dropping it.
+
+    ``lossless_only`` is set when the objective contains protected literal content: the
+    leftover absorption below would join exact spans into a NEW authoritative string, so
+    it is refused and the caller keeps the objective intact."""
     for node in nodes:
         if node.get("executor") == "TOOL_ONLY":
             continue
@@ -493,6 +570,8 @@ def _assign_task_slices(nodes: list[dict[str, Any]], slicer: "_Slicer") -> bool:
     ai_nodes = [node for node in nodes if node.get("executor") != "TOOL_ONLY"]
     if not leftover:
         return True
+    if lossless_only:
+        return False
     target = next((node for node in ai_nodes if node["task_id"] == "T3"), None)
     if target is None and ai_nodes:
         target = ai_nodes[-1]
