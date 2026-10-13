@@ -50,7 +50,6 @@ CONTRACT_VERSION = "task-contract-v1"
 
 # Deterministic clause boundaries for assigning task-specific objective slices.
 _CLAUSE_RE = re.compile(r"[;,]|\band\b", re.IGNORECASE)
-_QUOTE_CHARS = ("'", '"', "`")
 
 
 def _objective_fingerprint(objective: str) -> str:
@@ -62,73 +61,71 @@ def _objective_fingerprint(objective: str) -> str:
     return hashlib.sha256((objective or "").encode("utf-8", "replace")).hexdigest()[:32]
 
 
-def _protected_spans(text: str) -> Optional[list[tuple[int, int]]]:
-    """Character spans of authoritative/literal regions that decomposition must not
-    touch: quoted text, backtick literals, fenced code and indented code lines.
+# shortcut: only single-line ASCII action clauses are decomposable; widen this
+# grammar only with a losslessness proof. Everything else keeps the exact objective.
+_PLAIN_PROSE_RE = re.compile(r"[A-Za-z0-9 ,;.-]+")
+_PLAIN_CLAUSE_RE = re.compile(r"[A-Za-z0-9]+(?:[- ][A-Za-z0-9]+)*[.]?")
+_PLAIN_TARGET_WORDS = frozenset((
+    "the current repository repo files state branch head commit config configuration "
+    "docs documentation readme tests test suite focused unit architecture security "
+    "security-sensitive authentication authorization cross-machine multi-machine "
+    "ai infra infrastructure graphify resolver precedence migration concurrency "
+    "report final result results if needed"
+).split())
 
-    Returns None when a region is unbalanced (e.g. an unterminated quote), because
-    safe splitting then cannot be proven. Conservative by design: an unknown region
-    blocks decomposition instead of risking a rewrite of executable text."""
-    spans: list[tuple[int, int]] = []
-    index, length = 0, len(text)
-    while index < length:
-        if text.startswith("```", index):
-            end = text.find("```", index + 3)
-            if end == -1:
-                return None
-            spans.append((index, end + 3))
-            index = end + 3
+
+def objective_is_provably_safe_for_decomposition(objective: str) -> bool:
+    """Opt in only to plain action clauses; unfamiliar syntax is never assumed safe."""
+    text = objective or ""
+    if not text or text != text.strip() or not _PLAIN_PROSE_RE.fullmatch(text):
+        return False
+    clauses = [part.strip() for part in _CLAUSE_RE.split(text) if part.strip()]
+    actions = _READONLY_CUES + _MUTATION_VERBS + ("run", "give")
+    for clause in clauses:
+        words = clause.rstrip(".").lower().split()
+        if not _PLAIN_CLAUSE_RE.fullmatch(clause):
+            return False
+        # Enumerated repository-state nouns may continue a plain reporting clause.
+        state_words = {"current", "branch", "head", "clean", "dirty", "state", "working", "tree"}
+        if set(words) <= state_words:
             continue
-        char = text[index]
-        if char in _QUOTE_CHARS:
-            cursor = index + 1
-            while cursor < length and text[cursor] != char:
-                cursor += 2 if text[cursor] == "\\" else 1
-            if cursor >= length:
-                return None
-            spans.append((index, cursor + 1))
-            index = cursor + 1
-            continue
-        if char == "\n":
-            cursor, indent = index + 1, 0
-            while cursor < length and text[cursor] in " \t":
-                cursor += 1
-                indent += 1
-            if indent and cursor < length and text[cursor] != "\n":
-                end = text.find("\n", cursor)
-                end = length if end == -1 else end
-                spans.append((cursor, end))
-                index = end
-                continue
-        index += 1
+        if words[0] not in actions:
+            return False
+        # A single named target or a controlled workflow phrase is positive proof;
+        # arbitrary prose such as an unquoted exact-output requirement is not.
+        if len(words) < 2 or (len(words) > 2 and not set(words[1:]) <= _PLAIN_TARGET_WORDS):
+            return False
+    return bool(clauses)
+
+
+def _trim_span(text: str, start: int, end: int) -> tuple[int, int]:
+    while start < end and text[start].isspace():
+        start += 1
+    while end > start and text[end - 1].isspace():
+        end -= 1
+    return start, end
+
+
+def _clause_spans(objective: str) -> Optional[list[tuple[int, int, str]]]:
+    """Exact clause offsets/text, available only after positive plain-prose proof."""
+    if not objective_is_provably_safe_for_decomposition(objective):
+        return None
+    spans: list[tuple[int, int, str]] = []
+    start = 0
+    for match in _CLAUSE_RE.finditer(objective):
+        left, right = _trim_span(objective, start, match.start())
+        if left < right:
+            spans.append((left, right, objective[left:right]))
+        start = match.end()
+    left, right = _trim_span(objective, start, len(objective))
+    if left < right:
+        spans.append((left, right, objective[left:right]))
     return spans
 
 
 def _clauses(objective: str) -> Optional[list[str]]:
-    """Exact source span between each clause separator, where a separator is a
-    comma, semicolon or standalone "and" OUTSIDE any protected literal region.
-    Separators inside quotes/backticks/code are literal content, never boundaries.
-
-    Returns None when lossless splitting cannot be proven; the caller must then keep
-    the original objective intact rather than reconstruct executable text."""
-    text = objective or ""
-    spans = _protected_spans(text)
-    if spans is None:
-        return None
-    protected = lambda position: any(start <= position < end for start, end in spans)
-    clauses: list[str] = []
-    start = 0
-    for match in _CLAUSE_RE.finditer(text):
-        if protected(match.start()):
-            continue
-        segment = text[start:match.start()].strip()
-        if segment:
-            clauses.append(segment)
-        start = match.end()
-    tail = text[start:].strip()
-    if tail:
-        clauses.append(tail)
-    return clauses
+    spans = _clause_spans(objective)
+    return None if spans is None else [span[2] for span in spans]
 
 
 class _Slicer:
@@ -145,25 +142,21 @@ class _Slicer:
         "final": ("report", "final", "summar"),
     }
 
-    def __init__(self, clauses: list[str]) -> None:
-        self.clauses = clauses
+    def __init__(self, spans: list[tuple[int, int, str]]) -> None:
+        self.spans = spans
         self.used: set[int] = set()
 
-    def for_kind(self, kind: str, fallback: str) -> str:
-        cues = self._CUES.get(kind)
-        for index, clause in enumerate(self.clauses):
-            if index in self.used:
+    def for_kind(self, kind: str, *, reuse: bool = False) -> Optional[tuple[int, int, str]]:
+        cues = self._CUES.get(kind) or ()
+        for index, span in enumerate(self.spans):
+            if index in self.used and not reuse:
                 continue
-            low = clause.lower()
-            match = has_mutation(clause) if kind == "implement" else any(cue in low for cue in (cues or ()))
+            low = span[2].lower()
+            match = has_mutation(span[2]) if kind == "implement" else any(cue in low for cue in cues)
             if match:
                 self.used.add(index)
-                return clause
-        return fallback
-
-    def remaining(self) -> list[str]:
-        """Master clauses no work stage claimed. They must not silently disappear."""
-        return [clause for index, clause in enumerate(self.clauses) if index not in self.used]
+                return span
+        return None
 
 
 # Deterministic-coverage vocabulary: tokens a deterministic operation legitimately
@@ -211,23 +204,6 @@ def _deterministic_covers(objective: str, tasks: list[dict[str, Any]]) -> bool:
         return False
     covered = _coverage_tokens(tasks)
     return all(token in covered for token in _tokens(objective))
-
-
-def _requirement_covered(clause: str, nodes: list[dict[str, Any]]) -> bool:
-    """A master clause is covered when an AI stage carries it verbatim, or every
-    requirement-bearing token is accounted for by a deterministic node's operation."""
-    normalized = " ".join((clause or "").lower().split())
-    if not normalized:
-        return True
-    for node in nodes:
-        if node.get("executor") == "TOOL_ONLY":
-            continue
-        if normalized in " ".join((node.get("objective_summary") or "").lower().split()):
-            return True
-    tool_tasks = [{"operation": (node.get("tool") or {}).get("operation"), "args": (node.get("tool") or {}).get("args")}
-                  for node in nodes if node.get("executor") == "TOOL_ONLY" and (node.get("tool") or {}).get("operation")]
-    covered = _coverage_tokens([t for t in tool_tasks if t["operation"] in _OP_EVIDENCE])
-    return all(token in covered for token in _tokens(normalized))
 
 
 # Execution intent (never inferred from loose substrings such as "config"/"configured").
@@ -366,6 +342,9 @@ def _deterministic_plan(objective: str, constraints: dict[str, Any], decision: d
     plan["quota_view"] = {"nodes": len(nodes), "expensive_nodes": 0, "cheap_nodes": 0,
                           "conditional_expensive_nodes": 0, "full_context_nodes": 0}
     _attach_budget(plan, constraints)
+    for node in nodes:
+        node["objective_summary"] = objective
+        node["objective_span"] = [0, len(objective)]
     _attach_contracts(plan, objective)
     return plan
 
@@ -437,18 +416,15 @@ def decompose(objective: str, *, constraints: Optional[dict[str, Any]] = None) -
     """Build a small, valid task graph from one objective. Deterministic; no model."""
     constraints = constraints or {}
     decision = planner_decision(objective, constraints=constraints)
+    sig = _signals(objective)
+    if not objective_is_provably_safe_for_decomposition(objective):
+        return _single_task_plan(objective, sig, decision, constraints)
     if decision["mode"] == PLANNER_NONE and not _needs_ai(objective):
         deterministic_plan = _deterministic_plan(objective, constraints, decision)
         if deterministic_plan is not None:
             return deterministic_plan
-    sig = _signals(objective)
-    clauses = _clauses(objective)
-    if clauses is None:
-        # Protected/literal text cannot be split without risking a rewrite of what the
-        # user literally asked for: keep the authoritative objective intact.
-        return _single_task_plan(objective, sig, decision, constraints)
-    lossless_only = bool(_protected_spans(objective))
-    slicer = _Slicer(clauses)
+    spans = _clause_spans(objective)
+    slicer = _Slicer(spans)
     multi = (sum(1 for key in ("implement", "architecture", "security", "docs", "tests") if sig[key]) >= 2
              or decision["mode"] == PLANNER_AI or _requires_synthesis(objective))
     nodes: list[dict[str, Any]] = []
@@ -529,8 +505,7 @@ def decompose(objective: str, *, constraints: Optional[dict[str, Any]] = None) -
             final["acceptance_criteria"] = ["all deterministic acceptance satisfied"]
         nodes.append(final)
 
-    covered = _assign_task_slices(nodes, slicer, lossless_only=lossless_only)
-    if not covered or not all(_requirement_covered(clause, nodes) for clause in clauses):
+    if not _assign_task_slices(nodes, slicer, objective):
         # Coverage cannot be proven without silently dropping a requirement: keep the
         # whole objective intact in one bounded AI task instead of a lossy decomposition.
         return _single_task_plan(objective, sig, decision, constraints)
@@ -546,39 +521,46 @@ _SLICE_OPERATION = {"T1": "inspect", "T2": "analyze", "T2S": "review", "T3": "im
                     "D": "check"}
 
 
-def _assign_task_slices(nodes: list[dict[str, Any]], slicer: "_Slicer",
-                        *, lossless_only: bool = False) -> bool:
-    """Give each AI stage the bounded master clause that matches its work, so distinct
-    objectives with different requirements cannot collapse into one generic task.
+def _assign_task_slices(nodes: list[dict[str, Any]], slicer: "_Slicer", objective: str) -> bool:
+    """Assign exact source spans, then prove complete clause coverage before execution.
 
-    Returns True when every master clause is covered: clauses a stage claimed, plus any
-    remaining clause absorbed by a primary AI stage. Returns False when a requirement
-    cannot be represented (no AI stage to absorb it), so the caller keeps the objective
-    intact instead of silently dropping it.
-
-    ``lossless_only`` is set when the objective contains protected literal content: the
-    leftover absorption below would join exact spans into a NEW authoritative string, so
-    it is refused and the caller keeps the objective intact."""
+    Supporting inspection/finalization/review stages refer to existing spans; they
+    never invent another executable objective. Unassigned clauses force intact fallback.
+    """
+    assigned: dict[str, tuple[int, int, str]] = {}
+    # Typed tool clauses have ownership first; an analysis cue such as "inspect"
+    # must not steal their span and leave the actual analysis clause unassigned.
     for node in nodes:
-        if node.get("executor") == "TOOL_ONLY":
+        if node.get("executor") != "TOOL_ONLY":
             continue
+        task = node.get("tool") or {}
+        covered = [(index, candidate) for index, candidate in enumerate(slicer.spans)
+                   if _deterministic_covers(candidate[2], [task])]
+        if covered:
+            slicer.used.update(index for index, _ in covered)
+            start, end = covered[0][1][0], covered[-1][1][1]
+            assigned[node["task_id"]] = (start, end, objective[start:end])
+    for node in nodes:
         kind = _SLICE_KIND.get(node["task_id"])
-        if kind is None:
-            continue
-        node["objective_summary"] = slicer.for_kind(kind, node["objective_summary"])
-    leftover = slicer.remaining()
-    ai_nodes = [node for node in nodes if node.get("executor") != "TOOL_ONLY"]
-    if not leftover:
-        return True
-    if lossless_only:
-        return False
-    target = next((node for node in ai_nodes if node["task_id"] == "T3"), None)
-    if target is None and ai_nodes:
-        target = ai_nodes[-1]
-    if target is None:
-        return False
-    target["objective_summary"] = target["objective_summary"] + "; " + "; ".join(leftover)
-    return True
+        if kind and node.get("executor") != "TOOL_ONLY":
+            span = slicer.for_kind(kind)
+            if span is not None:
+                assigned[node["task_id"]] = span
+    for node in nodes:
+        task_id = node["task_id"]
+        span = assigned.get(task_id)
+        if span is None:
+            kind = _SLICE_KIND.get(task_id)
+            span = slicer.for_kind(kind, reuse=True) if kind else None
+        if span is None and task_id in ("T1", "T3E", "T6"):
+            span = slicer.spans[-1] if task_id == "T6" else slicer.spans[0]
+        if span is None:
+            return False
+        node["objective_span"] = [span[0], span[1]]
+        node["objective_summary"] = span[2]
+    return (len(slicer.used) == len(slicer.spans)
+            and all(node["objective_summary"] == objective[slice(*node["objective_span"])]
+                    for node in nodes))
 
 
 def _single_task_plan(objective: str, sig: dict[str, bool], decision: dict[str, Any],
@@ -593,6 +575,7 @@ def _single_task_plan(objective: str, sig: dict[str, bool], decision: dict[str, 
                  acceptance=["the stated task's requested outcome is reached"],
                  produces=["task_result"], family=knowledge.task_family_for(objective_text))
     node["objective_summary"] = objective_text
+    node["objective_span"] = [0, len(objective_text)]
     node["title"] = _bounded_summary(objective_text, 200)
     node["objective_display"] = node["title"]
     plan = _finish_plan(objective, [node], decision, constraints)
@@ -638,6 +621,7 @@ def _attach_contracts(plan: dict[str, Any], objective: str) -> None:
             "contract_version": CONTRACT_VERSION,
             "task_id": node["task_id"],
             "objective": node["objective_summary"],
+            "source_span": list(node["objective_span"]),
             "master_fingerprint": master,
             "operation": _SLICE_OPERATION.get(node["task_id"],
                                               (node.get("tool") or {}).get("operation") or "execute"),
