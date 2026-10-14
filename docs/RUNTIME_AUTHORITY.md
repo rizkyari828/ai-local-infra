@@ -167,16 +167,16 @@ other's results.
   adapters (the SIMULATED fake, or the abstract `UNSUPPORTED` base) has no launch
   to authorize. The policy is still recorded in that run's identity, so the
   identity is never adapter-dependent.
-- **Agent Runtime** — `AgentRuntime.run` refuses a provider that repository
-  configuration resolved to a machine-prohibited one
-  (`runtime.require_machine_permission`), at the inference boundary, so tool-only
-  and health-only invocations are not blocked. `EscalationController.from_config`
-  applies the same rule to a fallback provider it builds itself.
-  A provider object a caller constructs and supplies directly is that caller's
-  choice and is not second-guessed — but a caller cannot reach a *prohibited*
-  provider through any config-driven path, and
-  `tests/test_runtime_authority_agentruntime.py` fails if a production module adds
-  an ungated `AgentRuntime(...)` construction site.
+- **Agent Runtime** — `AgentRuntime.run` checks authoritative machine permission
+  immediately before the first provider invocation
+  (`runtime.require_machine_permission`), so **no construction path can omit or
+  disable it**: a provider this machine prohibits never reaches `execute`, whether
+  it was resolved from configuration, supplied directly, or handed over by an
+  escalation factory, and no flag can switch the check off. Tool-only invocations
+  and `--health` are unaffected (neither performs inference).
+  `EscalationController.from_config` and `scripts/agent-run --escalate`
+  additionally check early, for fail-fast diagnostics — the boundary check, not the
+  factory, is what makes the invariant hold.
 - **Doctor** — reports the same permission state, with the state kept distinct
   (`machine-policy` check). Doctor never probes a provider: availability is a
   runtime observation, not a readiness fact.

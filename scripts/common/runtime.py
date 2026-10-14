@@ -43,11 +43,13 @@ RUNTIME_VERSION = "0.1.0"
 
 
 def require_machine_permission(provider_name: Optional[str]) -> dict:
-    """Refuse a provider this machine's hard policy prohibits, before it is built.
+    """Refuse a provider this machine's hard policy prohibits.
 
-    The Agent Runtime is a real execution entrypoint: policy is bound here rather
-    than trusted to a caller. An invalid machine policy fails closed. Availability
-    (a binary, a reachable endpoint, an installed model) never authorizes.
+    Called by the Agent Runtime execution boundary immediately before the first
+    provider invocation (and early, for fail-fast diagnostics, by the factories that
+    build a provider from configuration). An invalid machine policy fails closed.
+    Availability (a binary, a reachable endpoint, an installed model) never
+    authorizes.
     """
     try:
         permission = authority.provider_permission(provider_name or "")
@@ -296,7 +298,6 @@ class AgentRuntime:
         self.record_spans = record_spans
         self._clock = clock or time.perf_counter
         self.tools = tools
-        self.policy_bound = False  # set by from_config; see AgentRuntime.run
 
     @classmethod
     def from_config(
@@ -311,12 +312,8 @@ class AgentRuntime:
     ) -> "AgentRuntime":
         runtime_config = config if config is not None else providers.load_runtime_config()
         provider = providers.build_provider(runtime_config, provider_name)
-        agent = cls(provider=provider, limits=limits, span_output=span_output, role=role, tools=tools,
-                    pricing_config=pricing_config)
-        # The provider was resolved from repository configuration, so machine policy is
-        # enforced at inference time (see require_machine_permission).
-        agent.policy_bound = True
-        return agent
+        return cls(provider=provider, limits=limits, span_output=span_output, role=role, tools=tools,
+                   pricing_config=pricing_config)
 
     def health_check(self) -> dict:
         """Read-only readiness check; never downloads a model."""
@@ -392,13 +389,6 @@ class AgentRuntime:
         prompt_prefix_hash = (telemetry.hash_prompt_prefix(task.prompt)
                               if isinstance(task.prompt, str) and task.prompt.strip() else None)
 
-        # Hard machine policy binds at the inference launch boundary, before any attempt.
-        # Only a runtime whose provider was resolved from repository configuration is
-        # gated: a caller that constructed (and therefore chose) the provider itself is
-        # not second-guessed here, and a tool-only call never reaches this path.
-        if self.policy_bound:
-            require_machine_permission(self.provider.name)
-
         if not isinstance(task.prompt, str) or not task.prompt.strip():
             return self._fail_early(run_id, trace_id, started, 0, "validation_failure", "empty_prompt", False, model,
                                     task.parent_span_id, prompt_prefix_hash)
@@ -408,6 +398,12 @@ class AgentRuntime:
 
         max_attempts = self._allowed_attempts(task)
         per_attempt_timeout = self._per_attempt_timeout(task)
+        # Hard machine policy is checked at the execution boundary itself, immediately
+        # before the first provider invocation, so no construction path can omit it.
+        # Availability is not authorization: a provider this machine prohibits never
+        # reaches ``execute``, whether it was resolved from configuration, supplied
+        # directly, or handed over by an escalation factory.
+        require_machine_permission(self.provider.name)
 
         attempt = 0
         while attempt < max_attempts:

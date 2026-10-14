@@ -10,6 +10,7 @@ import tempfile
 import threading
 import time
 import unittest
+import unittest.mock
 import urllib.error
 import uuid
 
@@ -390,6 +391,13 @@ class RuntimeFailureTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.spans = pathlib.Path(self.temp.name) / "spans.jsonl"
+        # These cases drive a real provider class (OllamaProvider) with a stubbed
+        # transport. Hard machine policy is enforced at the Agent Runtime execution
+        # boundary (docs/RUNTIME_AUTHORITY.md), so the fixture states a machine whose
+        # policy permits local inference. No assertion changes.
+        patcher = unittest.mock.patch.dict(os.environ, {"LAI_MACHINE": "home-wsl"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def tearDown(self) -> None:
         self.temp.cleanup()

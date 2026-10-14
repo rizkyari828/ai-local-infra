@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import re
 import sys
 import tempfile
 import time
 import unittest
+import unittest.mock
 import uuid
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -253,6 +255,13 @@ class EscalationContextPackTests(unittest.TestCase):
         self.spans = base / "spans.jsonl"
         self.escalations = base / "escalations.jsonl"
         self.limits = make_limits()
+        # The student provider here is an offline test double named after the local
+        # provider. Hard machine policy is enforced at the Agent Runtime execution
+        # boundary (docs/RUNTIME_AUTHORITY.md), so the fixture states a machine whose
+        # policy permits local inference. No assertion changes.
+        patcher = unittest.mock.patch.dict(os.environ, {"LAI_MACHINE": "home-wsl"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def tearDown(self) -> None:
         self.temp.cleanup()

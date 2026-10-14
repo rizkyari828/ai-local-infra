@@ -3,15 +3,15 @@
 Question under audit: can any production-reachable provider-backed execution occur
 without the authoritative machine-policy binding that ``execute_plan`` guarantees?
 
-The audit's answer is recorded by these tests:
+The audit found no production bypass, and Fix Pass 1.1 closed the residual by
+moving the check to the execution boundary itself. These tests record the result:
 
-- every config-driven construction path (``AgentRuntime.from_config``,
-  ``EscalationController.from_config``, ``scripts/agent-run``) refuses a provider the
-  machine prohibits, before any launch;
-- the one direct ``AgentRuntime(...)`` construction in production code is the
-  escalation teacher, whose provider is policy-checked by every factory that builds
-  it — and a source-level guard fails if a production module adds an ungated direct
-  construction;
+- ``AgentRuntime.run`` checks authoritative machine permission immediately before
+  the first provider invocation, so construction method cannot affect safety —
+  ``from_config``, direct construction, and an escalation factory that omits its
+  early check are all stopped;
+- the config-driven factories still check early (fail-fast diagnostics), and a
+  source-level guard flags a new production ``AgentRuntime(...)`` site for review;
 - every production adapter that can reach a provider is ``SUPPORTED``, so
   ``execute_plan``'s hard-policy gate applies to it;
 - pretend adapters (SIMULATED/UNSUPPORTED) cannot reach a provider at all.
@@ -30,6 +30,7 @@ import pathlib
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import unittest.mock
 
@@ -137,24 +138,67 @@ class ConfigFactoryTests(ProhibitingMachine):
         self.assertEqual([], self.launches)
 
 
-class PolicyBindingFlagTests(ProhibitingMachine):
-    """A1 — the audited design of the two construction paths."""
+class DirectConstructionTests(ProhibitingMachine):
+    """A2/A3/A10 — the execution boundary is safe whatever built the runtime."""
 
-    def test_direct_construction_is_gated_only_by_from_config(self) -> None:
-        direct = runtime.AgentRuntime(self.stub(providers.build_provider(_config(), "ollama")),
+    def _stubbed(self, provider_name: str):
+        provider = providers.build_provider(_config(), provider_name)
+        return provider
+
+    def test_A2_direct_construction_cannot_execute_a_prohibited_provider(self) -> None:
+        agent = runtime.AgentRuntime(self.stub(self._stubbed("ollama")),
                                      span_output=self.spans, record_spans=False)
-        self.assertFalse(direct.policy_bound)  # caller chose this provider object
-        configured = runtime.AgentRuntime.from_config(_config(), "fake", span_output=self.spans)
-        self.assertTrue(configured.policy_bound)  # resolved from repository configuration
+        with self.assertRaises(providers.ProviderConfigurationError) as caught:
+            agent.run(runtime.AgentTask(prompt="hello"))
+        self.assertIn("provider_prohibited_by_machine_policy", str(caught.exception))
+        self.assertEqual([], self.launches)  # launch count = 0
+        self.assertEqual(authority.PROHIBITED, self.policy()["prohibited"]["ollama"])
 
-    def test_from_config_gate_is_independent_of_the_adapter_or_caller_choices(self) -> None:
-        # Any provider name the config can produce is judged by the same authority.
-        for name in ("ollama",):
-            agent = runtime.AgentRuntime.from_config(_config(), name, span_output=self.spans)
-            agent.provider = self.stub(agent.provider)
-            with self.assertRaises(providers.ProviderConfigurationError):
-                agent.run(runtime.AgentTask(prompt="x"))
+    def test_A3_direct_construction_with_a_permitted_provider_executes(self) -> None:
+        agent = runtime.AgentRuntime(self.stub(self._stubbed("deepseek")),
+                                     span_output=self.spans, record_spans=False)
+        result = agent.run(runtime.AgentTask(prompt="hello"))
+        self.assertEqual("succeeded", result.status)
+        self.assertEqual(1, len(self.launches))
+        self.assertEqual("deepseek", self.launches[0]["provider"])
+
+    def test_no_boolean_escape_hatch_disables_the_gate(self) -> None:
+        # A construction-path flag must not be able to switch hard policy off.
+        agent = runtime.AgentRuntime(self.stub(self._stubbed("ollama")),
+                                     span_output=self.spans, record_spans=False)
+        self.assertFalse(hasattr(agent, "policy_bound"))
         self.assertEqual([], self.launches)
+
+    def test_A8_invalid_policy_refuses_direct_construction_too(self) -> None:
+        (self.root / "machines" / "audit.yaml").write_text(
+            json.dumps({"id": "audit", "platform": "linux",
+                        "provider_availability": {"ollama": "false"}}), encoding="utf-8")
+        agent = runtime.AgentRuntime(self.stub(self._stubbed("deepseek")),
+                                     span_output=self.spans, record_spans=False)
+        with self.assertRaises(providers.ProviderConfigurationError) as caught:
+            agent.run(runtime.AgentTask(prompt="hello"))
+        self.assertIn("machine_policy_invalid", str(caught.exception))
+        self.assertEqual([], self.launches)
+
+    def test_A9_explicit_invalid_selector_refuses_direct_construction(self) -> None:
+        with unittest.mock.patch.dict(os.environ, {"LAI_MACHINE": "no-such-machine"}):
+            agent = runtime.AgentRuntime(self.stub(self._stubbed("deepseek")),
+                                         span_output=self.spans, record_spans=False)
+            with self.assertRaises(providers.ProviderConfigurationError) as caught:
+                agent.run(runtime.AgentTask(prompt="hello"))
+        self.assertIn("machine_policy_invalid", str(caught.exception))
+        self.assertEqual([], self.launches)
+
+    def test_offline_provider_is_not_blocked_merely_for_being_a_provider(self) -> None:
+        # A6: the repository's offline provider performs no real inference and is not a
+        # prohibited provider, so deterministic execution keeps working; the machine
+        # policy is still recorded truthfully.
+        provider = providers.FakeModelProvider()
+        agent = runtime.AgentRuntime(provider, span_output=self.spans, record_spans=False)
+        result = agent.run(runtime.AgentTask(prompt="hello"))
+        self.assertEqual("succeeded", result.status)
+        self.assertEqual(1, len(provider.calls))  # offline call, no provider launch
+        self.assertEqual(authority.PROHIBITED, self.policy()["prohibited"]["ollama"])
 
 
 class EscalationFallbackTests(ProhibitingMachine):
@@ -191,16 +235,26 @@ class EscalationFallbackTests(ProhibitingMachine):
         self.assertEqual("fake", controller.fallback_provider.name)
         self.assertTrue(authority.provider_permission("fake")["allowed"])
 
-    def test_direct_controller_construction_uses_the_callers_provider(self) -> None:
-        # The audited residual: a caller-supplied provider object is not second-guessed
-        # here; every production factory that builds one is policy-checked first, and
-        # ProductionBoundaryGuardTests fails if that stops being true.
+    def test_A5_boundary_stops_the_teacher_even_without_a_factory_gate(self) -> None:
+        # Synthetic fixture: a controller built directly with a prohibited provider, i.e.
+        # as if a factory had omitted its early check. The execution boundary still stops
+        # the teacher launch on its own.
+        policy = escalation.EscalationPolicy.from_config(self._config_with_ollama_fallback())
+        teacher = self.stub(providers.build_provider(_config(), "ollama"))
         controller = escalation.EscalationController(
-            escalation.EscalationPolicy.from_config(_config()),
-            self.stub(providers.build_provider(_config(), "ollama")),
-            span_output=self.spans, escalation_output=self.spans, record_spans=False,
-            record_telemetry=False)
-        self.assertEqual("ollama", controller.fallback_provider.name)
+            policy, teacher, span_output=self.spans, escalation_output=self.spans,
+            record_spans=False, record_telemetry=False)
+        session = runtime.TaskSession(run_id="r1", trace_id="t1", started=time.perf_counter(),
+                                      budget=60.0)
+        task = runtime.AgentTask(prompt="fix the parser")
+        student = runtime.RuntimeResult(
+            run_id="r1", trace_id="t1", span_id=None, status="failed", provider="fake",
+            model="fake-model", content=None, duration_ms=1.0, attempts=1,
+            error_category="model_reasoning_failure", error_code="reasoning_gap", retryable=False)
+        with self.assertRaises(providers.ProviderConfigurationError) as caught:
+            controller.maybe_escalate(session, task, student, task_class="bounded")
+        self.assertIn("provider_prohibited_by_machine_policy", str(caught.exception))
+        self.assertEqual([], self.launches)  # teacher launch count = 0
 
 
 class ProductionBoundaryGuardTests(unittest.TestCase):
@@ -222,11 +276,11 @@ class ProductionBoundaryGuardTests(unittest.TestCase):
                 if "AgentRuntime(" in line:
                     findings.append((str(path.relative_to(ROOT)), number))
         files = sorted({name for name, _ in findings})
-        # from_config() is gated at the inference boundary. The one direct construction is
-        # the escalation teacher, whose provider every factory policy-checks before use.
-        # A new production file here means the boundary changed: re-audit before editing.
+        # Safety no longer depends on call sites: AgentRuntime.run checks machine
+        # permission at the execution boundary. This guard only flags a NEW production
+        # construction site so its callers are re-reviewed deliberately.
         self.assertEqual(["scripts/common/escalation.py"], files,
-                         f"unguarded production AgentRuntime construction sites: {findings}")
+                         f"new production AgentRuntime construction sites: {findings}")
 
     def test_every_factory_that_builds_the_teacher_provider_policy_checks_it(self) -> None:
         escalation_source = (ROOT / "scripts/common/escalation.py").read_text(encoding="utf-8")
