@@ -35,6 +35,7 @@ import urllib.request
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import orchestrator  # noqa: E402
 import execution  # noqa: E402
+import authority  # noqa: E402
 import discovery  # noqa: E402
 import failover  # noqa: E402
 import orchestration_store  # noqa: E402
@@ -47,45 +48,57 @@ import infra  # noqa: E402
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 
-def _codex_model() -> str | None:
-    path = pathlib.Path.home() / ".codex" / "config.toml"
-    try:
-        for line in path.read_text(encoding="utf-8").splitlines():
-            stripped = line.strip()
-            if stripped.startswith("model") and "=" in stripped and "model_reasoning_effort" not in stripped:
-                return stripped.split("=", 1)[1].strip().strip('"')
-    except OSError:
-        return None
-    return None
-
-
-def _local_inference_policy() -> str | None:
-    machine = os.environ.get("LAI_MACHINE")
-    if not machine:
-        return None
-    try:
-        return json.loads((ROOT / "machines" / f"{machine}.yaml").read_text(encoding="utf-8")).get("local_inference")
-    except (OSError, json.JSONDecodeError):
-        return None
-
-
 def _local_health() -> tuple[failover.Health, dict[str, "execution.Backend"]]:
-    """Cheap, no-inference runtime availability for the configured backends."""
+    """Cheap, no-inference runtime availability for the configured backends.
+
+    Machine identity/policy come from the one authority, so a machine that only
+    declares ``provider_availability.ollama: false`` (without the
+    ``local_inference`` marker) is also treated as prohibiting local inference.
+    """
     config = discovery.load_config()
     providers = {name: set(spec.get("providers", [])) for name, spec in config.get("backends", {}).items()}
     binaries = {name: bool(shutil.which(name)) for name in providers}
-    policy = _local_inference_policy()
+    policy = authority.machine_policy(dict(os.environ))
     ollama_models: set[str] | None = None
-    if policy != failover.NOT_CONFIGURED_BY_MACHINE_POLICY:
+    if "ollama" not in policy["prohibited"]:
         try:
             with urllib.request.urlopen("http://127.0.0.1:11434/api/tags", timeout=1.5) as response:
                 ollama_models = {model["name"] for model in json.load(response).get("models", [])}
         except (urllib.error.URLError, OSError, ValueError, KeyError):
             ollama_models = None  # unreachable -> UNKNOWN (never assumed available)
     health = failover.Health(binaries=binaries, providers=providers, ollama_models=ollama_models,
-                             codex_model=_codex_model(), local_inference=policy)
+                             codex_model=_codex_model(), local_inference=policy["local_inference"],
+                             prohibited=policy["prohibited"])
     backends = {name: execution.CliBackend(name, name) for name in providers}
     return health, backends
+
+
+def _codex_model() -> str | None:
+    """Locally configured Codex model, read with a real TOML parse (no line scan)."""
+    model, _error = authority.read_codex_model()
+    return model
+
+
+def _machine_constraints(constraints: dict) -> dict:
+    """Bind the run's hard constraints to this machine's declared policy.
+
+    The policy is part of execution identity, so a run resolved while a provider
+    was prohibited cannot be resumed on a machine where it is permitted.
+    """
+    try:
+        policy = authority.machine_policy(dict(os.environ))
+    except authority.AuthorityError as exc:
+        raise execution.ExecutionError(f"MACHINE_POLICY_INVALID: {exc}") from exc
+    bound = dict(constraints)
+    bound["prohibited_providers"] = dict(policy["prohibited"])
+    return bound
+
+
+def _resolve_workspace(args: argparse.Namespace) -> dict:
+    try:
+        return authority.resolve_workspace(getattr(args, "workspace", None))
+    except authority.AuthorityError as exc:
+        raise execution.ExecutionError(str(exc)) from exc
 
 
 def _objective(args: argparse.Namespace) -> str:
@@ -134,13 +147,15 @@ def cmd_run(args: argparse.Namespace) -> int:
     health, backends = _local_health()
     if args.backend != "fake":
         backends.setdefault(backend.name, backend)
+    workspace = _resolve_workspace(args)
     report = execution.execute_plan(
         plan, backend=backend, run_id=args.run_id, state_dir=args.state_dir,
-        repo_root=pathlib.Path.cwd(), confirm=args.confirm, dry_run=args.dry_run,
+        repo_root=pathlib.Path(workspace["workspace"]), confirm=args.confirm, dry_run=args.dry_run,
         allow_dirty=args.allow_dirty, surface=args.surface, record_evidence=not args.no_evidence,
         resume=args.resume, read_only=args.read_only, max_ai_calls=args.max_ai_calls,
         backends=backends, health=(None if args.backend == "fake" else health),
-        constraints=_constraints(args), cache=not args.no_cache, force_refresh=args.refresh,
+        constraints=_machine_constraints(_constraints(args)), cache=not args.no_cache,
+        force_refresh=args.refresh,
         explicit_model=bool(args.prefer_model or args.prefer_provider),
         entry_mode=entry_mode, controller_ai_calls=controller_ai_calls)
     if not args.no_store:
@@ -149,8 +164,9 @@ def cmd_run(args: argparse.Namespace) -> int:
                              machine_id=os.environ.get("LAI_MACHINE") or "unknown",
                              entry_mode=entry_mode, controller_ai_calls=controller_ai_calls)
     if args.json:
-        print(json.dumps(report, indent=2, ensure_ascii=False))
+        print(json.dumps({**report, "workspace": workspace}, indent=2, ensure_ascii=False))
     else:
+        print(_render_workspace(workspace))
         print(execution.render_execution(report))
     if report.get("error"):
         return 2
@@ -163,6 +179,16 @@ def _tier(value: str) -> str:
     if candidate not in orchestrator.TIER_ORDER:
         raise argparse.ArgumentTypeError(f"tier must be one of {', '.join(orchestrator.TIER_ORDER)}")
     return candidate
+
+
+def _render_workspace(workspace: dict) -> str:
+    line = (f"WORKSPACE {workspace['workspace']}  source={workspace['source']}  "
+            f"repo={workspace['repository']['id']}")
+    conflict = workspace.get("conflict")
+    if conflict:
+        line += (f"  CONFLICT explicit={conflict['explicit_identity']} "
+                 f"discovered={conflict['discovered_identity']}")
+    return line
 
 
 def _entry_mode(value: str) -> str:
@@ -198,6 +224,8 @@ def _add_run_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--resume", action="store_true", help="resume a previous run (--run-id required)")
     parser.add_argument("--run-id", help="run identifier")
     parser.add_argument("--state-dir", type=pathlib.Path, help="override local state root")
+    parser.add_argument("--workspace", type=pathlib.Path,
+                        help="explicit workspace root (default: the invocation repository's toplevel)")
     parser.add_argument("--no-evidence", action="store_true", help="do not record outcome evidence")
     parser.add_argument("--no-store", action="store_true", help="do not persist operational run state")
     parser.add_argument("--no-cache", action="store_true",

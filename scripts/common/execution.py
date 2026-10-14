@@ -21,6 +21,7 @@ import uuid
 from typing import Any, Optional
 
 import infra  # scripts/common, on sys.path
+import authority  # scripts/common, on sys.path
 import routing  # scripts/common, on sys.path
 import discovery  # scripts/common, on sys.path
 import failover  # scripts/common, on sys.path
@@ -428,11 +429,15 @@ def _worktree_fingerprint(root: pathlib.Path) -> str:
 
 
 def workspace_root(root: Optional[pathlib.Path] = None) -> pathlib.Path:
-    """Resolve ONE explicit workspace root used for Git, context, tools and cwd."""
-    resolved = pathlib.Path(root or ROOT).expanduser()
-    if not resolved.exists() or not resolved.is_dir():
-        raise ExecutionError(f"WORKSPACE_INVALID: workspace root is not a directory: {resolved}")
-    return resolved.resolve()
+    """Resolve ONE explicit workspace root used for Git, context, tools and cwd.
+
+    Validation lives in the one workspace authority, so a subdirectory invocation
+    and an explicit ``--workspace`` are judged by the same rule.
+    """
+    try:
+        return authority.canonical_workspace(root if root is not None else ROOT)
+    except authority.AuthorityError as exc:
+        raise ExecutionError(str(exc)) from exc
 
 
 # --------------------------------------------------------------------------- #
