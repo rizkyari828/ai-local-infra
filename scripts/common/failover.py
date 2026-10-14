@@ -235,12 +235,18 @@ def select(candidates: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
 
 
 def failover(candidates: list[dict[str, Any]], failed: dict[str, Any], health: Health,
-             reason: str) -> Optional[dict[str, Any]]:
+             reason: str, *, exact_destinations: bool = False) -> Optional[dict[str, Any]]:
     """On an infra/reason failure, cool down the failed backend/provider and return the
     next capability-preserving candidate. Returns None for reasoning failures (caller
     escalates) or when no equivalent candidate exists."""
     if reason not in FAILOVER_REASONS:
         return None
+    if exact_destinations:
+        # Exact requests can switch only to controller-validated, explicitly allowed
+        # alternatives. A model-specific rejection need not disable its whole backend.
+        index = next((i for i, c in enumerate(candidates) if all(
+            c.get(k) == failed.get(k) for k in ('backend', 'provider', 'model', 'native_variant'))), len(candidates))
+        return next((c for c in candidates[index + 1:] if c['runnable'] and not health.is_tripped(c)), None)
     health.trip(failed, reason)
     for candidate in candidates:
         if candidate["backend"] == failed["backend"] and candidate["provider"] == failed["provider"]:

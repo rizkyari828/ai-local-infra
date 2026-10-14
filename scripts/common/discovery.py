@@ -266,3 +266,53 @@ def effort_status(provider: Optional[str], model: Optional[str], surface: Option
         if str(variant.get("normalized")) == wanted:
             return VERIFIED if variant.get("verified") else UNVERIFIED
     return UNKNOWN
+
+
+def backend_models(backend: str) -> list[dict[str, Any]]:
+    """Configured exact model/variant inventory; no network or inference discovery."""
+    config = load_config()
+    surface = 'codex-cli' if backend == 'codex' else backend
+    records = []
+    for row in discover(config=config):
+        cap = capability(row['provider'], row['model'], surface, config=config)
+        if cap['status'] in (AVAILABLE, VERIFIED):
+            records.append({'provider': row['provider'], 'model': row['model'],
+                            'efforts': [v['native'] for v in cap['variants']],
+                            'capabilities': ['implementation', 'review', 'read_only']})
+    if backend == 'opencode':
+        # Reuse the existing configured execution destinations; no worker registry
+        # search and no invented provider-native effort variants.
+        declared = {}
+        observed = {(r['provider'], r['model']) for r in records}
+        for specs in config.get('failover', {}).values():
+            for spec in specs:
+                key = (spec.get('provider'), spec.get('model'))
+                if spec.get('backend') != backend or not all(key) or not spec.get('native_variant') or key in observed:
+                    continue
+                if capability(*key, surface, config=config)['status'] == UNAVAILABLE:
+                    continue
+                row = declared.setdefault(key, {'provider': key[0], 'model': key[1], 'efforts': [],
+                    'capabilities': ['implementation', 'review', 'read_only']})
+                if spec['native_variant'] not in row['efforts']:
+                    row['efforts'].append(spec['native_variant'])
+        records.extend(declared.values())
+    if backend == 'codex':
+        # A catalog is capability evidence, not evidence that a request was executed.
+        # Custom provider configurations cannot inherit the OpenAI account catalog.
+        import os
+        import json
+        import tomllib
+        home = pathlib.Path(os.environ.get('CODEX_HOME', pathlib.Path.home() / '.codex'))
+        try:
+            settings = tomllib.loads((home / 'config.toml').read_text()) if (home / 'config.toml').exists() else {}
+            if settings.get('model_provider', 'openai') != 'openai':
+                return records
+            data = json.loads((home / 'models_cache.json').read_text())
+            for row in data['models']:
+                if isinstance(row.get('slug'), str) and row.get('visibility') == 'list':
+                    records.append({'provider': 'codex', 'model': row['slug'],
+                        'efforts': [v['effort'] for v in row['supported_reasoning_levels']],
+                        'capabilities': ['implementation', 'review', 'read_only']})
+        except (OSError, ValueError, KeyError, TypeError):
+            pass  # absent/malformed inventory is unavailable, never a guessed route
+    return records

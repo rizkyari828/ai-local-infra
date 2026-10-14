@@ -15,7 +15,7 @@
     "claude": "anthropic",
     "local": "ollama"
   },
-  "model_aliases": {},
+  "model_aliases": {"Astra": "gpt-6-astra"},
   "surfaces": {
     "opencode": {"shares_config_with": null},
     "codex-cli": {"shares_config_with": null},

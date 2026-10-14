@@ -172,6 +172,9 @@ class Backend:
     def available(self) -> bool:
         return False
 
+    def models(self) -> list[dict[str, Any]]:
+        return []  # explicit requests require an exact, configured capability record
+
     def resolve(self, node: dict[str, Any], provider: Optional[str], model: Optional[str],
                 effort: str) -> dict[str, Any]:
         return {"provider": provider, "model": model, "native_variant": effort,
@@ -187,11 +190,16 @@ class FakeBackend(Backend):
     mode = "SIMULATED"
 
     def __init__(self, script: Optional[dict[str, list[dict[str, Any]]]] = None,
-                 default: Optional[dict[str, Any]] = None, cancel_on: Optional[str] = None):
+                 default: Optional[dict[str, Any]] = None, cancel_on: Optional[str] = None,
+                 models: Optional[list[dict[str, Any]]] = None):
         self.script = {key: list(value) for key, value in (script or {}).items()}
         self.default = default
         self.cancel_on = cancel_on
         self.calls: list[dict[str, Any]] = []
+        self._models = copy.deepcopy(models or [])
+
+    def models(self):
+        return copy.deepcopy(self._models)
 
     def available(self) -> bool:
         return True
@@ -202,6 +210,7 @@ class FakeBackend(Backend):
                            "model": request["model"], "native_variant": request["native_variant"],
                            "dependency_tasks": [d["task_id"] for d in request["dependency_summaries"]],
                            "prompt": request["prompt"]})
+        self.calls[-1]['role'] = request.get('role')
         if self.cancel_on == request["task_id"]:
             raise KeyboardInterrupt()
         queue = self.script.get(request["task_id"])
@@ -235,23 +244,28 @@ class CliBackend(Backend):
     def available(self) -> bool:
         return shutil.which(self.binary) is not None
 
+    def models(self):
+        return discovery.backend_models(self.name)
+
     def resolve(self, node, provider, model, effort):
-        native = (node["routing"]["effort"] or "").lower()
+        native = (effort or "").lower()
         return {"provider": provider, "model": model, "native_variant": native,
                 "mode": self.mode, "available": self.available()}
 
     def _command(self, request: dict[str, Any]) -> list[str]:
         prompt = request["prompt"]
         if self.name == "opencode":
-            command = [self.binary, "run", "--format", "json", "--dir", request["working_dir"]]
+            command = [self.binary, "run", "--format", "json"]
             if request["model"]:
                 model_arg = f"{request['provider']}/{request['model']}" if request["provider"] else request["model"]
+                if request['native_variant']:
+                    model_arg += '#' + request['native_variant']
                 command += ["--model", model_arg]
-            if request["native_variant"]:
-                command += ["--variant", request["native_variant"]]
             return command + [prompt]
         if self.name == "codex":
             command = [self.binary, "exec"]
+            if request.get('provider') in ('codex', 'openai'):
+                command += ['-c', 'model_provider="openai"']
             if request.get("read_only"):
                 command += ["-s", "read-only"]  # verified flag: codex exec --sandbox read-only
             if request["model"]:
@@ -322,6 +336,116 @@ def backend_for(name: str, *, timeout: int = 300) -> Backend:
 # --------------------------------------------------------------------------- #
 
 
+def execution_requirement(node):
+    """Validate an explicit requirement separately from symbolic tier recommendations."""
+    raw = node.get('execution_requirement')
+    if raw is None:
+        return None
+    fields = {'role', 'requested_provider', 'requested_model', 'requested_effort',
+              'required_capabilities', 'fallback_policy', 'allowed_destinations',
+              'require_actual_effort', 'require_actual_model'}
+    if not isinstance(raw, dict) or set(raw) - fields:
+        raise ExecutionError('EXECUTION_REQUIREMENT_INVALID')
+    req = copy.deepcopy(raw)
+    for key in ('role', 'requested_provider', 'requested_model', 'requested_effort'):
+        if (not isinstance(req.get(key), str) or not req[key].strip() or '\n' in req[key]
+                or len(req[key]) > 200 or knowledge.learning.contains_secret_like(req[key])):
+            raise ExecutionError('EXECUTION_REQUIREMENT_INVALID')
+    req['requested_effort'] = req['requested_effort'].lower()
+    for key in ('require_actual_effort', 'require_actual_model'):
+        if key in req and type(req[key]) is not bool:
+            raise ExecutionError('EXECUTION_REQUIREMENT_INVALID')
+    caps = req.setdefault('required_capabilities', [])
+    if not isinstance(caps, list) or any(not isinstance(c, str) or not c for c in caps):
+        raise ExecutionError('EXECUTION_REQUIREMENT_INVALID')
+    destinations = req.get('allowed_destinations')
+    if destinations is not None and (not isinstance(destinations, list) or any(
+            not isinstance(d, dict) or set(d) != {'backend', 'provider'} or
+            any(not isinstance(v, str) or not v for v in d.values()) for d in destinations)):
+        raise ExecutionError('EXECUTION_REQUIREMENT_INVALID')
+    policy = req.setdefault('fallback_policy', {'mode': 'forbidden'})
+    if not isinstance(policy, dict) or policy.get('mode') not in ('forbidden', 'allowed') or set(policy) - {'mode', 'alternatives'}:
+        raise ExecutionError('EXECUTION_REQUIREMENT_INVALID')
+    alternatives = policy.get('alternatives', [])
+    if not isinstance(alternatives, list) or any(not isinstance(a, dict) or
+            set(a) != {'provider', 'model', 'effort'} or
+            any(not isinstance(v, str) or not v or '\n' in v or len(v) > 200 or
+                knowledge.learning.contains_secret_like(v) for v in a.values()) for a in alternatives):
+        raise ExecutionError('EXECUTION_REQUIREMENT_INVALID')
+    if policy['mode'] == 'forbidden' and alternatives:
+        raise ExecutionError('EXECUTION_REQUIREMENT_INVALID')
+    return req
+
+
+def _resolve_requirement(node, registry, health, constraints, enforce_machine_policy):
+    req = execution_requirement(node)
+    config = discovery.load_config()
+    targets = [{'provider': req['requested_provider'], 'model': req['requested_model'],
+                'effort': req['requested_effort']}]
+    if req['fallback_policy']['mode'] == 'allowed':
+        targets += req['fallback_policy'].get('alternatives', [])
+    candidates, reasons = [], []
+    for index, target in enumerate(targets):
+        provider = discovery.canonical_provider(target['provider'], config)
+        model = discovery.canonical_model(target['model'], config)
+        if any(not isinstance(v, str) or not v or '\n' in v or len(v) > 200 or
+               knowledge.learning.contains_secret_like(v) for v in (provider, model)):
+            reasons.append('BLOCKED_MODEL_CONFIG_INVALID')
+            continue
+        block = failover.policy_block(provider, node['routing']['tier'], constraints,
+                                     enforce_machine_policy=enforce_machine_policy)
+        if block:
+            reasons.append(block)
+            continue
+        for name, adapter in registry.items():
+            destinations = req.get('allowed_destinations')
+            if destinations is not None and not any(d['backend'] == name and
+                    discovery.canonical_provider(d['provider'], config) == provider for d in destinations):
+                continue
+            if provider not in config.get('backends', {}).get(name, {}).get('providers', []):
+                continue
+            for record in adapter.models():
+                if record.get('provider') != provider or record.get('model') != model:
+                    continue
+                effort = target['effort'].lower()
+                if effort not in record.get('efforts', []):
+                    reasons.append('BLOCKED_EFFORT_UNAVAILABLE')
+                    continue
+                if not set(req['required_capabilities']).issubset(record.get('capabilities', [])):
+                    reasons.append('BLOCKED_CAPABILITY_UNAVAILABLE')
+                    continue
+                candidate = {'backend': name, 'provider': provider, 'model': model,
+                    'native_variant': effort, 'tier': node['routing']['tier'], 'effort': effort,
+                    'normalized_effort': discovery.normalize_effort(provider, effort, config),
+                    'fallback_index': index, 'verified': False}
+                status = health.status(candidate) if health is not None else failover.BACKEND_HEALTHY
+                # The exact account catalog replaces the need for a default model setting.
+                if (health is not None and status == failover.UNKNOWN and provider == 'codex'
+                        and health.codex_model is None and not health.codex_model_error
+                        and health._override(candidate) is None and health.binaries.get(name) is True):
+                    status = failover.BACKEND_HEALTHY
+                if not adapter.available() or status != failover.BACKEND_HEALTHY or (health is not None and health.is_tripped(candidate)):
+                    reasons.append('BLOCKED_PROVIDER_UNAVAILABLE')
+                    continue
+                configured = adapter.resolve(node, provider, model, effort)
+                if any(configured.get(k) != candidate[k] for k in ('provider', 'model', 'native_variant')):
+                    reasons.append('BLOCKED_EFFORT_UNAVAILABLE' if configured.get('native_variant') != effort
+                                   else 'BLOCKED_MODEL_UNAVAILABLE')
+                    continue
+                candidate.update(runnable=True, status=status)
+                candidates.append(candidate)
+    selected = failover.select(candidates)
+    return {'task_id': node['task_id'], 'tier': node['routing']['tier'],
+            'effort': req['requested_effort'], 'requirement': req, 'candidates': candidates,
+            'backend': selected['backend'] if selected else None,
+            'provider': selected['provider'] if selected else None,
+            'model': selected['model'] if selected else None,
+            'native_variant': selected['native_variant'] if selected else None,
+            'mode': registry[selected['backend']].mode if selected else None,
+            'runnable': selected is not None,
+            'reason': None if selected else (reasons[0] if reasons else 'BLOCKED_MODEL_UNAVAILABLE')}
+
+
 def resolve_plan(plan: dict[str, Any], backend: Backend, surface: Optional[str] = None, *,
                  health: Optional[failover.Health] = None,
                  constraints: Optional[dict[str, Any]] = None,
@@ -330,11 +454,18 @@ def resolve_plan(plan: dict[str, Any], backend: Backend, surface: Optional[str] 
     resolutions = []
     for node in plan["nodes"]:
         if node.get("executor") == "TOOL_ONLY":
+            if node.get('execution_requirement') is not None:
+                raise ExecutionError('EXECUTION_REQUIREMENT_ON_TOOL')
             resolutions.append({"task_id": node["task_id"], "executor": "TOOL_ONLY", "tier": None,
                                 "runnable": True, "candidates": None})
             continue
         tier = node["routing"]["tier"]
         effort = node["routing"]["effort"]
+        if node.get('execution_requirement') is not None:
+            registry = dict(backends or {})
+            registry.setdefault(backend.name, backend)
+            resolutions.append(_resolve_requirement(node, registry, health, constraints, enforce_machine_policy))
+            continue
         if health is None:
             # Alternate resolution path (no runtime health object). Hard policy is still
             # enforced here at the shared authority boundary, so a remote candidate can
@@ -516,8 +647,16 @@ def execute_plan(plan: dict[str, Any], *, backend: Backend, run_id: Optional[str
                  entry_mode: str = "DIRECT_CLI",
                  controller_ai_calls: Optional[int] = None,
                  knowledge_provider=None, postcondition_verifier=None,
-                 wait_seconds: float = 30) -> dict[str, Any]:
+                 wait_seconds: float = 30, execution_requirements=None) -> dict[str, Any]:
     plan = copy.deepcopy(plan)  # this invocation owns its declared task semantics
+    if execution_requirements is not None:
+        if not isinstance(execution_requirements, dict) or set(execution_requirements) - set(plan['order']):
+            raise ExecutionError('EXECUTION_REQUIREMENT_INVALID')
+        for node in plan['nodes']:
+            if node['task_id'] in execution_requirements:
+                if not isinstance(execution_requirements[node['task_id']], dict):
+                    raise ExecutionError('EXECUTION_REQUIREMENT_INVALID')
+                node['execution_requirement'] = copy.deepcopy(execution_requirements[node['task_id']])
     constraints = copy.deepcopy(constraints)
     if not plan.get("valid"):
         raise ExecutionError("refusing to execute an invalid plan")
@@ -935,6 +1074,16 @@ def _dependency_facts(node: dict[str, Any], results: dict[str, dict[str, Any]]) 
     facts: list[dict[str, Any]] = []
     for dep in node["depends_on"]:
         outcome = results.get(dep, {})
+        req = execution_requirement(node)
+        if req and req['role'] == 'reviewer':
+            # Only bounded accepted evidence crosses the independent review boundary.
+            # Source/diff context is separately retrieved from explicit context refs.
+            outcome = {**outcome, 'summary': json.dumps({
+                'result_reference': outcome.get('cache_entry_id') or outcome.get('result_fingerprint'),
+                'status': outcome.get('status'), 'acceptance': outcome.get('acceptance'),
+                'files_changed': (outcome.get('files_changed') or [])[:20],
+                'tool_result': outcome.get('result') if outcome.get('executor') == 'TOOL_ONLY' else None},
+                sort_keys=True)[:2000]}
         fact: dict[str, Any] = {"task_id": dep, "summary": outcome.get("summary", ""),
                                 "status": outcome.get("status")}
         # Meaningful dependency identity: the accepted result fingerprint, never
@@ -1101,6 +1250,8 @@ def _plan_fingerprint(plan: dict[str, Any]) -> str:
             "acceptance": list(node.get("acceptance_criteria") or []),
             "tool": node.get("tool"),
             "routing": (node.get("routing") or {}),
+            **({'execution_requirement': execution_requirement(node)}
+               if node.get('execution_requirement') is not None else {}),
         } for node in plan.get("nodes", [])],
     }
     return hashlib.sha256(json.dumps(material, sort_keys=True, default=str)
@@ -1136,18 +1287,7 @@ def _resume_dependency_facts(node: dict[str, Any],
                              recorded: dict[str, Any]) -> list[dict[str, Any]]:
     """Reconstruct the dependency facts of a completed node from its recorded results,
     so its relevant input identity can be recomputed deterministically on resume."""
-    facts: list[dict[str, Any]] = []
-    for dep in node["depends_on"]:
-        outcome = recorded.get(dep, {})
-        fact: dict[str, Any] = {"task_id": dep, "summary": outcome.get("summary", ""),
-                                "status": outcome.get("status")}
-        fingerprint = outcome.get("result_fingerprint")
-        if not fingerprint and outcome.get("status") == SKIPPED:
-            fingerprint = result_cache.result_fingerprint("inactive", {"status": SKIPPED})
-        if fingerprint:
-            fact["result_fingerprint"] = fingerprint
-        facts.append(fact)
-    return facts
+    return _dependency_facts(node, recorded)
 
 
 def _resume_node_identity(node: dict[str, Any], dependency_summaries: list[dict[str, Any]],
@@ -1276,6 +1416,7 @@ def _run_node(node, deps, results, backend, resolution, *, state_dir, record_evi
               dependency_summaries=None, prebuilt_context=None,
               durable_store=None, claim=None, owner_run=None) -> dict[str, Any]:
     tier = node["routing"]["tier"]
+    requirement = execution_requirement(node)
     initial_tier = tier
     if enforce_read_only and node.get("intent") == "MUTATING":
         return {"task_id": node["task_id"], "status": "READ_ONLY_VIOLATION",
@@ -1298,7 +1439,9 @@ def _run_node(node, deps, results, backend, resolution, *, state_dir, record_evi
                  "native_variant": (resolution or {}).get("native_variant"),
                  "tier": tier, "effort": node["routing"]["effort"]}
     current_backend = registry.get(candidate["backend"], backend)
-    first_backend = candidate["backend"]
+    first_destination = (candidate['backend'], candidate['provider'], candidate['model'], candidate['native_variant'])
+    candidate['fallback_index'] = next((c.get('fallback_index', 0) for c in (candidates or [])
+        if (c['backend'], c['provider'], c['model'], c['native_variant']) == first_destination), 0)
     if dependency_summaries is None:
         dependency_summaries = [{"task_id": dep, "summary": results.get(dep, {}).get("summary", "")}
                                 for dep in deps]
@@ -1341,7 +1484,12 @@ def _run_node(node, deps, results, backend, resolution, *, state_dir, record_evi
             return _finalize_node(node, {"summary": "hard AI-call budget exhausted"}, FAILURE,
                                   "CALL_BUDGET_EXHAUSTED", initial_tier, tier, attempt, escalations,
                                   decision_id, resolution, state_dir, record_evidence, candidate=last_launched)
-        attempt += 1
+        blocked = failover.policy_block(candidate['provider'], candidate['tier'],
+            bind_machine_policy(constraints), enforce_machine_policy=launch_capable(current_backend))
+        if blocked:
+            return _finalize_node(node, {'summary': blocked}, BLOCKED, blocked, initial_tier, tier,
+                                  attempt, escalations, decision_id, resolution, state_dir,
+                                  record_evidence, candidate=last_launched)
         # The context is validated BEFORE the launch boundary: a rejected/missing
         # context consumes no AI-call budget and counts as zero invocations.
         if prebuilt_context is not None:
@@ -1395,6 +1543,7 @@ def _run_node(node, deps, results, backend, resolution, *, state_dir, record_evi
             manifest["delivered_input_fingerprint"] = request["delivered_input_fingerprint"]
         if durable_store is not None:
             durable_store.launch(claim)  # durable intent before any possible external call
+        attempt += 1
         budget["used"] += 1  # actual worker/model launch boundary
         launched = True
 
@@ -1410,18 +1559,25 @@ def _run_node(node, deps, results, backend, resolution, *, state_dir, record_evi
                 "normalized_effort": candidate.get("normalized_effort"),
                 "required_tier": initial_tier, "required_effort": node["routing"]["effort"],
                 "status": "LAUNCHED", "failure_category": None,
-                "is_retry": attempt > 1 and current_backend.name == first_backend,
-                "is_fallback": current_backend.name != first_backend,
+                "is_retry": attempt > 1 and (candidate['backend'], candidate['provider'], candidate['model'], candidate['native_variant']) == first_destination,
+                "is_fallback": bool(candidate.get('fallback_index')) or (candidate['backend'], candidate['provider'], candidate['model'], candidate['native_variant']) != first_destination,
                 "completion_signal": None,
                 "simulated": getattr(current_backend, "mode", "SUPPORTED") == "SIMULATED",
                 "requested_model": (constraints or {}).get("prefer_model"),
+                "requested_effort": node['routing']['effort'],
             }
+            if requirement:
+                attempt_row.update(requested_model=requirement['requested_model'],
+                                   requested_effort=requirement['requested_effort'],
+                                   requested_provider=requirement['requested_provider'], role=requirement['role'])
             attempts.append(attempt_row)
             if durable_store is not None:
                 attempt_row["attempt_id"] = durable_store.record_attempt(owner_run, node["task_id"],
                     **{k: attempt_row[k] for k in ("attempt_no", "backend", "provider", "model",
                         "native_effort", "normalized_effort", "status", "required_tier", "required_effort",
-                        "failure_category", "is_retry", "is_fallback", "completion_signal")})
+                        "failure_category", "is_retry", "is_fallback", "completion_signal",
+                        'requested_model', 'requested_effort')},
+                    requested_provider=attempt_row.get('requested_provider'), role=attempt_row.get('role'))
 
         def _settle_attempt(status_value: str, category_value: Optional[str],
                             result_value: Optional[dict[str, Any]] = None) -> None:
@@ -1455,7 +1611,6 @@ def _run_node(node, deps, results, backend, resolution, *, state_dir, record_evi
                       "summary": f"malformed adapter result: {type(result).__name__}"}
         candidate = {**candidate, "simulated": getattr(current_backend, "mode", "SUPPORTED") == "SIMULATED"}
         last_launched = candidate  # the candidate that actually ran this attempt
-
         try:
             if read_only_scope:
                 changed = sorted(_worktree_paths(repo_root) - (before_paths or set()))
@@ -1467,6 +1622,28 @@ def _run_node(node, deps, results, backend, resolution, *, state_dir, record_evi
                                           "READ_ONLY_VIOLATION", "READ_ONLY_VIOLATION", initial_tier, tier,
                                           attempt, escalations, decision_id, resolution, state_dir, record_evidence,
                                           candidate=candidate)
+            if requirement:
+                violation = None
+                for field in ('model', 'effort'):
+                    actual = result.get('actual_' + field)
+                    if not isinstance(actual, str) or knowledge.learning.contains_secret_like(actual):
+                        actual = None
+                    result['actual_' + field] = actual
+                    expected = candidate['model' if field == 'model' else 'native_variant']
+                    if actual is not None and actual != expected:
+                        violation = 'EXECUTION_CONTRACT_VIOLATION'
+                    elif (actual is None and requirement.get('require_actual_' + field) and violation is None
+                          and result.get('status') == SUCCESS and result.get('completion_signal')):
+                        violation = 'ACTUAL_' + field.upper() + '_UNVERIFIED'
+                result['effort_verification'] = ('VERIFIED' if result.get('actual_effort') == candidate['native_variant']
+                                                 else 'UNVERIFIED')
+                if violation:
+                    _settle_attempt('FAILED' if violation == 'EXECUTION_CONTRACT_VIOLATION' else UNVERIFIED,
+                                    violation, result)
+                    return _finalize_node(node, result,
+                        FAILURE if violation == 'EXECUTION_CONTRACT_VIOLATION' else UNVERIFIED, violation,
+                        initial_tier, tier, attempt, escalations, decision_id, resolution, state_dir,
+                        record_evidence, candidate=candidate)
             category = result.get("failure_category")
             process_ok = result.get("status") == SUCCESS and bool(result.get("completion_signal"))
             acceptance_state, acceptance_reason = (ACCEPTANCE_UNVERIFIED, "process did not complete")
@@ -1511,8 +1688,10 @@ def _run_node(node, deps, results, backend, resolution, *, state_dir, record_evi
                     infra_used += 1
                     continue
                 # Capability-preserving backend failover (never downgrades the tier floor).
-                if candidates is not None and health is not None:
-                    next_candidate = failover.failover(candidates, candidate, health, category)
+                if candidates is not None and (health is not None or requirement) and (
+                        requirement is None or requirement['fallback_policy']['mode'] == 'allowed'):
+                    next_candidate = failover.failover(candidates, candidate, health or failover.Health(), category,
+                                                       exact_destinations=requirement is not None)
                     if next_candidate and next_candidate["backend"] in registry:
                         candidate = next_candidate
                         current_backend = registry[next_candidate["backend"]]
@@ -1523,7 +1702,7 @@ def _run_node(node, deps, results, backend, resolution, *, state_dir, record_evi
         if category == REASONING:
             chosen = None
             next_tier = None
-            if not mutating_uncertain:
+            if not mutating_uncertain and requirement is None:
                 next_tier = NEXT_TIER.get(tier)
                 if next_tier and escalations < 2 and health is not None:
                     stronger = failover.resolve(next_tier, node["routing"]["effort"],
@@ -1616,6 +1795,8 @@ def _request(node, resolution, dependency_summaries, execution_id, tier, backend
         "dependency_summaries": dependency_summaries, "knowledge_refs": node.get("knowledge_refs", []),
         "context_manifest": manifest, "context_pack": context_pack, "working_dir": str(working_dir),
         "read_only": read_only, "task_contract": contract,
+        'role': (execution_requirement(node) or {}).get('role', node['routing'].get('role')),
+        'execution_requirement': execution_requirement(node),
         "delivered_input_fingerprint": delivered_input_fingerprint(node, dependency_summaries, manifest),
         "prompt": _prompt(node, dependency_summaries, read_only=read_only, context_pack=context_pack,
                           manifest=manifest),
@@ -1658,6 +1839,8 @@ def _canonical_semantics(node: dict[str, Any], dependency_summaries: list[dict[s
         "capability_requirement": contract.get("capability_requirement"),
         "context": result_cache.context_identity(manifest),
         "dependencies": _canonical_dependencies(dependency_summaries),
+        **({'execution_requirement': execution_requirement(node)}
+           if node.get('execution_requirement') is not None else {}),
     }
 
 
@@ -1686,6 +1869,8 @@ def _prompt(node, dependency_summaries, read_only: bool = False,
             context_pack: Optional[dict[str, Any]] = None,
             manifest: Optional[dict[str, Any]] = None) -> str:
     semantics = _canonical_semantics(node, dependency_summaries, manifest)
+    requirement = semantics.get('execution_requirement')
+    role = f"Role: {requirement['role']}\n" if requirement else ''
     deps = "; ".join(f"{d['task_id']}: {d['summary']}" for d in semantics["dependencies"]) or "none"
     guard = "\nRead-only task: do not modify, create, or delete any files." if read_only else ""
     target_line = ", ".join(semantics.get("targets") or []) or "none stated"
@@ -1695,6 +1880,7 @@ def _prompt(node, dependency_summaries, read_only: bool = False,
     data_block = (f"\n{DATA_AUTHORITY_HEADER}\n{DATA_AUTHORITY_NOTE}\n{context_text}"
                   if context_text else "")
     return (f"{WORKER_ISOLATION_NOTE}{guard}\n\n{TASK_AUTHORITY_HEADER}\n"
+            f"{role}"
             f"Objective: {semantics['objective']}\n"
             f"Operation: {semantics.get('operation', 'execute')}\n"
             f"Targets: {target_line}\n"
@@ -1740,8 +1926,16 @@ def _finalize(node, result, status, category, initial_tier, final_tier, attempts
               "acceptance_contract": result_cache.ACCEPTANCE_CONTRACT_VERSION,
               "summary": result.get("summary", ""), "decisions": result.get("decisions", []),
               "resolved_model": (candidate or {}).get("model"),
+              'resolved_backend': (candidate or {}).get('backend'),
+              'resolved_provider': (candidate or {}).get('provider'),
               "resolved_effort": (candidate or {}).get("native_variant"),
               "actual_model": result.get("actual_model"), "actual_effort": result.get("actual_effort"),
+              'requested_model': (execution_requirement(node) or {}).get('requested_model'),
+              'requested_provider': (execution_requirement(node) or {}).get('requested_provider'),
+              'role': (execution_requirement(node) or {}).get('role', node['routing'].get('role')),
+              'requested_effort': (execution_requirement(node) or {}).get('requested_effort', node['routing']['effort']),
+              'effort_verification': result.get('effort_verification', 'UNVERIFIED'),
+              'fallback_index': (candidate or {}).get('fallback_index', 0),
               "files_changed": result.get("files_changed", []),
               "acceptance_results": result.get("acceptance_results", {}),
               "new_risk_signals": result.get("new_risk_signals", []),

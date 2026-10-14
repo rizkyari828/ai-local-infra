@@ -61,7 +61,7 @@ def run_direct(objective: str, *, backend: execution.Backend,
                force_refresh: bool = False, max_ai_calls: Optional[int] = None,
                entry_mode: str = "DIRECT_CLI", controller_ai_calls: Optional[int] = None,
                backends: Optional[dict[str, execution.Backend]] = None,
-               health: Optional[Any] = None,
+               health: Optional[Any] = None, execution_requirements: Optional[dict] = None,
                store: Optional[orchestration_store.OrchestrationStore] = None) -> tuple[dict, dict]:
     """Direct local entry path: objective -> deterministic plan -> execute -> record.
 
@@ -80,7 +80,8 @@ def run_direct(objective: str, *, backend: execution.Backend,
         confirm=confirm, dry_run=dry_run, allow_dirty=allow_dirty, surface=surface,
         record_evidence=record_evidence, cache=cache, force_refresh=force_refresh,
         max_ai_calls=max_ai_calls, constraints=constraints, backends=backends, health=health,
-        entry_mode=entry_mode, controller_ai_calls=controller_ai_calls)
+        entry_mode=entry_mode, controller_ai_calls=controller_ai_calls,
+        execution_requirements=execution_requirements)
     if not dry_run:
         record_run(plan, report, state_dir=state_dir, entry_mode=entry_mode,
                    controller_ai_calls=controller_ai_calls, store=store)

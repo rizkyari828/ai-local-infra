@@ -98,6 +98,12 @@ def identity(node, root, context, dependencies, constraints, resolution, backend
         'resolved_effort': resolution.get('native_variant'),
         'acceptance_contract': result_cache.ACCEPTANCE_CONTRACT_VERSION,
     }
+    if resolution.get('requirement'):
+        req = resolution['requirement']
+        compatibility.update(execution_requirement=req,
+            requested_model=req['requested_model'], requested_effort=req['requested_effort'],
+            allowed_bindings=[{k:c.get(k) for k in ('backend','provider','model','native_variant')}
+                              for c in resolution.get('candidates', [])])
     equivalent = kc.active_work_equivalence_input(task=task,
         knowledge_identity=selected['delivered_identity'], execution_compatibility=compatibility)
     return {**equivalent, 'version': VERSION, 'workspace': repo['workspace_instance'],
@@ -151,9 +157,19 @@ class WorkStore(ops.OrchestrationStore):
         compatibility = identity['execution_compatibility']
         if identity['mode'] == 'READ_ONLY' and compatibility.get('freshness_policy') not in result_cache.REUSABLE_FRESHNESS:
             return None
+        req = compatibility.get('execution_requirement') or {}
+        resolved = {'backend': result.get('resolved_backend'), 'provider': result.get('resolved_provider'),
+                    'model': result.get('resolved_model'), 'native_variant': result.get('resolved_effort')}
+        allowed_fallback = (req.get('fallback_policy', {}).get('mode') == 'allowed'
+                            and resolved in compatibility.get('allowed_bindings', []))
         for field in ('model', 'effort'):
             actual = result.get('actual_' + field)
-            if actual is not None and actual != compatibility.get('resolved_' + field):
+            expected = result.get('resolved_' + field) if allowed_fallback else compatibility.get('resolved_' + field)
+            if result.get('resolved_' + field) is not None and result['resolved_' + field] != expected:
+                return None
+            if (compatibility.get('execution_requirement') or {}).get('require_actual_' + field) and actual is None:
+                return None
+            if actual is not None and actual != expected:
                 return None
         if identity['mode'] == 'MUTATING':
             if not row['postcondition_verified'] or postcondition is None or postcondition(result) is not True:
@@ -318,7 +334,7 @@ class WorkStore(ops.OrchestrationStore):
         with self.connection:
             self.connection.execute('UPDATE attempts SET status=?, failure_category=?, completion_signal=?, completed_at=?, requested_model=?, requested_effort=?, resolved_model=?, resolved_effort=?, actual_model=?, actual_effort=? WHERE attempt_id=?',
                 (row['status'], row.get('failure_category'), row.get('completion_signal'), ops._now(),
-                 row.get('requested_model'), row.get('required_effort'), row.get('model'),
+                 row.get('requested_model'), row.get('requested_effort', row.get('required_effort')), row.get('model'),
                  row.get('native_effort'), row.get('actual_model'), row.get('actual_effort'), attempt_id))
             owner = self.connection.execute('SELECT run_id, task_id FROM attempts WHERE attempt_id=?',
                                             (attempt_id,)).fetchone()

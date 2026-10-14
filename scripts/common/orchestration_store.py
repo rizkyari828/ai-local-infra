@@ -406,7 +406,9 @@ class OrchestrationStore:
                        normalized_effort: Optional[str], status: str, required_tier: Optional[str] = None,
                        required_effort: Optional[str] = None, failure_category: Optional[str] = None,
                        is_retry: bool = False, is_fallback: bool = False,
-                       completion_signal: Optional[str] = None, started_at: Optional[str] = None) -> str:
+                       completion_signal: Optional[str] = None, started_at: Optional[str] = None,
+                       requested_model: Optional[str] = None, requested_effort: Optional[str] = None,
+                       requested_provider: Optional[str] = None, role: Optional[str] = None) -> str:
         attempt_id = uuid.uuid4().hex
         now = _now()
         with self.connection:
@@ -422,11 +424,17 @@ class OrchestrationStore:
                  status, _clean(failure_category, "failure_category"), 1 if is_retry else 0,
                  1 if is_fallback else 0, _clean(completion_signal, "completion_signal"),
                  started_at or now, None if status == "LAUNCHED" else now, SCHEMA_VERSION))
+            self.connection.execute('UPDATE attempts SET requested_model=?, requested_effort=?, resolved_model=?, resolved_effort=? WHERE attempt_id=?',
+                (_clean(requested_model, 'requested_model'), _clean(requested_effort, 'requested_effort'),
+                 _clean(model, 'resolved_model'), _clean(native_effort, 'resolved_effort'), attempt_id))
             if status == "LAUNCHED":
                 self.connection.execute("UPDATE runs SET used_ai_calls=COALESCE(used_ai_calls,0)+1 WHERE run_id=?",
                                         (run_id,))
             self._event(run_id, "ATTEMPT_STARTED", task_id=task_id, attempt_id=attempt_id,
-                        payload={"attempt_no": attempt_no, "backend": backend, "model": model})
+                        payload={"attempt_no": attempt_no, "backend": backend, "model": model,
+                            'provider': provider, 'role': role, 'requested_provider': requested_provider,
+                            'requested_model': requested_model, 'requested_effort': requested_effort,
+                            'resolved_effort': native_effort})
             if status in ("SUCCESS",):
                 self._event(run_id, "ATTEMPT_SUCCEEDED", task_id=task_id, attempt_id=attempt_id,
                             payload={"normalized_effort": normalized_effort})

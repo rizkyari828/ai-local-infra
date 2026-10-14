@@ -130,8 +130,10 @@ def cmd_run(args: argparse.Namespace) -> int:
     entry_mode = getattr(args, "entry_mode", None) or "DIRECT_CLI"
     controller_ai_calls = getattr(args, "controller_ai_calls", None)
     backend = execution.backend_for(args.backend)
-    health, backends = _local_health()
-    if args.backend != "fake":
+    if args.backend == 'fake':
+        health, backends = None, {}  # offline selection must never dispatch a real CLI
+    else:
+        health, backends = _local_health()
         backends.setdefault(backend.name, backend)
     workspace = _resolve_workspace(args)
     report = execution.execute_plan(
@@ -142,6 +144,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         backends=backends, health=(None if args.backend == "fake" else health),
         constraints=_constraints(args), cache=not args.no_cache,
         force_refresh=args.refresh,
+        execution_requirements=(infra.load_json(args.execution_requirements)
+            if getattr(args, 'execution_requirements', None) else None),
         explicit_model=bool(args.prefer_model or args.prefer_provider),
         entry_mode=entry_mode, controller_ai_calls=controller_ai_calls)
     if not args.no_store:
@@ -205,6 +209,8 @@ def _add_objective_args(parser: argparse.ArgumentParser) -> None:
 
 
 def _add_run_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument('--execution-requirements', type=pathlib.Path,
+                        help='JSON object mapping AI task IDs to exact role/provider/model/effort requirements')
     parser.add_argument("--backend", default="auto", help="fake | opencode | codex | auto")
     parser.add_argument("--dry-run", action="store_true", help="show resolved backends/calls; launch nothing")
     parser.add_argument("--confirm", action="store_true", help="required gate for real execution")
@@ -403,7 +409,7 @@ def main() -> int:
     args = parser().parse_args()
     try:
         return args.func(args)
-    except (orchestrator.OrchestratorError, execution.ExecutionError, OSError) as exc:
+    except (orchestrator.OrchestratorError, execution.ExecutionError, infra.InfraError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
 
