@@ -21,6 +21,8 @@ import uuid
 from typing import Any, Optional
 
 import infra  # scripts/common, on sys.path
+import copy
+import active_work
 import authority  # scripts/common, on sys.path
 import routing  # scripts/common, on sys.path
 import discovery  # scripts/common, on sys.path
@@ -487,6 +489,15 @@ def workspace_root(root: Optional[pathlib.Path] = None) -> pathlib.Path:
 # --------------------------------------------------------------------------- #
 
 
+def _current_knowledge(node, provider):
+    if provider is None:
+        return copy.deepcopy(node.get("knowledge_contract"))
+    document = provider(node)
+    if document is None:
+        raise active_work.WorkError("REQUIRED_CONTEXT_UNAVAILABLE")
+    return copy.deepcopy(document)
+
+
 def execute_plan(plan: dict[str, Any], *, backend: Backend, run_id: Optional[str] = None,
                  state_dir: Optional[pathlib.Path] = None, repo_root: Optional[pathlib.Path] = None,
                  confirm: bool = False, dry_run: bool = False, allow_dirty: bool = False,
@@ -503,7 +514,11 @@ def execute_plan(plan: dict[str, Any], *, backend: Backend, run_id: Optional[str
                  explicit_model: bool = False,
                  allow_stronger_reuse: bool = True,
                  entry_mode: str = "DIRECT_CLI",
-                 controller_ai_calls: Optional[int] = None) -> dict[str, Any]:
+                 controller_ai_calls: Optional[int] = None,
+                 knowledge_provider=None, postcondition_verifier=None,
+                 wait_seconds: float = 30) -> dict[str, Any]:
+    plan = copy.deepcopy(plan)  # this invocation owns its declared task semantics
+    constraints = copy.deepcopy(constraints)
     if not plan.get("valid"):
         raise ExecutionError("refusing to execute an invalid plan")
     if not confirm and not dry_run:
@@ -616,6 +631,33 @@ def execute_plan(plan: dict[str, Any], *, backend: Backend, run_id: Optional[str
     store, owns_store, repo_identity = _open_cache(cache, cache_store, state_dir, project_id, repo_root)
     if store is None:
         cache_meta["enabled"] = False
+    work_store = active_work.WorkStore(state_dir=state_dir)
+    if work_store.get_run(run_id) is None:
+        work_store.ensure_project(identity_project, repository_id=authority.repository_identity(repo_root)["id"])
+        work_store.create_run(run_id, project_id=identity_project,
+                              machine_id=constraints["machine_policy"]["machine_id"] or "unknown",
+                              intent=plan.get("intent"), status="RUNNING", entry_mode=entry_mode,
+                              controller_ai_calls=controller_ai_calls if controller_ai_calls is not None else (None if entry_mode == "CHAT_HANDOFF" else 0),
+                              objective_summary=plan.get("objective_summary"),
+                              planner_mode=(plan.get("planner_mode") or {}).get("mode"),
+                              hard_max_ai_calls=budget["max"],
+                              planned_ai_calls=(plan.get("planning_budget") or {}).get("planned_ai_calls"),
+                              tool_only_count=sum(t.get("executor") == "TOOL_ONLY" for t in plan["nodes"]))
+        for task in plan["nodes"]:
+            work_store.create_task(run_id, task["task_id"], title=task.get("title", task["task_id"]),
+                                   executor_type=task.get("executor", "AI"), intent=task.get("intent"),
+                                   task_family=task.get("task_family"), task_class=task.get("task_class"),
+                                   required_tier=(task.get("routing") or {}).get("tier"),
+                                   required_effort=(task.get("routing") or {}).get("effort"),
+                                   context_budget=(task.get("context") or {}).get("budget"),
+                                   conditional=bool(task.get("conditional")),
+                                   tool_operation=(task.get("tool") or {}).get("operation"))
+        for task in plan["nodes"]:
+            for dep in task["depends_on"]:
+                work_store.add_dependency(run_id, task["task_id"], dep)
+    durable_run = work_store.get_run(run_id)
+    if resume and durable_run:
+        budget["used"] = max(budget["used"], durable_run.get("used_ai_calls") or 0)
     try:
         for task_id in plan["order"]:
             node = next(item for item in plan["nodes"] if item["task_id"] == task_id)
@@ -633,6 +675,21 @@ def execute_plan(plan: dict[str, Any], *, backend: Backend, run_id: Optional[str
                                        "stale results")
                     results[task_id] = {"status": NOT_RUN, "task_id": task_id}
                     _mark_not_run(plan, task_id, results)
+                    break
+                try:
+                    current_context = _build_node_context(node, _dependency_facts(node, results), repo_root)
+                    current_b = active_work.identity(node, repo_root, current_context,
+                        _dependency_facts(node, results), bind_machine_policy(constraints),
+                        resolutions[task_id], backend_registry.get(resolutions[task_id].get("backend"), backend),
+                        _current_knowledge(node, knowledge_provider))
+                except active_work.WorkError as exc:
+                    report["error"] = str(exc)
+                    break
+                if node.get("intent") == "MUTATING" and results[task_id].get("coordination_outcome") == "OUTCOME_UNCERTAIN":
+                    report["error"] = "REFUSE_RESUME_UNCERTAIN_MUTATION"
+                    break
+                if results[task_id].get("master_b_identity") != current_b:
+                    report["error"] = "REFUSE_RESUME_CURRENT_IDENTITY_CHANGED"
                     break
                 continue
             deps = node["depends_on"]
@@ -660,62 +717,153 @@ def execute_plan(plan: dict[str, Any], *, backend: Backend, run_id: Optional[str
             freshness = result_cache.freshness_policy(node, constraints=constraints)
             identity = _cache_identity(node, context_result, dependency_summaries, identity_project,
                                        freshness, state["head"])
-            if store is not None:
-                dependencies_complete = all(fact.get("result_fingerprint") for fact in dependency_summaries)
-                resolution = resolutions.get(task_id) or {}
-                decision = result_cache.decide(
-                    store=store, project_id=repo_identity, node=node, identity=identity,
-                    required_tier=resolution.get("tier"), required_effort=node["routing"]["effort"],
-                    freshness=freshness, force_refresh=force_refresh, explicit_model=explicit_model,
-                    allow_stronger_reuse=allow_stronger_reuse, dependencies_complete=dependencies_complete,
-                    provenance=run_provenance)
-                cache_meta["decisions"].append(_bounded_decision(decision))
-                if decision["decision"] == result_cache.REUSE:
-                    cache_meta["hits"] += 1
-                    results[task_id] = _reused_result(node, decision)
-                    results[task_id]["resume_input_identity"] = identity["input_fingerprint"]
+            refresh_count = [0]
+            def refresh():
+                effective = bind_machine_policy(constraints)
+                fresh_bindings = resolve_plan({**plan, "nodes": [node]}, backend, surface,
+                    health=health, constraints=effective, backends=backend_registry,
+                    enforce_machine_policy=launch_capable(backend, backends))
+                if not fresh_bindings[0]["runnable"]:
+                    raise active_work.WorkError(fresh_bindings[0].get("reason") or "POLICY_BLOCKED")
+                # Re-read tool evidence on subsequent validation, before adopting work.
+                for dep in (deps if refresh_count[0] else []):
+                    dep_node = next(t for t in plan["nodes"] if t["task_id"] == dep)
+                    if dep_node.get("executor") == "TOOL_ONLY":
+                        if dep_node.get("tool", {}).get("operation") == "repository_state":
+                            facts_now = deterministic.ToolExecutor(root=repo_root)._repository_state()
+                            prior = results[dep]
+                            current_result = {k: facts_now.get(k) for k in prior.get("result", {})}
+                            refreshed = {**prior, "result": current_result}
+                        else:
+                            refreshed = _run_tool_node(dep_node, dep_node["depends_on"], results, tool_executor,
+                                                      state_dir=state_dir, record_evidence=False)
+                        if refreshed["status"] not in (SUCCESS, "NO_CHANGE_REQUIRED"):
+                            raise active_work.WorkError("DEPENDENCY_CURRENTLY_INVALID")
+                        _annotate_result(dep_node, refreshed)
+                        results[dep] = refreshed
+                facts = _dependency_facts(node, results)
+                fresh_context = _build_node_context(node, facts, repo_root)
+                document = _current_knowledge(node, knowledge_provider)
+                selected_backend = backend_registry.get(fresh_bindings[0].get("backend"), backend)
+                work_identity = active_work.identity(node, repo_root, fresh_context, facts,
+                    effective, fresh_bindings[0], selected_backend, document)
+                # Contract input is supplied explicitly; no runtime retrieval/skill loading.
+                if document:
+                    import knowledge_contract
+                    selected = knowledge_contract.select(document)
+                    if selected["entries"] and fresh_context.get("pack") is None:
+                        fresh_context["pack"] = {"items": []}
+                    for entry in selected["entries"]:
+                        content = document["contents"][entry["key"]]
+                        delivered = knowledge_contract.normalize_content(content.get("delivered")
+                            if content.get("delivered") is not None else content["content"])
+                        fresh_context["pack"]["items"].append({"source_kind": "knowledge",
+                            "source_id": entry["source_identity"], "content": delivered})
+                    fresh_context["manifest"].setdefault("items", []).append({
+                        "source_kind": "knowledge_contract", "source_id": "selected",
+                        "fingerprint": selected["delivered_identity"], "required": True})
+                refresh_count[0] += 1
+                return work_identity, (fresh_context, facts, effective, fresh_bindings[0])
+
+            def execute_owned(claim, current, fresh):
+                context, facts, effective, binding = fresh
+                work_store.start_task(run_id, task_id)
+                if node.get("intent") == "MUTATING":
+                    results[task_id] = {"status": "RUNNING", "task_id": task_id,
+                        "resume_input_identity": identity["input_fingerprint"]}
                     _save_state(run_dir, _state_blob(run_id, state, results, budget))
-                    context_manifests.setdefault(task_id, (context_result or {}).get("manifest"))
-                    continue
-                cache_meta["misses"] += 1
-            # Durable mutation intent: a crash after this marker but before acceptance is
-            # recorded leaves an in-flight mutating node, so a later resume refuses to
-            # auto-replay a possibly side-effecting mutation.
-            if node.get("intent") == "MUTATING":
-                results[task_id] = {"status": "RUNNING", "task_id": task_id,
-                                    "resume_input_identity": identity["input_fingerprint"]}
-                _save_state(run_dir, _state_blob(run_id, state, results, budget))
+                worker_node = node
+                if node.get("intent") == "MUTATING" and effective.get("mutation_scope") == "workspace":
+                    worker_node = copy.deepcopy(node)
+                    contract = worker_node.setdefault("task_contract", {})
+                    contract["constraints"] = list(contract.get("constraints") or []) + [
+                        "Mutation scope: this repository workspace only; external service mutations are not authorized"]
+                result = _run_node(worker_node, deps, results, backend, binding,
+                    state_dir=state_dir, record_evidence=record_evidence,
+                    infra_retries=infra_retries, same_tier_retries=same_tier_retries,
+                    surface=backend.name, budget=budget, enforce_read_only=enforce_read_only,
+                    repo_root=repo_root, candidates=binding.get("candidates"),
+                    backends=backend_registry, health=health, constraints=effective,
+                    attempts=attempts, context_manifests=context_manifests,
+                    dependency_summaries=facts, prebuilt_context=context,
+                    durable_store=work_store, claim=claim, owner_run=run_id)
+                return _redact_value(result)
+
             try:
-                node_result = _run_node(node, deps, results, backend, resolutions[task_id],
-                                        state_dir=state_dir, record_evidence=record_evidence,
-                                        infra_retries=infra_retries, same_tier_retries=same_tier_retries,
-                                        surface=backend.name, budget=budget,
-                                        enforce_read_only=enforce_read_only, repo_root=repo_root,
-                                        candidates=resolutions[task_id].get("candidates"),
-                                        backends=backend_registry, health=health,
-                                        constraints=constraints, attempts=attempts,
-                                        context_manifests=context_manifests,
-                                        dependency_summaries=dependency_summaries,
-                                        prebuilt_context=context_result)
+                node_result, work_identity, fresh = active_work.coordinate(
+                    work_store, refresh, execute_owned, run=run_id, task=task_id,
+                    reuse=cache, force_refresh=force_refresh, wait_seconds=wait_seconds,
+                    postcondition=(lambda result: postcondition_verifier(node, result, repo_root))
+                        if postcondition_verifier else None)
+                context_result, dependency_summaries, _, _ = fresh
+                identity = _cache_identity(node, context_result, dependency_summaries,
+                    identity_project, freshness, repo_state(repo_root)["head"])
+                # Current-contract namespace prevents automatic reuse of legacy results.
+                identity["input_fingerprint"] = active_work.digest({
+                    "legacy_inputs": identity["input_fingerprint"], "master_b": work_identity})
+                if node_result.get("execution_source") == "CACHE":
+                    cache_meta["hits"] += 1
+                    work_store.cache_event(run_id, "CACHE_HIT", task_id=task_id,
+                        payload={"cache_entry_id": node_result.get("cache_entry_id")})
+                    cache_meta["decisions"].append({"task_id": task_id, "decision": "REUSE",
+                        "reason": "CURRENT_IDENTITY_VALIDATED", "cache_entry_id": node_result.get("cache_entry_id")})
+                elif store is not None:
+                    cache_meta["misses"] += 1
+                    cache_meta["decisions"].append({"task_id": task_id, "decision": "RERUN",
+                        "reason": result_cache.REASON_MUTATION_UNVERIFIED if node.get("intent") == "MUTATING"
+                            else result_cache.REASON_USER_FORCED_REFRESH if force_refresh
+                            else result_cache.REASON_CACHE_MISS})
+                context_manifests.setdefault(task_id, (context_result or {}).get("manifest"))
+            except active_work.WorkError as exc:
+                node_result = {"task_id": task_id, "status": BLOCKED, "failure_category": str(exc)}
+                report["error"] = str(exc)
             except KeyboardInterrupt:
-                results[task_id] = {"status": CANCELLED, "task_id": task_id}
+                node_result = {"status": CANCELLED, "task_id": task_id}
                 _mark_not_run(plan, task_id, results)
-                break
+            except (OSError, orchestration_store.StoreError) as exc:
+                node_result = {"status": BLOCKED, "task_id": task_id,
+                               "failure_category": "DURABLE_PUBLICATION_FAILED"}
+                report["error"] = "DURABLE_PUBLICATION_FAILED"
+            if node.get("intent") == "MUTATING" and cache:
+                cache_meta["decisions"].append({"task_id": task_id, "decision": "WRITE_REJECTED",
+                    "reason": result_cache.REASON_MUTATION_UNVERIFIED})
+            if node_result["status"] == BLOCKED:
+                report["error"] = node_result.get("failure_category") or "ACTIVE_WORK_BLOCKED"
             results[task_id] = node_result
-            node_result["resume_input_identity"] = identity["input_fingerprint"]
+            node_result["resume_input_identity"] = _resume_node_identity(
+                node, dependency_summaries, repo_root, identity_project, state["head"], constraints)
             if store is not None:
                 node_result["input_fingerprint"] = identity["input_fingerprint"]
             if node_result["status"] == SUCCESS:
                 fp, bounded, rtype = _annotate_result(node, node_result)
-                if store is not None and identity is not None and fp is not None:
+                if (store is not None and identity is not None and fp is not None
+                        and node_result.get("execution_source") != "CACHE"):
                     _write_cache(store, node, identity, freshness, node_result, bounded, rtype, fp,
                                  attempts, run_id, repo_identity, cache_meta, run_provenance)
+            if node_result["status"] == CANCELLED:
+                _save_state(run_dir, _state_blob(run_id, state, results, budget))
+                break
             if node_result["status"] in ("CALL_BUDGET_EXHAUSTED", "READ_ONLY_VIOLATION"):
                 report["error"] = node_result["status"]
                 _mark_not_run(plan, task_id, results)
                 break
             _save_state(run_dir, _state_blob(run_id, state, results, budget))
     finally:
+        for task_id, outcome in results.items():
+            work_store.finish_task(run_id, task_id,
+                orchestration_store.to_operational_task_status(outcome.get("status")),
+                execution_source=outcome.get("execution_source"),
+                failure_category=outcome.get("failure_category"),
+                reused_from_run_id=outcome.get("reused_from_run_id"),
+                reused_from_task_id=outcome.get("reused_from_task_id"),
+                cache_entry_id=outcome.get("cache_entry_id"),
+                input_fingerprint=outcome.get("input_fingerprint"),
+                result_fingerprint=outcome.get("result_fingerprint"))
+        work_store.finish_run(run_id, "SUCCEEDED" if len(results) == len(plan["nodes"]) and all(
+            orchestration_store.is_task_success(r.get("status")) for r in results.values()) else "FAILED",
+            used_ai_calls=budget["used"], final_head=repo_state(repo_root)["head"],
+            failure_category=report.get("error"))
+        work_store.close()
         if owns_store and store is not None:
             store.close()
     report["nodes"] = results
@@ -1125,7 +1273,8 @@ def _run_node(node, deps, results, backend, resolution, *, state_dir, record_evi
               infra_retries, same_tier_retries, surface, budget, enforce_read_only,
               repo_root, candidates=None, backends=None, health=None,
               constraints=None, attempts=None, context_manifests=None,
-              dependency_summaries=None, prebuilt_context=None) -> dict[str, Any]:
+              dependency_summaries=None, prebuilt_context=None,
+              durable_store=None, claim=None, owner_run=None) -> dict[str, Any]:
     tier = node["routing"]["tier"]
     initial_tier = tier
     if enforce_read_only and node.get("intent") == "MUTATING":
@@ -1244,6 +1393,8 @@ def _run_node(node, deps, results, backend, resolution, *, state_dir, record_evi
             manifest = context_manifests.setdefault(node["task_id"], context_result["manifest"]
                                                     if context_result is not None else {})
             manifest["delivered_input_fingerprint"] = request["delivered_input_fingerprint"]
+        if durable_store is not None:
+            durable_store.launch(claim)  # durable intent before any possible external call
         budget["used"] += 1  # actual worker/model launch boundary
         launched = True
 
@@ -1263,8 +1414,14 @@ def _run_node(node, deps, results, backend, resolution, *, state_dir, record_evi
                 "is_fallback": current_backend.name != first_backend,
                 "completion_signal": None,
                 "simulated": getattr(current_backend, "mode", "SUPPORTED") == "SIMULATED",
+                "requested_model": (constraints or {}).get("prefer_model"),
             }
             attempts.append(attempt_row)
+            if durable_store is not None:
+                attempt_row["attempt_id"] = durable_store.record_attempt(owner_run, node["task_id"],
+                    **{k: attempt_row[k] for k in ("attempt_no", "backend", "provider", "model",
+                        "native_effort", "normalized_effort", "status", "required_tier", "required_effort",
+                        "failure_category", "is_retry", "is_fallback", "completion_signal")})
 
         def _settle_attempt(status_value: str, category_value: Optional[str],
                             result_value: Optional[dict[str, Any]] = None) -> None:
@@ -1276,6 +1433,11 @@ def _run_node(node, deps, results, backend, resolution, *, state_dir, record_evi
             attempt_row["failure_category"] = category_value
             if isinstance(result_value, dict):
                 attempt_row["completion_signal"] = result_value.get("completion_signal")
+                for field in ("actual_model", "actual_effort"):
+                    value = result_value.get(field)
+                    attempt_row[field] = value if isinstance(value, str) and not knowledge.learning.contains_secret_like(value) else None
+            if durable_store is not None:
+                durable_store.settle_attempt(attempt_row["attempt_id"], attempt_row)
 
         try:
             result = current_backend.execute(request)
@@ -1577,6 +1739,9 @@ def _finalize(node, result, status, category, initial_tier, final_tier, attempts
               "acceptance": acceptance_state,
               "acceptance_contract": result_cache.ACCEPTANCE_CONTRACT_VERSION,
               "summary": result.get("summary", ""), "decisions": result.get("decisions", []),
+              "resolved_model": (candidate or {}).get("model"),
+              "resolved_effort": (candidate or {}).get("native_variant"),
+              "actual_model": result.get("actual_model"), "actual_effort": result.get("actual_effort"),
               "files_changed": result.get("files_changed", []),
               "acceptance_results": result.get("acceptance_results", {}),
               "new_risk_signals": result.get("new_risk_signals", []),

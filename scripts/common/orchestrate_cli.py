@@ -99,7 +99,8 @@ def _constraints(args: argparse.Namespace) -> dict:
             "read_only": getattr(args, "read_only", False),
             "max_ai_calls": getattr(args, "max_ai_calls", None),
             "prefer_provider": getattr(args, "prefer_provider", None),
-            "prefer_model": getattr(args, "prefer_model", None)}
+            "prefer_model": getattr(args, "prefer_model", None),
+            "mutation_scope": getattr(args, "mutation_scope", None)}
 
 
 def cmd_plan(args: argparse.Namespace) -> int:
@@ -191,6 +192,8 @@ def _add_objective_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--min-tier", type=_tier, help="floor every node at this tier")
     parser.add_argument("--max-tier", type=_tier, help="cap nodes (never below a safety floor)")
     parser.add_argument("--local-only", action="store_true", help="prefer local/economical (cap BALANCED)")
+    parser.add_argument("--mutation-scope", choices=("workspace",),
+                        help="declare real mutations are bounded to the selected repository workspace")
     parser.add_argument("--no-premium", action="store_true", help="disallow MAX unless a floor requires it")
     parser.add_argument("--prefer-model", help="informational preference (no auto-switch in V0.1)")
     parser.add_argument("--prefer-provider", help="informational preference (no auto-switch in V0.1)")

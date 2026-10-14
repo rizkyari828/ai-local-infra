@@ -31,7 +31,7 @@ import learning  # scripts/common, on sys.path (secret guard)
 ROOT = infra.ROOT
 DB_SUBDIR = "orchestration"
 DB_FILENAME = "orchestration.db"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 BUSY_TIMEOUT_MS = 5000
 MAX_PAYLOAD = 2000  # bounded structured event payload
 
@@ -71,6 +71,8 @@ EVENT_TYPES = (
     "CALL_BUDGET_EXHAUSTED",
     # Result Cache + incremental DAG reuse (Layer 3).
     "CACHE_HIT", "CACHE_MISS", "CACHE_REJECTED", "TASK_REUSED", "CACHE_ENTRY_WRITTEN",
+    "ACTIVE_WORK_FOUND", "WAIT_STARTED", "WAIT_COMPLETED", "WAIT_REVALIDATION_FAILED",
+    "RESULT_ADOPTED", "WAIT_TIMEOUT", "CLAIM_ACQUIRED", "CLAIM_RECOVERED", "CLAIM_UNCERTAIN",
 )
 # Superset failure taxonomy (non-intelligence categories never imply model weakness).
 FAILURE_TAXONOMY = (
@@ -202,6 +204,27 @@ _MIGRATIONS: list[tuple[int, list[str]]] = [
         "ALTER TABLE runs ADD COLUMN entry_mode TEXT",
         "ALTER TABLE runs ADD COLUMN controller_ai_calls INTEGER",
     ]),
+    (4, [
+        "ALTER TABLE attempts ADD COLUMN requested_model TEXT",
+        "ALTER TABLE attempts ADD COLUMN requested_effort TEXT",
+        "ALTER TABLE attempts ADD COLUMN resolved_model TEXT",
+        "ALTER TABLE attempts ADD COLUMN resolved_effort TEXT",
+        "ALTER TABLE attempts ADD COLUMN actual_model TEXT",
+        "ALTER TABLE attempts ADD COLUMN actual_effort TEXT",
+        """CREATE TABLE active_work (
+            work_key TEXT PRIMARY KEY, version TEXT NOT NULL, workspace TEXT NOT NULL,
+            mode TEXT NOT NULL, owner_run TEXT NOT NULL, owner_task TEXT NOT NULL,
+            owner_pid INTEGER NOT NULL, generation INTEGER NOT NULL, token TEXT NOT NULL,
+            state TEXT NOT NULL, launch_intent INTEGER NOT NULL DEFAULT 0,
+            lease_until REAL NOT NULL, result_id TEXT)""",
+        "CREATE INDEX active_workspace ON active_work(workspace, state)",
+        """CREATE TABLE accepted_work (
+            result_id TEXT PRIMARY KEY, work_key TEXT NOT NULL, version TEXT NOT NULL,
+            generation INTEGER NOT NULL, token TEXT NOT NULL, result TEXT NOT NULL,
+            identity TEXT NOT NULL, owner_run TEXT NOT NULL, owner_task TEXT NOT NULL,
+            postcondition_verified INTEGER NOT NULL DEFAULT 0)""",
+        "CREATE INDEX accepted_work_key ON accepted_work(work_key)",
+    ]),
 ]
 
 
@@ -228,17 +251,17 @@ class OrchestrationStore:
 
     def _migrate(self) -> None:
         self.connection.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
-        current = self._version()
         for version, statements in _MIGRATIONS:
-            if version <= current:
-                continue
             try:
-                with self.connection:  # transaction: commits or rolls back atomically
+                self.connection.execute("BEGIN IMMEDIATE")
+                if version > self._version():
                     for statement in statements:
                         self.connection.execute(statement)
                     self.connection.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?)",
                                             (str(version),))
+                self.connection.commit()
             except sqlite3.DatabaseError as exc:
+                self.connection.rollback()
                 raise StoreError(f"migration {version} failed and rolled back: {exc}") from exc
 
     def _version(self) -> int:
@@ -398,13 +421,16 @@ class OrchestrationStore:
                  _clean(native_effort, "native_effort"), _clean(normalized_effort, "normalized_effort"),
                  status, _clean(failure_category, "failure_category"), 1 if is_retry else 0,
                  1 if is_fallback else 0, _clean(completion_signal, "completion_signal"),
-                 started_at or now, now, SCHEMA_VERSION))
+                 started_at or now, None if status == "LAUNCHED" else now, SCHEMA_VERSION))
+            if status == "LAUNCHED":
+                self.connection.execute("UPDATE runs SET used_ai_calls=COALESCE(used_ai_calls,0)+1 WHERE run_id=?",
+                                        (run_id,))
             self._event(run_id, "ATTEMPT_STARTED", task_id=task_id, attempt_id=attempt_id,
                         payload={"attempt_no": attempt_no, "backend": backend, "model": model})
             if status in ("SUCCESS",):
                 self._event(run_id, "ATTEMPT_SUCCEEDED", task_id=task_id, attempt_id=attempt_id,
                             payload={"normalized_effort": normalized_effort})
-            else:
+            elif status != "LAUNCHED":
                 self._event(run_id, "ATTEMPT_FAILED", task_id=task_id, attempt_id=attempt_id,
                             payload={"failure_category": failure_category})
             if is_fallback:
