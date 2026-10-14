@@ -211,8 +211,12 @@ class EscalationController:
     ) -> "EscalationController":
         runtime_config = config if config is not None else providers.load_runtime_config()
         policy = EscalationPolicy.from_config(runtime_config)
-        provider = fallback_provider if fallback_provider is not None else \
-            providers.build_provider(runtime_config, policy.fallback_provider)
+        if fallback_provider is not None:
+            provider = fallback_provider
+        else:
+            # A configured fallback is a real provider launch: machine policy binds here too.
+            runtime.require_machine_permission(policy.fallback_provider)
+            provider = providers.build_provider(runtime_config, policy.fallback_provider)
         return cls(policy, provider, limits=limits, span_output=span_output,
                    escalation_output=escalation_output, role=role,
                    record_spans=record_spans, record_telemetry=record_telemetry, clock=clock)

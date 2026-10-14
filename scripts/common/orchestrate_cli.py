@@ -53,12 +53,17 @@ def _local_health() -> tuple[failover.Health, dict[str, "execution.Backend"]]:
 
     Machine identity/policy come from the one authority, so a machine that only
     declares ``provider_availability.ollama: false`` (without the
-    ``local_inference`` marker) is also treated as prohibiting local inference.
+    ``local_inference`` marker) is also treated as prohibiting local inference, and an
+    invalid policy refuses before any probe instead of probing as "permitted".
     """
     config = discovery.load_config()
     providers = {name: set(spec.get("providers", [])) for name, spec in config.get("backends", {}).items()}
     binaries = {name: bool(shutil.which(name)) for name in providers}
-    policy = authority.machine_policy(dict(os.environ))
+    try:
+        policy = authority.machine_policy_or_fail()
+    except authority.AuthorityError as exc:
+        raise execution.ExecutionError(f"MACHINE_POLICY_INVALID: {exc}") from exc
+    codex_model, codex_error = authority.read_codex_model()
     ollama_models: set[str] | None = None
     if "ollama" not in policy["prohibited"]:
         try:
@@ -67,31 +72,11 @@ def _local_health() -> tuple[failover.Health, dict[str, "execution.Backend"]]:
         except (urllib.error.URLError, OSError, ValueError, KeyError):
             ollama_models = None  # unreachable -> UNKNOWN (never assumed available)
     health = failover.Health(binaries=binaries, providers=providers, ollama_models=ollama_models,
-                             codex_model=_codex_model(), local_inference=policy["local_inference"],
+                             codex_model=codex_model, codex_model_error=codex_error,
+                             local_inference=policy["local_inference"],
                              prohibited=policy["prohibited"])
     backends = {name: execution.CliBackend(name, name) for name in providers}
     return health, backends
-
-
-def _codex_model() -> str | None:
-    """Locally configured Codex model, read with a real TOML parse (no line scan)."""
-    model, _error = authority.read_codex_model()
-    return model
-
-
-def _machine_constraints(constraints: dict) -> dict:
-    """Bind the run's hard constraints to this machine's declared policy.
-
-    The policy is part of execution identity, so a run resolved while a provider
-    was prohibited cannot be resumed on a machine where it is permitted.
-    """
-    try:
-        policy = authority.machine_policy(dict(os.environ))
-    except authority.AuthorityError as exc:
-        raise execution.ExecutionError(f"MACHINE_POLICY_INVALID: {exc}") from exc
-    bound = dict(constraints)
-    bound["prohibited_providers"] = dict(policy["prohibited"])
-    return bound
 
 
 def _resolve_workspace(args: argparse.Namespace) -> dict:
@@ -154,7 +139,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         allow_dirty=args.allow_dirty, surface=args.surface, record_evidence=not args.no_evidence,
         resume=args.resume, read_only=args.read_only, max_ai_calls=args.max_ai_calls,
         backends=backends, health=(None if args.backend == "fake" else health),
-        constraints=_machine_constraints(_constraints(args)), cache=not args.no_cache,
+        constraints=_constraints(args), cache=not args.no_cache,
         force_refresh=args.refresh,
         explicit_model=bool(args.prefer_model or args.prefer_provider),
         entry_mode=entry_mode, controller_ai_calls=controller_ai_calls)

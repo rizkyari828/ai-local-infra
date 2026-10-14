@@ -83,9 +83,13 @@ def main() -> int:
         tool_engine = tool_runtime.ToolRuntime(
             args.workspace, span_output=args.span_output, role=args.role
         )
-    agent = runtime.AgentRuntime.from_config(
-        config, args.provider, span_output=args.span_output, role=args.role, tools=tool_engine
-    )
+    try:
+        agent = runtime.AgentRuntime.from_config(
+            config, args.provider, span_output=args.span_output, role=args.role, tools=tool_engine
+        )
+    except providers.ProviderError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
 
     if args.health:
         health = agent.health_check()
@@ -138,7 +142,12 @@ def main() -> int:
     )
     started_at = infra.utc_now()
     session = agent.open_session(task)
-    result = agent.run(task, session=session)
+    try:
+        result = agent.run(task, session=session)
+    except providers.ProviderError as exc:
+        # Includes machine-policy refusal at the inference boundary: no launch, clear message.
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
     outcome = None
     fallback = None
     if args.escalate:
@@ -148,7 +157,12 @@ def main() -> int:
             policy.mode = args.escalation_mode
         if args.hosted:
             policy.hosted_allowed = True
-        fallback = providers.build_provider(config, policy.fallback_provider)
+        try:
+            runtime.require_machine_permission(policy.fallback_provider)
+            fallback = providers.build_provider(config, policy.fallback_provider)
+        except providers.ProviderError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
         controller = escalation.EscalationController(
             policy, fallback, limits=agent.limits, span_output=args.span_output,
             escalation_output=args.escalation_output, role="teacher-cheap",

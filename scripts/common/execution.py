@@ -323,7 +323,8 @@ def backend_for(name: str, *, timeout: int = 300) -> Backend:
 def resolve_plan(plan: dict[str, Any], backend: Backend, surface: Optional[str] = None, *,
                  health: Optional[failover.Health] = None,
                  constraints: Optional[dict[str, Any]] = None,
-                 backends: Optional[dict[str, Backend]] = None) -> list[dict[str, Any]]:
+                 backends: Optional[dict[str, Backend]] = None,
+                 enforce_machine_policy: bool = True) -> list[dict[str, Any]]:
     resolutions = []
     for node in plan["nodes"]:
         if node.get("executor") == "TOOL_ONLY":
@@ -341,7 +342,8 @@ def resolve_plan(plan: dict[str, Any], backend: Backend, surface: Optional[str] 
             capability = None
             if surface:
                 capability = discovery.capability(resolution["provider"], resolution["model"], surface)["status"]
-            blocked = failover.policy_block(resolution["provider"], tier, constraints)
+            blocked = failover.policy_block(resolution["provider"], tier, constraints,
+                                            enforce_machine_policy=enforce_machine_policy)
             runnable = (bool(backend.available() and resolution["model"]) or backend.name == "fake") \
                 and blocked is None
             resolved.update({"task_id": node["task_id"], "tier": tier, "capability_status": capability,
@@ -351,11 +353,21 @@ def resolve_plan(plan: dict[str, Any], backend: Backend, surface: Optional[str] 
             continue
         # Runtime-availability-aware, capability-preserving candidate resolution.
         specs = failover.candidates_for_tier(tier)
-        candidates = failover.resolve(tier, effort, specs, health, constraints=constraints)
+        candidates = failover.resolve(tier, effort, specs, health, constraints=constraints,
+                                      enforce_machine_policy=enforce_machine_policy)
         selected = failover.select(candidates)
         # Post-resolution hard-policy check: the shared authority, not the path, decides.
-        blocked = failover.policy_block(selected["provider"], selected["tier"], constraints) if selected else None
+        blocked = failover.policy_block(selected["provider"], selected["tier"], constraints,
+                                        enforce_machine_policy=enforce_machine_policy) if selected else None
         runnable = bool(selected and not blocked and (backends is None or selected["backend"] in backends))
+        reason = blocked
+        if not runnable and not reason:
+            # Report the authoritative reason when machine policy is what left this tier
+            # with nothing runnable, instead of a generic fallback message.
+            reason = next((entry for candidate in candidates for entry in candidate.get("blocking", ())
+                           if entry in (failover.NOT_CONFIGURED_BY_MACHINE_POLICY,
+                                        failover.PROHIBITED_BY_MACHINE_POLICY)), None) \
+                or "NO_CAPABILITY_PRESERVING_FALLBACK"
         resolutions.append({
             "task_id": node["task_id"], "tier": tier, "effort": effort, "candidates": candidates,
             "backend": selected["backend"] if selected else None,
@@ -364,7 +376,7 @@ def resolve_plan(plan: dict[str, Any], backend: Backend, surface: Optional[str] 
             "native_variant": selected.get("native_variant") if selected else None,
             "capability_status": selected["status"] if selected else None,
             "runnable": runnable,
-            "reason": (blocked or "NO_CAPABILITY_PRESERVING_FALLBACK") if not runnable else None,
+            "reason": reason if not runnable else None,
         })
     return resolutions
 
@@ -428,6 +440,36 @@ def _worktree_fingerprint(root: pathlib.Path) -> str:
     return digest.hexdigest()
 
 
+def bind_machine_policy(constraints: Optional[dict[str, Any]]) -> dict[str, Any]:
+    """Effective execution constraints = caller constraints + authoritative machine policy.
+
+    Hard machine policy must not depend on a caller remembering to attach it, so it is
+    composed here for EVERY execution that goes through this boundary. It is applied
+    unconditionally (never conditioned on the adapter) so the run's policy identity is
+    stable and a resume can never see a different authority than the original attempt.
+    Whether a machine prohibition also *blocks* a candidate is decided separately, by
+    :func:`launch_capable` plus ``enforce_machine_policy``.
+    """
+    try:
+        return authority.bind_constraints(constraints)
+    except authority.AuthorityError as exc:
+        raise ExecutionError(str(exc)) from exc
+
+
+def launch_capable(backend: Optional["Backend"], backends: Optional[dict[str, "Backend"]] = None) -> bool:
+    """Can this execution actually reach a provider?
+
+    A registry containing an adapter that declares itself SUPPORTED can perform a real
+    worker launch, so a machine prohibition must block it. A registry of only pretend
+    adapters (SIMULATED fake, or the abstract UNSUPPORTED base) cannot, so a symbolic
+    provider name on a node is not a launch to authorize.
+    """
+    registry = dict(backends or {})
+    if backend is not None:
+        registry.setdefault(backend.name, backend)
+    return any(getattr(adapter, "mode", "UNSUPPORTED") == "SUPPORTED" for adapter in registry.values())
+
+
 def workspace_root(root: Optional[pathlib.Path] = None) -> pathlib.Path:
     """Resolve ONE explicit workspace root used for Git, context, tools and cwd.
 
@@ -467,6 +509,11 @@ def execute_plan(plan: dict[str, Any], *, backend: Backend, run_id: Optional[str
     if not confirm and not dry_run:
         raise ExecutionError("execution requires --confirm (or use --dry-run)")
     repo_root = workspace_root(repo_root)
+    # Hard machine policy binds at THIS boundary, not at the caller: a programmatic
+    # entrypoint (lifecycle.run_direct, Direct Mode, any library caller) cannot bypass a
+    # machine prohibition by omitting it. It is applied before resolution, resume
+    # identity, cache eligibility, and any launch.
+    constraints = bind_machine_policy(constraints)
     tool_executor = tool_executor or deterministic.ToolExecutor(root=repo_root)
     state = repo_state(repo_root)
     enforce_read_only = read_only or plan.get("intent") == "READ_ONLY"
@@ -474,7 +521,8 @@ def execute_plan(plan: dict[str, Any], *, backend: Backend, run_id: Optional[str
     if backend is not None:
         backend_registry.setdefault(backend.name, backend)
     bindings = resolve_plan(plan, backend, surface, health=health, constraints=constraints,
-                            backends=backend_registry)
+                            backends=backend_registry,
+                            enforce_machine_policy=launch_capable(backend, backends))
     bounds = call_bounds(plan, infra_retries=infra_retries, same_tier_retries=same_tier_retries)
 
     report: dict[str, Any] = {"run_id": run_id, "backend": backend.name, "dry_run": dry_run,

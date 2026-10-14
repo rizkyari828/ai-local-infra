@@ -38,9 +38,13 @@ UNKNOWN = "UNKNOWN"
 # one authority model in scripts/common/authority.py.
 NOT_CONFIGURED_BY_MACHINE_POLICY = authority.NOT_CONFIGURED_BY_MACHINE_POLICY
 PROHIBITED_BY_MACHINE_POLICY = authority.PROHIBITED
+# A locally configured model whose configuration cannot be read exactly is not the
+# same as "no model configured": the invalid state is reported, never inferred away.
+MODEL_CONFIG_INVALID = "MODEL_CONFIG_INVALID"
 RUNTIME_STATUSES = (BACKEND_HEALTHY, BACKEND_UNAVAILABLE, PROVIDER_UNAVAILABLE, MODEL_UNAVAILABLE,
                     ACCOUNT_MODEL_UNSUPPORTED, TEMPORARILY_RATE_LIMITED, UNKNOWN,
-                    NOT_CONFIGURED_BY_MACHINE_POLICY, PROHIBITED_BY_MACHINE_POLICY)
+                    NOT_CONFIGURED_BY_MACHINE_POLICY, PROHIBITED_BY_MACHINE_POLICY,
+                    MODEL_CONFIG_INVALID)
 
 # Failures that justify capability-preserving backend failover (not intelligence).
 FAILOVER_REASONS = ("RATE_LIMIT", "PROVIDER_503", "TIMEOUT", "ACCOUNT_MODEL_UNSUPPORTED",
@@ -71,6 +75,8 @@ class Health:
     prohibited:    provider -> hard machine-policy reason. Config-owned and checked
                    BEFORE any observation, so availability can never authorize a
                    provider the machine prohibits.
+    codex_model_error: explicit error reading the local Codex model configuration.
+                   Reported as MODEL_CONFIG_INVALID, never collapsed into "unset".
     """
 
     def __init__(self, *, binaries: Optional[dict[str, bool]] = None,
@@ -80,11 +86,13 @@ class Health:
                  unavailable: Optional[dict[str, str]] = None,
                  tripped: Optional[set[str]] = None,
                  local_inference: Optional[str] = None,
-                 prohibited: Optional[dict[str, str]] = None) -> None:
+                 prohibited: Optional[dict[str, str]] = None,
+                 codex_model_error: Optional[str] = None) -> None:
         self.binaries = dict(binaries or {})
         self.providers = {k: set(v) for k, v in (providers or {}).items()}
         self.ollama_models = set(ollama_models) if ollama_models is not None else None
         self.codex_model = codex_model
+        self.codex_model_error = codex_model_error
         self.unavailable = dict(unavailable or {})
         self.tripped = set(tripped or ())
         self.local_inference = local_inference
@@ -116,8 +124,11 @@ class Health:
                 return UNKNOWN
             if candidate.get("model") and candidate["model"] not in self.ollama_models:
                 return MODEL_UNAVAILABLE
-        if candidate["provider"] == "codex" and self.codex_model is None:
-            return UNKNOWN
+        if candidate["provider"] == "codex":
+            if self.codex_model_error:
+                return MODEL_CONFIG_INVALID
+            if self.codex_model is None:
+                return UNKNOWN
         return BACKEND_HEALTHY
 
     def is_tripped(self, candidate: dict[str, Any]) -> bool:
@@ -132,17 +143,21 @@ class Health:
 
 
 def policy_block(provider: Optional[str], tier: Optional[str],
-                 constraints: Optional[dict[str, Any]]) -> Optional[str]:
+                 constraints: Optional[dict[str, Any]],
+                 *, enforce_machine_policy: bool = True) -> Optional[str]:
     """ONE shared hard-policy authority every resolved candidate must pass, regardless of
     resolution path (health-aware, alternate, fallback or resume). A hard constraint that
     cannot be satisfied fails resolution clearly instead of leaking a remote candidate.
 
     A machine-policy prohibition is checked first and cannot be lifted by an explicit
-    invocation, a machine-local preference, or a healthy observation."""
+    invocation, a machine-local preference, or a healthy observation.
+    ``enforce_machine_policy`` is False only when no adapter in the run can reach a
+    provider, so there is no launch to authorize (see execution.launch_capable)."""
     constraints = constraints or {}
-    prohibited = constraints.get("prohibited_providers") or {}
-    if provider in prohibited:
-        return prohibited[provider] or "prohibited_by_machine_policy"
+    if enforce_machine_policy:
+        prohibited = constraints.get("prohibited_providers") or {}
+        if provider in prohibited:
+            return prohibited[provider] or "prohibited_by_machine_policy"
     if constraints.get("local_only") and provider != "ollama":
         return "local_only"
     if constraints.get("no_premium") and tier == "MAX":
@@ -151,7 +166,8 @@ def policy_block(provider: Optional[str], tier: Optional[str],
 
 
 def resolve(required_tier: str, required_effort: str, specs: list[dict[str, Any]],
-            health: Health, *, constraints: Optional[dict[str, Any]] = None) -> list[dict[str, Any]]:
+            health: Health, *, constraints: Optional[dict[str, Any]] = None,
+            enforce_machine_policy: bool = True) -> list[dict[str, Any]]:
     """Annotate candidate specs. Runnable = capability-preserving + healthy + not tripped
     + satisfies user constraints. Registry presence alone never makes a candidate runnable.
     """
@@ -185,7 +201,8 @@ def resolve(required_tier: str, required_effort: str, specs: list[dict[str, Any]
             blocking.append("below_effort_floor")
         if health.is_tripped(candidate):
             blocking.append("cooldown")
-        block = policy_block(candidate["provider"], candidate["tier"], constraints)
+        block = policy_block(candidate["provider"], candidate["tier"], constraints,
+                             enforce_machine_policy=enforce_machine_policy)
         if block:
             blocking.append(block)
         if candidate["status"] != BACKEND_HEALTHY:
