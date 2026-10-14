@@ -36,6 +36,7 @@ import uuid
 from typing import Any
 
 import infra  # scripts/common, on sys.path
+import authority  # scripts/common, on sys.path
 import secret_guard as secret_scan
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -219,18 +220,15 @@ def _sanitize_identity(identity: Any) -> Any:
 
 
 def compute_repository() -> dict[str, Any]:
-    """Stable repository identity: remote when available, else the repo name.
+    """Stable repository identity, from the one canonical contract.
 
-    Absolute paths differ per machine and are diagnostics only; identity never
-    depends on path equality.
+    Identity never depends on path spelling or a bare directory name
+    (scripts/common/authority.py): a sanitized remote URL when present, else a hash
+    of the canonical common git directory.
     """
-    toplevel = _git("rev-parse", "--show-toplevel") or str(ROOT)
-    name = pathlib.Path(toplevel).name
-    remote = sanitize_remote(_git("config", "--get", "remote.origin.url"))
-    head = _git("rev-parse", "HEAD")
-    identity = f"remote:{remote}" if remote else f"name:{name}"
-    return {"name": name, "identity": identity, "root": str(pathlib.Path(toplevel).resolve()),
-            "head": head, "remote": remote}
+    identity = authority.repository_identity(ROOT)
+    return {"name": identity["name"], "identity": identity["id"], "root": identity["root"],
+            "head": identity["head"], "remote": identity["remote"]}
 
 
 @functools.lru_cache(maxsize=8)

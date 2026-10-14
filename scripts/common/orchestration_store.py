@@ -25,6 +25,7 @@ import uuid
 from typing import Any, Optional
 
 import infra  # scripts/common, on sys.path
+import authority  # scripts/common, on sys.path
 import learning  # scripts/common, on sys.path (secret guard)
 
 ROOT = infra.ROOT
@@ -525,22 +526,15 @@ class OrchestrationStore:
 
 
 def repository_identity(root: Optional[pathlib.Path] = None) -> dict[str, str]:
-    """Stable project identity independent of absolute local path."""
-    root = pathlib.Path(root or ROOT)
+    """Stable project identity independent of absolute local path.
 
-    def git(*args: str) -> Optional[str]:
-        try:
-            result = subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True, text=True)
-        except (OSError, subprocess.CalledProcessError):
-            return None
-        return result.stdout.strip() or None
-
-    remote = git("config", "--get", "remote.origin.url")
-    from bootstrap import sanitize_remote  # reuse existing sanitizer
-    clean_remote = sanitize_remote(remote) if remote else None
-    name = pathlib.Path(git("rev-parse", "--show-toplevel") or str(root)).name
-    identity = f"remote:{clean_remote}" if clean_remote else f"name:{name}"
-    return {"repository_id": identity, "name": name}
+    Delegates to the ONE canonical identity contract (scripts/common/authority.py) so
+    cache/reuse/resume identity cannot drift from workspace authority: a sanitized
+    remote URL when present, else a hash of the canonical common git directory. A bare
+    directory name is never identity.
+    """
+    identity = authority.repository_identity(pathlib.Path(root or ROOT))
+    return {"repository_id": identity["id"], "name": identity["name"]}
 
 
 def persist_run(plan: dict[str, Any], report: dict[str, Any], *, machine_id: str,
