@@ -9,6 +9,11 @@ they never send a completion request and never consume the AI-call budget.
 Infrastructure failures (rate limit/503/timeout/unavailable/account-unsupported)
 fail over to an equivalent-or-stronger candidate; REASONING_INSUFFICIENT is handled
 by intelligence escalation, not failover.
+
+Hard machine policy (a provider the machine forbids) is NOT a health state: it is
+checked before any observation in ``Health.status`` and ``policy_block``, so a
+discovered binary or a reachable endpoint can never authorize a prohibited provider.
+See scripts/common/authority.py.
 """
 
 from __future__ import annotations
@@ -16,6 +21,7 @@ from __future__ import annotations
 import pathlib
 from typing import Any, Optional
 
+import authority  # scripts/common, on sys.path
 import infra  # scripts/common, on sys.path
 import routing  # scripts/common, on sys.path
 import discovery  # scripts/common, on sys.path
@@ -28,10 +34,13 @@ MODEL_UNAVAILABLE = "MODEL_UNAVAILABLE"
 ACCOUNT_MODEL_UNSUPPORTED = "ACCOUNT_MODEL_UNSUPPORTED"
 TEMPORARILY_RATE_LIMITED = "TEMPORARILY_RATE_LIMITED"
 UNKNOWN = "UNKNOWN"
-NOT_CONFIGURED_BY_MACHINE_POLICY = "NOT_CONFIGURED_BY_MACHINE_POLICY"
+# Hard machine policy (config-owned, never inferred) shares the vocabulary of the
+# one authority model in scripts/common/authority.py.
+NOT_CONFIGURED_BY_MACHINE_POLICY = authority.NOT_CONFIGURED_BY_MACHINE_POLICY
+PROHIBITED_BY_MACHINE_POLICY = authority.PROHIBITED
 RUNTIME_STATUSES = (BACKEND_HEALTHY, BACKEND_UNAVAILABLE, PROVIDER_UNAVAILABLE, MODEL_UNAVAILABLE,
                     ACCOUNT_MODEL_UNSUPPORTED, TEMPORARILY_RATE_LIMITED, UNKNOWN,
-                    NOT_CONFIGURED_BY_MACHINE_POLICY)
+                    NOT_CONFIGURED_BY_MACHINE_POLICY, PROHIBITED_BY_MACHINE_POLICY)
 
 # Failures that justify capability-preserving backend failover (not intelligence).
 FAILOVER_REASONS = ("RATE_LIMIT", "PROVIDER_503", "TIMEOUT", "ACCOUNT_MODEL_UNSUPPORTED",
@@ -58,6 +67,10 @@ class Health:
     codex_model:   locally configured Codex model (None = unknown)
     unavailable:   backend or "backend:provider" -> runtime status (explicit override)
     tripped:       per-run cooldown set of "backend" or "backend:provider" keys
+    local_inference: machine policy for local inference (NOT_CONFIGURED_BY_MACHINE_POLICY)
+    prohibited:    provider -> hard machine-policy reason. Config-owned and checked
+                   BEFORE any observation, so availability can never authorize a
+                   provider the machine prohibits.
     """
 
     def __init__(self, *, binaries: Optional[dict[str, bool]] = None,
@@ -66,7 +79,8 @@ class Health:
                  codex_model: Optional[str] = None,
                  unavailable: Optional[dict[str, str]] = None,
                  tripped: Optional[set[str]] = None,
-                 local_inference: Optional[str] = None) -> None:
+                 local_inference: Optional[str] = None,
+                 prohibited: Optional[dict[str, str]] = None) -> None:
         self.binaries = dict(binaries or {})
         self.providers = {k: set(v) for k, v in (providers or {}).items()}
         self.ollama_models = set(ollama_models) if ollama_models is not None else None
@@ -74,12 +88,21 @@ class Health:
         self.unavailable = dict(unavailable or {})
         self.tripped = set(tripped or ())
         self.local_inference = local_inference
+        self.prohibited = dict(prohibited or {})
+        if local_inference == NOT_CONFIGURED_BY_MACHINE_POLICY:
+            self.prohibited.setdefault("ollama", NOT_CONFIGURED_BY_MACHINE_POLICY)
 
     def _override(self, candidate: dict[str, Any]) -> Optional[str]:
         backend, provider = candidate["backend"], candidate["provider"]
         return self.unavailable.get(f"{backend}:{provider}") or self.unavailable.get(backend)
 
     def status(self, candidate: dict[str, Any]) -> str:
+        # Hard policy first: a machine prohibition is not a health observation and
+        # cannot be contradicted by a discovered binary, a reachable endpoint, or a
+        # model that happens to be installed.
+        prohibited = self.prohibited.get(candidate["provider"])
+        if prohibited:
+            return prohibited
         override = self._override(candidate)
         if override:
             return override
@@ -88,9 +111,6 @@ class Health:
         served = self.providers.get(candidate["backend"])
         if served is not None and candidate["provider"] not in served:
             return PROVIDER_UNAVAILABLE
-        if candidate["provider"] == "ollama" and self.local_inference == NOT_CONFIGURED_BY_MACHINE_POLICY:
-            # Machine policy: local inference intentionally disabled (not a failure).
-            return NOT_CONFIGURED_BY_MACHINE_POLICY
         if candidate["provider"] == "ollama":
             if self.ollama_models is None:
                 return UNKNOWN
@@ -115,8 +135,14 @@ def policy_block(provider: Optional[str], tier: Optional[str],
                  constraints: Optional[dict[str, Any]]) -> Optional[str]:
     """ONE shared hard-policy authority every resolved candidate must pass, regardless of
     resolution path (health-aware, alternate, fallback or resume). A hard constraint that
-    cannot be satisfied fails resolution clearly instead of leaking a remote candidate."""
+    cannot be satisfied fails resolution clearly instead of leaking a remote candidate.
+
+    A machine-policy prohibition is checked first and cannot be lifted by an explicit
+    invocation, a machine-local preference, or a healthy observation."""
     constraints = constraints or {}
+    prohibited = constraints.get("prohibited_providers") or {}
+    if provider in prohibited:
+        return prohibited[provider] or "prohibited_by_machine_policy"
     if constraints.get("local_only") and provider != "ollama":
         return "local_only"
     if constraints.get("no_premium") and tier == "MAX":
