@@ -33,12 +33,20 @@
   [Provider usage and cache telemetry](CACHE_TELEMETRY.md). `import-opencode-stats`
   imports OpenCode's own aggregate stats into the same vocabulary without a plugin,
   database access, or auth change.
-- One compact task outcome row per completed task aggregates the runtime result and
-  any escalation (success, initial/final provider/model/variant, attempts, latency,
+- One compact task outcome row per completed task aggregates the runtime result and  any escalation (success, initial/final provider/model/variant, attempts, latency,
   and estimated cost) into `telemetry/outcomes/runs.jsonl`, with a read-only
   `task-outcomes` report. One-shot `oc run` executions append a row too, but keep
   `success = null`: OpenCode exposes execution status, not semantic task success.
   See [Runtime observability](RUNTIME_OBSERVABILITY.md).
+
+- One effective runtime authority model separates HARD machine policy (a provider
+  the machine forbids, never liftable by a CLI flag, a machine-local file, or a
+  healthy observation) from OVERRIDABLE defaults (explicit -> machine-local ->
+  portable), treats runtime discovery as evidence that may only narrow
+  eligibility, and resolves the active workspace with explicit provenance. Runtime
+  execution, routing, Doctor, `verify-environment`, and bootstrap all read their
+  authoritative state from it instead of re-deriving it. See
+  [Runtime authority](RUNTIME_AUTHORITY.md).
 
 No server process exists. Commands are short-lived and state is inspectable. Active application files remain at `~/.qwen/settings.json` and `/etc/systemd/system/ollama.service.d/override.conf`; no symlinks are used.
 
