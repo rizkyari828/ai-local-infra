@@ -362,11 +362,19 @@ def _digest(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8", "replace")).hexdigest()[:24]
 
 
-def _absolute(base: pathlib.Path, value: Optional[str]) -> Optional[pathlib.Path]:
+def _git_path(context: pathlib.Path, value: Optional[str]) -> Optional[pathlib.Path]:
+    """Resolve one path Git reported, in the context the Git command ran in.
+
+    Git reports a *relative* ``--git-dir``/``--git-common-dir`` relative to the
+    directory the command ran in (the ``-C``/cwd context), **not** the repository
+    toplevel: from ``pkg/src`` a normal repository reports ``../../.git``. Resolving
+    that against the toplevel would collapse unrelated repositories onto one
+    identity, so the invocation context is the base. Absolute output is used as-is.
+    """
     if not value:
         return None
     path = pathlib.Path(value)
-    return (path if path.is_absolute() else base / path).resolve()
+    return (path if path.is_absolute() else context / path).resolve()
 
 
 def repository_identity(root: Any) -> dict[str, Any]:
@@ -385,15 +393,17 @@ def repository_identity(root: Any) -> dict[str, Any]:
 
     ``workspace_instance`` distinguishes the mutable workspace (a linked worktree
     has its own git dir) while ``id`` stays shared across worktrees of one
-    repository.
+    repository. Identity never depends on how deep inside the same repository the
+    caller invoked Git (root, nested directory, symlink or ``./`` spelling all
+    resolve to one identity).
     """
     root = pathlib.Path(root)
     toplevel = _git_in(root, "rev-parse", "--show-toplevel")
     if toplevel:
         base = pathlib.Path(toplevel).resolve()
         remote = sanitize_remote(_git_in(root, "config", "--get", "remote.origin.url"))
-        common = _absolute(base, _git_in(root, "rev-parse", "--git-common-dir"))
-        git_dir = _absolute(base, _git_in(root, "rev-parse", "--git-dir"))
+        common = _git_path(root, _git_in(root, "rev-parse", "--git-common-dir"))
+        git_dir = _git_path(root, _git_in(root, "rev-parse", "--git-dir"))
         head = _git_in(root, "rev-parse", "HEAD")
         if remote:
             identity, kind, portable = f"remote:{remote}", "remote", True

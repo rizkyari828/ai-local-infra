@@ -137,7 +137,11 @@ cache/resume identity (`project_id`), and bootstrap's graph manifest.
   collision-free: two unrelated repositories are distinct even when they share a
   directory name, the same tree, and the same HEAD. A shared basename is never
   proof of equivalence, and identity never depends on HEAD, so it survives
-  ordinary commits, path spelling, and symlink aliases.
+  ordinary commits, path spelling, and symlink aliases. Git reports a *relative*
+  metadata path relative to the directory its command ran in, so the common
+  directory is resolved in that Git invocation context: identity is identical
+  whether the caller runs at the repository root, a nested subdirectory, or
+  through a symlink.
 - A non-Git workspace uses a hash of its canonical path (`path:<hash>`,
   `portable: false`). Consumers must treat that as machine-local and must not
   fabricate cross-machine equivalence from it.
