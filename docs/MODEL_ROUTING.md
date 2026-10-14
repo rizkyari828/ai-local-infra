@@ -1,5 +1,11 @@
 # Model routing
 
+Explicit orchestration execution requests now have a separate exact routing contract;
+see [Exact orchestration routing V0.1](ORCHESTRATION_ROUTING_FIX.md). Symbolic
+recommendation floors below remain unchanged. Exact requests never silently replace
+their model/provider/native effort, and configured effort is separate from observed
+actual execution evidence.
+
 Logical roles for the teacher/student loop live in [`../models/roles.yaml`](../models/roles.yaml):
 `student` (local Qwen), `teacher-cheap` (hosted DeepSeek), and `teacher-premium`
 (hosted Codex). They describe intent and escalation order. A single bounded,
