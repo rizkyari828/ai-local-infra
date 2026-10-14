@@ -31,24 +31,26 @@ def version(command: list[str]) -> str:
     return text[0] if result.returncode == 0 and text else "UNAVAILABLE"
 
 
-def machine_local_inference_policy() -> str | None:
-    """Machine-declared local inference policy (None = permitted/unknown machine).
+def machine_policy() -> dict:
+    """The ONE canonical machine policy for this checkout (scripts/common/authority.py).
 
-    A machine that explicitly disables local inference (``local_inference`` or
-    ``provider_availability.ollama: false``) intentionally has no Ollama runtime, so
-    the health probe is skipped rather than reported as an environment failure.
-
-    This delegates to the ONE authority model (scripts/common/authority.py), which
-    reads the committed descriptor directly: a machine-local file may override a
-    preference but never a hard prohibition. Machine identity is ``LAI_MACHINE``
-    when set; otherwise the descriptor whose declared ``repo_path`` is this exact
-    repository (never guessed, only matched).
+    Reads the committed descriptor directly: a machine-local file may override a
+    preference but never a hard prohibition. Machine identity is ``LAI_MACHINE`` when
+    set; otherwise the descriptor whose declared ``repo_path`` is this exact
+    repository (never guessed, only matched). Never raises: the resolved state is
+    reported, and INVALID states are reported as INVALID rather than as permitted.
     """
-    try:
-        return authority.machine_policy(dict(os.environ)).get("local_inference")
-    except authority.AuthorityError as exc:
-        print(f"WARN machine policy unreadable: {exc}", file=sys.stderr)
-        return None
+    return authority.machine_policy(dict(os.environ))
+
+
+def machine_local_inference_policy() -> str | None:
+    """Canonical local-inference state, or None when the machine does not prohibit it.
+
+    ``None`` means "not prohibited" only. An INVALID policy also reports ``None`` here,
+    so callers that must not confuse the two read :func:`machine_policy` and its
+    ``state`` (main() does).
+    """
+    return machine_policy().get("local_inference")
 
 
 def main() -> int:
@@ -75,20 +77,32 @@ def main() -> int:
         print("PASS limits config/limits.yaml")
     except infra.InfraError as exc:
         failures.append(str(exc))
-    policy = machine_local_inference_policy()
+    policy = machine_policy()
+    state = policy["state"]
+    invalid = state in authority.INVALID_POLICY_STATES
+    prohibited = state in authority.INVALID_POLICY_STATES or "ollama" in policy["prohibited"]
+    if invalid:
+        # An unresolvable authority is not a permission: never probe, never ready.
+        failures.append(f"MACHINE_POLICY_INVALID ({state}): {policy['error']}")
     tools = {
         "python": ["python3", "--version"],
         "qwen": ["qwen", "--version"], "node": ["node", "--version"], "npm": ["npm", "--version"],
         "dotnet": ["dotnet", "--version"],
     }
-    if policy != NOT_CONFIGURED_BY_MACHINE_POLICY:
+    if not prohibited:
         tools["ollama"] = ["ollama", "--version"]
     for name, command in tools.items():
         print(f"{name}: {version(command)}")
-    if policy == NOT_CONFIGURED_BY_MACHINE_POLICY:
-        print(f"Ollama: {NOT_CONFIGURED_BY_MACHINE_POLICY}")
+    if invalid:
+        print(f"MACHINE POLICY: {state}")
+        print("Ollama health: SKIPPED_INVALID_MACHINE_POLICY")
+    elif "ollama" in policy["prohibited"]:
+        print(f"Ollama: {policy['prohibited']['ollama']}")
         print("Ollama health: SKIPPED_BY_POLICY")
     else:
+        if state == authority.GENUINELY_UNREGISTERED_MACHINE:
+            print(f"Ollama policy: {authority.NO_MACHINE_POLICY} "
+                  "(no registered machine declares this checkout)")
         try:
             with urllib.request.urlopen(OLLAMA_ENDPOINT, timeout=3) as response:
                 print(f"Ollama health: HTTP {response.status}")

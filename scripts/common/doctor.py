@@ -369,24 +369,33 @@ def _codex_mcp_checks(ctx: dict[str, Any]) -> list[Check]:
 def _authority_checks(ctx: dict[str, Any], env: dict[str, str]) -> list[Check]:
     """The machine's declared runtime policy, from the ONE authority model.
 
-    Doctor reports the same authoritative permitted/prohibited state that
-    verify-environment reports and the runtime resolver enforces. It never probes a
-    provider (availability is a runtime observation, not a readiness fact) and never
-    weakens a policy check.
+    Doctor reports the same authoritative permission state that verify-environment
+    reports and the runtime resolver enforces, keeping the states distinct: a valid
+    machine that prohibits, a genuinely unregistered machine, and an INVALID policy
+    are never collapsed into one another. It never probes a provider (availability is
+    a runtime observation, not a readiness fact).
     """
     try:
         policy = authority.machine_policy(env)
     except authority.AuthorityError as exc:
         return [Check("authority", "machine-policy", FAIL, f"machine policy unreadable: {exc}", "core")]
     machine_id = policy["machine_id"] or "unresolved"
+    policy_state = policy["state"]
+    if policy_state in authority.INVALID_POLICY_STATES:
+        return [Check("authority", "machine-policy", FAIL,
+                      f"machine policy invalid ({policy_state}): {policy['error']}", "core",
+                      observed=f"{machine_id}:{policy_state}")]
     if "ollama" in policy["prohibited"]:
-        state = policy["prohibited"]["ollama"]
+        observed = policy["prohibited"]["ollama"]
         reason = "local inference prohibited by machine policy; health probe skipped"
+    elif policy_state == authority.GENUINELY_UNREGISTERED_MACHINE:
+        observed = authority.NO_MACHINE_POLICY
+        reason = "no registered machine policy for this checkout; portable behavior applies"
     else:
-        state = authority.PERMITTED
+        observed = authority.PERMITTED
         reason = "local inference permitted by machine profile"
     return [Check("authority", "machine-policy", PASS, reason, "core",
-                  observed=f"{machine_id}:{state}")]
+                  observed=f"{machine_id}:{observed}")]
 
 
 def run(ctx: dict[str, Any], env: dict[str, str]) -> list[Check]:
