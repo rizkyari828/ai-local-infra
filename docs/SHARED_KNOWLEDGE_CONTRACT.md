@@ -50,7 +50,8 @@ source:<hash>       owner + repository identity + normalized locator + kind
 content:<hash>      the selected content (line endings normalized, nothing else)
 authority:<hash>    authority + review + lifecycle + supersession reference
 entry:<hash>        source + content + authority + requiredness + min_authority
-                    + declared revision + dependency fingerprints
+                    + requirement semantic scope + declared revision
+                    + the fingerprints of the whole dependency closure
 manifest:<hash>     contract/selector version + entry fingerprints + omissions/refusals
                     (key + reason) + scope
 delivered-content   the post-redaction delivered text
@@ -70,25 +71,51 @@ Rules this shape proves:
 | authority/review/lifecycle changes | revalidation; identity changes |
 | superseded/revoked | ineligible (refused when required, omitted when optional) |
 | declared `revision` changes | revalidates; an unrelated commit does not |
-| a dependency's content changes | the dependent entry's identity changes |
-| selection `reason` wording changes | identity unchanged (prose is not authority) |
-| `scope` changes | identity changes (different knowledge was requested) |
+| a dependency anywhere in the closure changes | the dependent entry's identity changes |
+| a dependency in the closure becomes unavailable/revoked/inapplicable | the dependent becomes unavailable, transitively |
+| requirement semantic `scope` changes (`api:payments` ≠ `api:refunds`) | `entry` → `manifest` → `delivered-identity` change |
+| document `scope` changes | identity changes (different knowledge was requested) |
+| selection prose (`reason`) wording changes | identity unchanged (prose is not authority) |
 | redaction removes a required semantic tag | refusal (`redaction_insufficient`) |
+
+## Dependency closure
+
+A source may satisfy a requirement only when **its entire declared dependency
+closure is available, valid and acyclic**:
+
+- an unavailable dependency (missing, invalid, revoked, superseded, inapplicable,
+  or itself withdrawn) withdraws every affected ancestor, transitively;
+- a required ancestor that is withdrawn refuses the whole selection
+  (`REQUIRED_CONTEXT_UNAVAILABLE`); an optional ancestor is omitted with the same
+  inspectable reason;
+- dependency cycles can never be satisfied and fail safely as explicit
+  `dependency_cycle` failures, never as a silent `READY`;
+- a dependency that exists but is not itself selected does **not** satisfy the
+  dependent: surviving validation, not mere existence, is what counts;
+- `dependency_fingerprints` covers the whole closure, so a change anywhere in it
+  revalidates the dependent entry.
 
 ## Refusal
 
 Any failure affecting **required** knowledge yields the outcome
 `REQUIRED_CONTEXT_UNAVAILABLE`; nothing partial is delivered silently. Reasons:
 `missing`, `superseded`, `revoked`, `authority_incompatible`, `unreviewed`,
-`missing_content`, `redaction_insufficient`, `dependency_unavailable`, plus
-document-level `permission_grant_rejected`, `unknown_field`, `invalid`,
-`duplicate_key`, `unsupported_contract_version`, `invalid_document`.
+`missing_content`, `redaction_insufficient`, `dependency_unavailable`,
+`dependency_cycle`, plus document-level `permission_grant_rejected`,
+`unknown_field`, `invalid`, `duplicate_key`, `unsupported_contract_version`,
+`invalid_document`.
 
 Optional sources are omitted deterministically with an inspectable reason
-(`omissions[]`). **Applicability is a scope decision, not an availability
-failure**: a requirement or source whose declared applicability does not match the
-context is recorded as an omission (`reason: not_applicable`, `level:
-requirement|source`) and never quietly rescues or drops required context.
+(`omissions[]`).
+
+**Applicability has two distinct levels and they are never conflated:**
+
+| case | meaning | outcome |
+|---|---|---|
+| the *requirement* does not apply to this context | the obligation does not exist for this task | deterministic non-selection (recorded omission, `level: requirement`) |
+| the requirement applies but the *source* does not | the obligation exists and cannot be satisfied | **refusal** when required, omission when optional (`reason: not_applicable`, `level: source`) |
+
+An omission is never a silent substitute for an obligation.
 
 ## Task identity vs delivered knowledge identity
 
@@ -120,8 +147,12 @@ accepted with. It changes no production cache/resume behaviour.
 `semantic_parity` compares two agents' requests. Prompt wrapper text and agent
 branding live **outside** the contract document; a document that carries them is
 invalid, so branding can never silently alter authoritative knowledge identity.
-Codex and OpenCode must therefore produce the same `delivered_identity` for
-equivalent requirements. Guidance that is loaded automatically and materially
+The descriptive `reason` is excluded at **both** levels (document and
+requirement), so two agents that phrase the same requirement differently still
+produce one authoritative identity, while every authority-bearing field —
+repository, source, requirement key, requiredness, minimum authority,
+applicability and semantic scope — is compared. Codex and OpenCode must therefore
+produce the same `delivered_identity` for equivalent requirements. Guidance that is loaded automatically and materially
 affects execution is expected to participate in effective input identity in a
 later phase; V0.1 only defines the requirement.
 
@@ -139,6 +170,13 @@ review/applicability change · F8 redaction insufficiency · F9 path alias · F1
 unrelated repository, same locator · F11 knowledge change while waiting · F12
 Codex/OpenCode parity · F13 knowledge cannot grant permission, plus `REUSE`
 (accepted K1 vs current K2 ⇒ not reusable).
+
+Fix Pass 1 additions: the dependency matrix `D1`–`D7` (valid closure, transitive
+withdrawal of required and optional ancestors, revoked/superseded/inapplicable
+dependencies, cycles, closure-content and closure-authority invalidation) and the
+adversarial regressions `A1`–`A10` (transitive propagation, cycle safety,
+applicability obligation versus scope, requirement-scope identity, reason-wording
+parity, equivalence and reuse under a scope change), with scope fixtures `S1`–`S4`.
 
 ```bash
 python3 -m unittest tests.test_knowledge_contract

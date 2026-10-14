@@ -70,6 +70,7 @@ NOT_APPLICABLE = "not_applicable"
 REDACTION_INSUFFICIENT = "redaction_insufficient"
 MISSING_CONTENT = "missing_content"
 DEPENDENCY_UNAVAILABLE = "dependency_unavailable"
+DEPENDENCY_CYCLE = "dependency_cycle"
 PERMISSION_GRANT_REJECTED = "permission_grant_rejected"
 UNSUPPORTED_CONTRACT_VERSION = "unsupported_contract_version"
 DUPLICATE_KEY = "duplicate_key"
@@ -134,6 +135,23 @@ def normalize_locator(value: str) -> str:
     return "/".join(parts)
 
 
+def normalize_scope(value: Any) -> Optional[str]:
+    """Canonical semantic scope identifier.
+
+    Recommended form ``kind:value`` (for example ``api:payments``). Outer whitespace is
+    trimmed, internal whitespace runs collapse to one space and whitespace around ``:``
+    is removed, so incidental spelling cannot create accidental ambiguity. Case is
+    preserved — a scope is a stable identifier, not prose. An absent scope is ``None``,
+    the one canonical "no scope" value.
+    """
+    if value is None:
+        return None
+    text = " ".join(str(value).split())
+    if not text:
+        return None
+    return re.sub(r"\s*:\s*", ":", text)
+
+
 def normalize_content(text: Any) -> str:
     """Selected content normalization: line endings only.
 
@@ -172,11 +190,15 @@ def entry_fingerprint(entry: dict[str, Any]) -> str:
     A source that declares a ``revision`` pins its authority to that revision, so a
     revision change revalidates it; a source that declares none is unaffected by an
     unrelated commit.
+
+    The requirement's semantic ``scope`` participates here: knowledge selected for
+    ``api:payments`` is not the same delivered knowledge as for ``api:refunds``, and
+    free-prose ``reason`` wording is not a substitute for a scope.
     """
     return "entry:" + _digest("entry", entry["source_identity"], entry["content_fingerprint"],
                               entry["authority_fingerprint"], bool(entry["required"]),
-                              entry.get("min_authority"), entry.get("revision"),
-                              entry.get("dependency_fingerprints") or [])
+                              entry.get("min_authority"), normalize_scope(entry.get("scope")),
+                              entry.get("revision"), entry.get("dependency_fingerprints") or [])
 
 
 def manifest_fingerprint(entries: list[dict[str, Any]], omissions: list[dict[str, Any]],
@@ -191,7 +213,7 @@ def manifest_fingerprint(entries: list[dict[str, Any]], omissions: list[dict[str
                                  [entry["entry_fingerprint"] for entry in entries],
                                  [[record["key"], record["reason"]] for record in omissions],
                                  [[record["key"], record["reason"]] for record in refusals],
-                                 scope)
+                                 normalize_scope(scope))
 
 
 def delivered_identity(*, manifest: str, delivered_content: str, omissions: list[dict[str, Any]],
@@ -485,11 +507,14 @@ def select(document: dict[str, Any], *, context: Optional[dict[str, Any]] = None
             continue
         reason, level = failure
         record = {"key": key, "reason": reason, "level": level, "required": required,
-                  "scope": requirement.get("scope"),
+                  "scope": normalize_scope(requirement.get("scope")),
                   "detail": _detail(reason, source, key)}
-        if reason == NOT_APPLICABLE:
-            omissions.append(record)  # scope decision, never a silent drop
+        if reason == NOT_APPLICABLE and level == "requirement":
+            # The obligation itself is conditional and does not exist for this context.
+            omissions.append(record)
         else:
+            # An obligation that applies but cannot be satisfied (including an
+            # inapplicable source) refuses when required and is omitted when optional.
             (refusals if required else omissions).append(record)
 
     entries = _attach_dependencies(base, refusals, omissions)
@@ -514,7 +539,7 @@ def select(document: dict[str, Any], *, context: Optional[dict[str, Any]] = None
             "lifecycle": source.get("lifecycle", "ACTIVE"),
             "revision": source.get("revision") or content.get("revision"),
             "required": entry["required"], "min_authority": entry["min_authority"],
-            "scope": entry["requirement"].get("scope"),
+            "scope": normalize_scope(entry["requirement"].get("scope")),
             "select_reason": entry["requirement"].get("reason"),
             "authority_fingerprint": authority_fingerprint(source),
             "dependency_fingerprints": entry.get("dependency_fingerprints") or [],
@@ -528,31 +553,109 @@ def select(document: dict[str, Any], *, context: Optional[dict[str, Any]] = None
 
 def _attach_dependencies(base: dict[str, dict[str, Any]], refusals: list[dict[str, Any]],
                          omissions: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    """Attach the fingerprints of the dependencies a selected entry actually relies on.
+    """Withdraw every source whose **entire dependency closure** cannot be satisfied.
 
-    A declared dependency that is not selected makes the dependent entry unavailable
-    (refused when required, omitted when optional) rather than silently dropped.
+    A source may only satisfy a requirement when all of its declared dependencies are
+    themselves available, so an unavailable dependency removes every affected
+    ancestor — transitivity is mandatory, and merely checking the preliminary
+    selection is not enough. Unavailable dependencies are refused when required and
+    omitted when optional. Dependency cycles can never be satisfied and fail safely
+    (deterministic withdrawal), never as a silent READY.
     """
+    graph = {key: sorted(set(record["source"].get("depends_on") or [])) for key, record in base.items()}
+    available = set(base)
+    failures: dict[str, tuple[str, Optional[str]]] = {}
+    while True:
+        removed = False
+        for key in sorted(available):
+            gone = next((dependency for dependency in graph[key] if dependency not in available), None)
+            if gone is not None:
+                failures[key] = (DEPENDENCY_UNAVAILABLE, gone)
+                available.discard(key)
+                removed = True
+        for key in sorted(_cycle_reachable(graph, available)):
+            failures[key] = (DEPENDENCY_CYCLE, None)
+            available.discard(key)
+            removed = True
+        if not removed:
+            break
+
     entries: dict[str, dict[str, Any]] = {}
-    for key in sorted(base):
+    for key in sorted(available):
+        # One fingerprint per dependency in the whole closure (direct and transitive): a
+        # change anywhere in the closure revalidates the dependent entry.
+        fingerprints = ["dependency:" + _digest("dependency", base[dependency]["identity"],
+                                                content_fingerprint(base[dependency]["content"]["content"]),
+                                                authority_fingerprint(base[dependency]["source"]))
+                        for dependency in _transitive_dependencies(graph, available, key)]
+        entries[key] = {**base[key], "dependency_fingerprints": fingerprints}
+    for key in sorted(set(base) - available):
+        reason, dependency = failures[key]
         record = base[key]
-        fingerprints: list[str] = []
-        unavailable: Optional[str] = None
-        for dependency in sorted(set(record["source"].get("depends_on") or [])):
-            other = base.get(dependency)
-            if other is None:
-                unavailable = dependency
-                break
-            fingerprints.append("dependency:" + _digest(
-                "dependency", other["identity"], content_fingerprint(other["content"]["content"])))
-        if unavailable is None:
-            entries[key] = {**record, "dependency_fingerprints": fingerprints}
-            continue
-        problem = {"key": key, "reason": DEPENDENCY_UNAVAILABLE, "required": record["required"],
-                   "scope": record["requirement"].get("scope"),
-                   "detail": f"declared dependency {unavailable!r} is not available in this selection"}
-        (refusals if record["required"] else omissions).append(problem)
+        (refusals if record["required"] else omissions).append({
+            "key": key, "reason": reason, "level": "source", "required": record["required"],
+            "scope": normalize_scope(record["requirement"].get("scope")),
+            "detail": _dependency_detail(reason, key, dependency, graph, set(base))})
     return entries
+
+
+def _transitive_dependencies(graph: dict[str, list[str]], available: set[str], key: str) -> list[str]:
+    """Every dependency reachable from ``key`` inside ``available`` (cycles withdraw
+    earlier, and ``seen`` guards the traversal regardless)."""
+    seen: set[str] = set()
+    queue = sorted(dependency for dependency in graph.get(key, ()) if dependency in available)
+    while queue:
+        current = queue.pop(0)
+        if current in seen:
+            continue
+        seen.add(current)
+        queue.extend(sorted(dependency for dependency in graph.get(current, ())
+                            if dependency in available))
+    return sorted(seen)
+
+
+def _cycle_reachable(graph: dict[str, list[str]], available: set[str]) -> set[str]:
+    """Keys that can reach a dependency cycle inside ``available``.
+
+    Kahn peeling on outgoing edges: a key with no outgoing dependency cannot be part of
+    a cycle; whatever survives the peeling can reach one (including self-dependencies).
+    """
+    remaining = {key: [dep for dep in graph.get(key, ()) if dep in available] for key in available}
+    peeled = True
+    while peeled:
+        peeled = False
+        for key in sorted(list(remaining)):
+            remaining[key] = [dep for dep in remaining[key] if dep in remaining]
+            if not remaining[key]:
+                del remaining[key]
+                peeled = True
+    return set(remaining)
+
+
+def _dependency_root(graph: dict[str, list[str]], base_keys: set[str], key: str) -> Optional[str]:
+    """First dependency in the closure that is not even preliminarily available."""
+    seen = {key}
+    queue = sorted(graph.get(key, ()))
+    while queue:
+        current = queue.pop(0)
+        if current not in base_keys:
+            return current
+        for nxt in sorted(graph.get(current, ())):
+            if nxt not in seen:
+                seen.add(nxt)
+                queue.append(nxt)
+    return None
+
+
+def _dependency_detail(reason: str, key: str, dependency: Optional[str], graph: dict[str, list[str]],
+                       base_keys: set[str]) -> str:
+    if reason == DEPENDENCY_CYCLE:
+        return f"{key!r} is part of a dependency cycle and can never be satisfied"
+    root = _dependency_root(graph, base_keys, key)
+    detail = f"declared dependency {dependency!r} is not available in this selection"
+    if root and root != dependency:
+        detail += f"; root cause {root!r}"
+    return detail
 
 
 def _detail(failure: str, source: Optional[dict[str, Any]], key: str) -> str:
@@ -641,6 +744,36 @@ def reuse_eligible(*, accepted_knowledge_identity: str, current_knowledge_identi
 # --------------------------------------------------------------------------- #
 
 
+def _semantic_source(record: dict[str, Any]) -> dict[str, Any]:
+    """A source's authoritative semantics: the locator is normalized so path spelling
+    cannot report a parity difference that identity does not see."""
+    semantic = dict(record)
+    try:
+        semantic["locator"] = normalize_locator(record.get("locator"))
+    except KnowledgeContractError:
+        pass  # an invalid locator is already a document-level refusal
+    if isinstance(semantic.get("applicability"), dict):
+        semantic["applicability"] = {facet: sorted(wanted) if isinstance(wanted, list) else wanted
+                                     for facet, wanted in sorted(semantic["applicability"].items())}
+    return semantic
+
+
+def _semantic_requirement(record: dict[str, Any]) -> dict[str, Any]:
+    """A requirement's authoritative semantics.
+
+    The descriptive ``reason`` is excluded so agent wording can never alter semantic
+    parity or delivered identity, while every authority-bearing field — requiredness,
+    minimum authority, applicability and the semantic ``scope`` — is kept.
+    """
+    semantic = {field: value for field, value in record.items() if field != "reason"}
+    if "scope" in semantic:
+        semantic["scope"] = normalize_scope(semantic["scope"])
+    if isinstance(semantic.get("applicability"), dict):
+        semantic["applicability"] = {facet: sorted(wanted) if isinstance(wanted, list) else wanted
+                                     for facet, wanted in sorted(semantic["applicability"].items())}
+    return semantic
+
+
 def agent_semantic_inputs(document: dict[str, Any]) -> dict[str, Any]:
     """The authoritative semantic inputs of a document, with agent branding and prompt
     wrapper text removed. Two agents asking the same thing must produce the same
@@ -650,11 +783,13 @@ def agent_semantic_inputs(document: dict[str, Any]) -> dict[str, Any]:
     return {
         "contract_version": document.get("contract_version"),
         "repositories": document.get("repositories"),
-        "sources": sorted(document.get("sources") or [], key=lambda item: str(item.get("key"))),
-        "requirements": sorted(document.get("requirements") or [], key=lambda item: str(item.get("key"))),
+        "sources": [_semantic_source(record) for record in
+                    sorted(document.get("sources") or [], key=lambda item: str(item.get("key")))],
+        "requirements": [_semantic_requirement(record) for record in
+                         sorted(document.get("requirements") or [], key=lambda item: str(item.get("key")))],
         "contents": {key: value for key, value in sorted((document.get("contents") or {}).items())},
         "context": {key: value for key, value in sorted((document.get("context") or {}).items())},
-        "scope": document.get("scope"),
+        "scope": normalize_scope(document.get("scope")),
         # The descriptive selection reason is intentionally omitted: prompt wording and
         # agent branding must not alter authoritative semantic identity.
     }
