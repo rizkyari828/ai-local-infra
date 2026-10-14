@@ -86,7 +86,7 @@ class SchemaTests(unittest.TestCase):
             self.assertEqual(2, s.status()["schema_version"])
             s.close()
         s2 = store.OrchestrationStore(state_dir=self.state)  # migrates 2 -> 3
-        self.assertEqual(3, s2.status()["schema_version"])
+        self.assertEqual(store.SCHEMA_VERSION, s2.status()["schema_version"])
         columns = {row[1] for row in s2.connection.execute("PRAGMA table_info(runs)")}
         self.assertIn("entry_mode", columns)
         self.assertIn("controller_ai_calls", columns)

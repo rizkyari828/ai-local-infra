@@ -95,6 +95,9 @@ class Fixture(unittest.TestCase):
         kw.setdefault("confirm", True)
         kw.setdefault("allow_dirty", True)
         kw.setdefault("record_evidence", False)
+        # These mutation fixtures operate only on the temporary repository workspace.
+        if any(node.get("intent") == "MUTATING" for node in plan["nodes"]):
+            kw["constraints"] = {**(kw.get("constraints") or {}), "mutation_scope": "workspace"}
         backend = backend or execution.FakeBackend()
         return execution.execute_plan(plan, backend=backend, state_dir=self.state,
                                       repo_root=self.root, **kw), backend

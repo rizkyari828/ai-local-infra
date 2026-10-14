@@ -135,9 +135,9 @@ class ProtocolTests(unittest.TestCase):
         for master_b in ("claim", "lease", "heartbeat"):
             self.assertNotIn(f"def {master_b}", text)
 
-    def test_no_production_module_consumes_the_contract_yet(self) -> None:
-        # V0.1 is a contract: production cache/resume/execution behaviour is unchanged.
-        for module in ("execution.py", "lifecycle.py", "result_cache.py", "orchestrate_cli.py",
+    def test_no_shared_knowledge_runtime_rollout(self) -> None:
+        # Master B consumes caller-supplied contract inputs; retrieval/skill rollout is deferred.
+        for module in ("lifecycle.py", "result_cache.py", "orchestrate_cli.py",
                        "context_retrieval.py", "orchestration_store.py"):
             text = (ROOT / "scripts/common" / module).read_text(encoding="utf-8")
             self.assertNotIn("knowledge_contract", text, module)

@@ -255,7 +255,7 @@ class OperationalDataTests(ReuseFixture):
             self.assertEqual("CACHE", tasks["T2"]["execution_source"])
             self.assertIsNotNone(tasks["T2"]["cache_entry_id"])
             self.assertIsNotNone(tasks["T2"]["result_fingerprint"])
-            self.assertEqual([], store.task_attempts("T2"))  # no fake attempt on reuse
+            self.assertEqual([], store.run_attempts(run_id))  # waiter/reuse run owns no fake Attempts
             events = [e["event_type"] for e in store.run_events(run_id)]
             self.assertIn("CACHE_HIT", events)
             self.assertIn("TASK_REUSED", events)
