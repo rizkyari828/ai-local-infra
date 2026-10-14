@@ -47,6 +47,13 @@
   execution, routing, Doctor, `verify-environment`, and bootstrap all read their
   authoritative state from it instead of re-deriving it. See
   [Runtime authority](RUNTIME_AUTHORITY.md).
+- A Shared Knowledge Contract defines, as a pure protocol, what a knowledge/context
+  requirement is and how a selection is identified and validated: source ownership,
+  repository/source identity, project-relative locators, required versus optional,
+  authority/review/lifecycle, supersession, content and delivered-manifest
+  fingerprints, deterministic refusal, and the active-work equivalence input a later
+  phase consumes. It retrieves nothing, grants no permission, and changes no runtime
+  behaviour. See [Shared knowledge contract](SHARED_KNOWLEDGE_CONTRACT.md).
 
 No server process exists. Commands are short-lived and state is inspectable. Active application files remain at `~/.qwen/settings.json` and `/etc/systemd/system/ollama.service.d/override.conf`; no symlinks are used.
 
