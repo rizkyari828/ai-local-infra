@@ -168,10 +168,15 @@ other's results.
   to authorize. The policy is still recorded in that run's identity, so the
   identity is never adapter-dependent.
 - **Agent Runtime** — `AgentRuntime.run` refuses a provider that repository
-  configuration resolved to a machine-prohibited one (`runtime.require_machine_permission`),
-  at the inference boundary, so tool-only and health-only invocations are not
-  blocked. `EscalationController.from_config` applies the same rule to a fallback
-  provider it builds itself.
+  configuration resolved to a machine-prohibited one
+  (`runtime.require_machine_permission`), at the inference boundary, so tool-only
+  and health-only invocations are not blocked. `EscalationController.from_config`
+  applies the same rule to a fallback provider it builds itself.
+  A provider object a caller constructs and supplies directly is that caller's
+  choice and is not second-guessed — but a caller cannot reach a *prohibited*
+  provider through any config-driven path, and
+  `tests/test_runtime_authority_agentruntime.py` fails if a production module adds
+  an ungated `AgentRuntime(...)` construction site.
 - **Doctor** — reports the same permission state, with the state kept distinct
   (`machine-policy` check). Doctor never probes a provider: availability is a
   runtime observation, not a readiness fact.
