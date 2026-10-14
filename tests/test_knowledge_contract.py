@@ -310,14 +310,18 @@ class RequirednessAndRefusalTests(unittest.TestCase):
     def test_F7_applicability_change_revalidates_at_both_levels(self) -> None:
         applicable = select(sources=[source(applicability={"task_families": ["architecture_review"]})])
         self.assertEqual(kc.READY, applicable["outcome"])
-        source_scope = select(sources=[source(applicability={"task_families": ["architecture_review"]})],
-                              context={"task_family": "code_review"})
-        self.assertEqual(kc.READY, source_scope["outcome"])
-        self.assertEqual(kc.NOT_APPLICABLE, source_scope["omissions"][0]["reason"])
-        self.assertEqual("source", source_scope["omissions"][0]["level"])
+        # A conditional *requirement* that does not apply carries no obligation.
         requirement_scope = select(requirements=[requirement(applicability={"task_classes": ["NORMAL"]})])
         self.assertEqual(kc.READY, requirement_scope["outcome"])
+        self.assertEqual(kc.NOT_APPLICABLE, requirement_scope["omissions"][0]["reason"])
         self.assertEqual("requirement", requirement_scope["omissions"][0]["level"])
+        # An applicable requirement whose *source* cannot satisfy it is an obligation
+        # failure, never a silent omission (see ApplicabilityObligationTests).
+        source_scope = select(sources=[source(applicability={"task_families": ["architecture_review"]})],
+                              context={"task_family": "code_review"})
+        self.assertEqual(kc.REQUIRED_CONTEXT_UNAVAILABLE, source_scope["outcome"])
+        self.assertEqual(kc.NOT_APPLICABLE, source_scope["refusals"][0]["reason"])
+        self.assertEqual("source", source_scope["refusals"][0]["level"])
         for variant in (source_scope, requirement_scope):
             self.assertNotEqual(applicable["delivered_identity"], variant["delivered_identity"])
 
@@ -460,6 +464,257 @@ class ActiveWorkContractTests(unittest.TestCase):
             self.assertFalse(hasattr(kc, attribute), attribute)
 
 
+def chain(spec, *, contents=None, context=None, **overrides) -> dict:
+    """``spec`` is a list of ``(key, depends_on, required)`` triples for a dependency graph."""
+    sources = [source(key=key, locator=f"docs/{key.lower()}.md", depends_on=list(depends_on))
+               for key, depends_on, _required in spec]
+    requirements = [requirement(key=key, required=required, min_authority="AUTHORITATIVE")
+                    for key, _depends_on, required in spec]
+    contents = contents if contents is not None else {key: {"content": f"{key} v1\n"}
+                                                      for key, _depends_on, _required in spec}
+    return document(sources=sources, requirements=requirements, contents=contents,
+                    context={} if context is None else context, **overrides)
+
+
+class DependencyClosureTests(unittest.TestCase):
+    """Finding 1 — a source may satisfy a requirement only when its ENTIRE declared
+    dependency closure is available, valid and acyclic."""
+
+    def test_D1_required_depends_on_valid_required(self) -> None:
+        result = kc.select(chain([("A", ["B"], True), ("B", [], True)]))
+        self.assertEqual(kc.READY, result["outcome"])
+        self.assertEqual(["A", "B"], [entry["key"] for entry in result["entries"]])
+
+    def test_D2_required_depends_on_valid_optional(self) -> None:
+        result = kc.select(chain([("A", ["B"], True), ("B", [], False)]))
+        self.assertEqual(kc.READY, result["outcome"])
+        self.assertEqual(["A", "B"], [entry["key"] for entry in result["entries"]])
+
+    def test_D3_A1_transitive_failure_refuses_the_required_ancestor(self) -> None:
+        # required A -> optional B -> missing C
+        result = kc.select(chain([("A", ["B"], True), ("B", ["C"], False)]))
+        self.assertEqual(kc.REQUIRED_CONTEXT_UNAVAILABLE, result["outcome"])
+        self.assertEqual([("A", kc.DEPENDENCY_UNAVAILABLE)],
+                         [(record["key"], record["reason"]) for record in result["refusals"]])
+        self.assertEqual([("B", kc.DEPENDENCY_UNAVAILABLE)],
+                         [(record["key"], record["reason"]) for record in result["omissions"]])
+        self.assertEqual([], result["entries"])  # nothing partial is delivered
+
+    def test_D4_A2_transitive_failure_omits_the_optional_ancestor(self) -> None:
+        result = kc.select(chain([("A", ["B"], False), ("B", ["C"], False)]))
+        self.assertEqual(kc.READY, result["outcome"])
+        self.assertEqual([], result["entries"])
+        self.assertEqual([("A", kc.DEPENDENCY_UNAVAILABLE), ("B", kc.DEPENDENCY_UNAVAILABLE)],
+                         [(record["key"], record["reason"]) for record in result["omissions"]])
+        self.assertEqual([], result["refusals"])
+
+    def test_D5_unavailable_dependency_state_propagates_with_its_root_cause(self) -> None:
+        for lifecycle, extra in (("REVOKED", {}), ("SUPERSEDED", {"superseded_by": "C.v2"})):
+            with self.subTest(lifecycle=lifecycle):
+                result = kc.select(document(
+                    sources=[source(key="A", locator="docs/a.md", depends_on=["B"]),
+                             source(key="B", locator="docs/b.md", depends_on=["C"]),
+                             source(key="C", locator="docs/c.md", lifecycle=lifecycle, **extra)],
+                    requirements=[requirement(key="A"), requirement(key="B", required=False)],
+                    contents={"A": {"content": "a\n"}, "B": {"content": "b\n"}, "C": {"content": "c\n"}}))
+                self.assertEqual(kc.REQUIRED_CONTEXT_UNAVAILABLE, result["outcome"])
+                self.assertEqual("A", result["refusals"][0]["key"])
+                self.assertEqual(kc.DEPENDENCY_UNAVAILABLE, result["refusals"][0]["reason"])
+                self.assertIn("'C'", result["refusals"][0]["detail"])  # root cause is named
+
+    def test_D5_an_inapplicable_dependency_is_unavailable_too(self) -> None:
+        # C is present but cannot apply here, so the obligation of its ancestor A fails.
+        result = kc.select(document(
+            sources=[source(key="A", locator="docs/a.md", depends_on=["B"]),
+                     source(key="B", locator="docs/b.md", depends_on=["C"]),
+                     source(key="C", locator="docs/c.md",
+                            applicability={"surfaces": ["opencode"]})],
+            requirements=[requirement(key="A"), requirement(key="B", required=False),
+                          requirement(key="C", required=False, min_authority="SUPPORTING")],
+            contents={"A": {"content": "a\n"}, "B": {"content": "b\n"}, "C": {"content": "c\n"}},
+            context={"surface": "codex-cli"}))
+        self.assertEqual(kc.REQUIRED_CONTEXT_UNAVAILABLE, result["outcome"])
+        self.assertEqual(kc.DEPENDENCY_UNAVAILABLE, result["refusals"][0]["reason"])
+        self.assertEqual("A", result["refusals"][0]["key"])
+        omitted = {record["key"]: record["reason"] for record in result["omissions"]}
+        self.assertEqual(kc.NOT_APPLICABLE, omitted["C"])
+        self.assertEqual(kc.DEPENDENCY_UNAVAILABLE, omitted["B"])
+
+    def test_D6_A3_dependency_cycles_fail_safely(self) -> None:
+        for spec in ([("A", ["B"], True), ("B", ["A"], True)], [("A", ["A"], True)]):
+            with self.subTest(spec=spec):
+                result = kc.select(chain(spec))
+                self.assertEqual(kc.REQUIRED_CONTEXT_UNAVAILABLE, result["outcome"])
+                self.assertEqual([], result["entries"])
+                self.assertTrue(all(record["reason"] == kc.DEPENDENCY_CYCLE
+                                    for record in result["refusals"]), result["refusals"])
+                self.assertTrue(all("cycle" in record["detail"] for record in result["refusals"]))
+        # A cycle reachable through a longer path also withdraws its ancestors.
+        deep = kc.select(chain([("A", ["B"], True), ("B", ["C"], True), ("C", ["A"], True)]))
+        self.assertEqual(kc.REQUIRED_CONTEXT_UNAVAILABLE, deep["outcome"])
+        self.assertEqual(["A", "B", "C"], sorted(record["key"] for record in deep["refusals"]))
+
+    def test_D6_cycle_with_an_optional_ancestor_is_an_omission(self) -> None:
+        result = kc.select(chain([("A", ["B"], False), ("B", ["A"], False)]))
+        self.assertEqual(kc.READY, result["outcome"])
+        self.assertEqual([], result["refusals"])
+        self.assertEqual([kc.DEPENDENCY_CYCLE, kc.DEPENDENCY_CYCLE],
+                         [record["reason"] for record in result["omissions"]])
+
+    def test_D7_dependency_content_change_changes_the_dependent_identity(self) -> None:
+        first = kc.select(chain([("A", ["B"], True), ("B", [], True)]))
+        second = kc.select(chain([("A", ["B"], True), ("B", [], True)],
+                                 contents={"A": {"content": "A v1\n"}, "B": {"content": "B v2\n"}}))
+        entry_a = next(entry for entry in first["entries"] if entry["key"] == "A")
+        entry_a2 = next(entry for entry in second["entries"] if entry["key"] == "A")
+        self.assertEqual(1, len(entry_a["dependency_fingerprints"]))
+        self.assertNotEqual(entry_a["entry_fingerprint"], entry_a2["entry_fingerprint"])
+        self.assertNotEqual(first["delivered_identity"], second["delivered_identity"])
+
+    def test_dependency_authority_change_changes_the_dependent_identity(self) -> None:
+        sources = [source(key="A", locator="docs/a.md", depends_on=["B"]),
+                   source(key="B", locator="docs/b.md")]
+        requirements = [requirement(key="A"), requirement(key="B", required=False,
+                                                          min_authority="SUPPORTING")]
+        contents = {"A": {"content": "a\n"}, "B": {"content": "b\n"}}
+        strong = kc.select(document(sources=sources, requirements=requirements, contents=contents))
+        weak = kc.select(document(sources=[sources[0], {**sources[1], "authority": "SUPPORTING"}],
+                                  requirements=requirements, contents=contents))
+        self.assertNotEqual(strong["delivered_identity"], weak["delivered_identity"])
+
+    def test_a_valid_dependency_that_is_merely_unselected_still_withdraws_the_dependent(self) -> None:
+        # B is a real, valid source but no requirement selects it: A must not silently
+        # treat its dependency as satisfied.
+        result = kc.select(document(sources=[source(key="A", locator="docs/a.md", depends_on=["B"]),
+                                            source(key="B", locator="docs/b.md")],
+                                   requirements=[requirement(key="A", required=False)],
+                                   contents={"A": {"content": "a\n"}, "B": {"content": "b\n"}}))
+        self.assertEqual(kc.READY, result["outcome"])
+        self.assertEqual(kc.DEPENDENCY_UNAVAILABLE, result["omissions"][0]["reason"])
+
+    def test_dependency_selection_depth_is_deterministic(self) -> None:
+        spec = [("A", ["B"], True), ("B", ["C"], True), ("C", [], True)]
+        first, second = kc.select(chain(spec)), kc.select(chain(spec))
+        self.assertEqual(kc.READY, first["outcome"])
+        self.assertEqual(first["delivered_identity"], second["delivered_identity"])
+        entry = next(item for item in first["entries"] if item["key"] == "A")
+        # One fingerprint per dependency in the whole closure (B and C), not only B.
+        self.assertEqual(2, len(entry["dependency_fingerprints"]))
+
+    def test_a_transitive_dependency_change_revalidates_the_ancestor(self) -> None:
+        spec = [("A", ["B"], True), ("B", ["C"], True), ("C", [], True)]
+        first = kc.select(chain(spec))
+        second = kc.select(chain(spec, contents={"A": {"content": "A v1\n"},
+                                                 "B": {"content": "B v1\n"},
+                                                 "C": {"content": "C v2\n"}}))
+        entry_a = next(item for item in first["entries"] if item["key"] == "A")
+        entry_a2 = next(item for item in second["entries"] if item["key"] == "A")
+        self.assertNotEqual(entry_a["entry_fingerprint"], entry_a2["entry_fingerprint"])
+        self.assertNotEqual(first["delivered_identity"], second["delivered_identity"])
+
+
+class ApplicabilityObligationTests(unittest.TestCase):
+    """Finding 2 — "the requirement does not apply" is not "the obligation exists but
+    the only source is unsuitable"."""
+
+    def test_A5_inapplicable_requirement_creates_no_obligation(self) -> None:
+        result = select(sources=[source(applicability={"languages": ["Java"]})],
+                        requirements=[requirement(applicability={"languages": ["Python"]})],
+                        context={"language": "Java"})
+        self.assertEqual(kc.READY, result["outcome"])
+        self.assertEqual([], result["refusals"])
+        self.assertEqual([], result["entries"])
+        self.assertEqual("requirement", result["omissions"][0]["level"])
+        self.assertEqual(kc.NOT_APPLICABLE, result["omissions"][0]["reason"])
+
+    def test_A4_applicable_required_requirement_with_inapplicable_source_refuses(self) -> None:
+        result = select(sources=[source(applicability={"languages": ["Java"]})],
+                        requirements=[requirement(applicability={"languages": ["Python"]})],
+                        context={"language": "Python"})
+        self.assertEqual(kc.REQUIRED_CONTEXT_UNAVAILABLE, result["outcome"])
+        self.assertEqual(kc.NOT_APPLICABLE, result["refusals"][0]["reason"])
+        self.assertEqual("source", result["refusals"][0]["level"])
+        self.assertEqual([], result["entries"])
+
+    def test_applicable_optional_requirement_with_inapplicable_source_is_omitted(self) -> None:
+        result = select(sources=[source(applicability={"languages": ["Java"]})],
+                        requirements=[requirement(required=False)],
+                        context={"language": "Python"})
+        self.assertEqual(kc.READY, result["outcome"])
+        self.assertEqual([], result["refusals"])
+        self.assertEqual("source", result["omissions"][0]["level"])
+        self.assertEqual(kc.NOT_APPLICABLE, result["omissions"][0]["reason"])
+
+    def test_the_two_inapplicability_levels_are_never_conflated(self) -> None:
+        requirement_level = select(requirements=[requirement(applicability={"surfaces": ["opencode"]})],
+                                   context={"surface": "codex-cli"})
+        source_level = select(sources=[source(applicability={"surfaces": ["opencode"]})],
+                              requirements=[requirement()], context={"surface": "codex-cli"})
+        self.assertEqual(kc.READY, requirement_level["outcome"])
+        self.assertEqual(kc.REQUIRED_CONTEXT_UNAVAILABLE, source_level["outcome"])
+        self.assertNotEqual(requirement_level["delivered_identity"], source_level["delivered_identity"])
+
+
+class RequirementScopeIdentityTests(unittest.TestCase):
+    """Finding 3 — requirement-level semantic scope is authority, not representation."""
+
+    def _scoped(self, scope, **overrides) -> dict:
+        return kc.select(document(requirements=[requirement(scope=scope)], **overrides))
+
+    def test_A6_S1_scope_change_changes_entry_manifest_and_delivered_identity(self) -> None:
+        payments, refunds = self._scoped("api:payments"), self._scoped("api:refunds")
+        self.assertEqual(kc.READY, payments["outcome"])
+        self.assertNotEqual(payments["entries"][0]["entry_fingerprint"],
+                            refunds["entries"][0]["entry_fingerprint"])
+        self.assertNotEqual(payments["manifest_fingerprint"], refunds["manifest_fingerprint"])
+        self.assertNotEqual(payments["delivered_identity"], refunds["delivered_identity"])
+        self.assertEqual("api:payments", payments["entries"][0]["scope"])
+        self.assertEqual("api:refunds", refunds["entries"][0]["scope"])
+        self.assertEqual(payments["entries"][0]["source_identity"],
+                         refunds["entries"][0]["source_identity"])  # same source, different scope
+
+    def test_S2_same_semantic_scope_with_different_prose_is_one_identity(self) -> None:
+        left = kc.select(document(requirements=[requirement(scope="api:payments",
+                                                           reason="Need payments")]))
+        right = kc.select(document(requirements=[requirement(scope="api:payments",
+                                                            reason="Use payment rules")]))
+        self.assertEqual(left["delivered_identity"], right["delivered_identity"])
+
+    def test_S3_document_scope_still_invalidates(self) -> None:
+        base = select(scope="task:architecture_review")
+        other = select(scope="task:code_review")
+        self.assertNotEqual(base["delivered_identity"], other["delivered_identity"])
+        self.assertNotEqual(base["manifest_fingerprint"], other["manifest_fingerprint"])
+
+    def test_S4_absent_scope_and_incidental_spelling_are_canonical(self) -> None:
+        self.assertIsNone(kc.normalize_scope(None))
+        self.assertIsNone(kc.normalize_scope("   "))
+        self.assertEqual("api:payments", kc.normalize_scope(" api : payments "))
+        self.assertEqual("api:payments", kc.normalize_scope("api:  payments"))
+        self.assertEqual("api:payments rules", kc.normalize_scope("  api:payments   rules "))
+        self.assertIsNone(select(requirements=[requirement(scope=None)])["entries"][0]["scope"])
+        self.assertEqual(kc.select(document(requirements=[requirement(scope="api : payments")]))["delivered_identity"],
+                         kc.select(document(requirements=[requirement(scope="api:payments")]))["delivered_identity"])
+        self.assertNotEqual(kc.normalize_scope("api:payments"), kc.normalize_scope("api:refunds"))
+
+    def test_A9_A10_scope_change_moves_equivalence_and_blocks_reuse(self) -> None:
+        accepted = self._scoped("api:payments")
+        current = self._scoped("api:refunds")
+        task = kc.task_identity(objective_identity="sha256:o", acceptance_identity="sha256:a",
+                                permissions_identity="sha256:p", requirements_identity="sha256:r")
+        before = kc.active_work_equivalence_input(task=task,
+                                                  knowledge_identity=accepted["delivered_identity"])
+        after = kc.active_work_equivalence_input(task=task,
+                                                 knowledge_identity=current["delivered_identity"])
+        self.assertTrue(kc.equivalence_changed(before, after))
+        self.assertFalse(kc.reuse_eligible(accepted_knowledge_identity=accepted["delivered_identity"],
+                                           current_knowledge_identity=current["delivered_identity"]))
+        unchanged = self._scoped("api:payments")
+        self.assertEqual(accepted["delivered_identity"], unchanged["delivered_identity"])
+        self.assertTrue(kc.reuse_eligible(accepted_knowledge_identity=accepted["delivered_identity"],
+                                          current_knowledge_identity=unchanged["delivered_identity"]))
+
+
 class CrossAgentParityTests(unittest.TestCase):
     """F12 — equivalent requirement, equivalent authoritative semantic identity."""
 
@@ -498,6 +753,39 @@ class CrossAgentParityTests(unittest.TestCase):
         self.assertEqual(kc.UNKNOWN_FIELD, result["refusals"][0]["reason"])
         for field in ("agent", "prompt_wrapper"):
             self.assertNotIn(field, kc.DOCUMENT_FIELDS)
+
+    def test_A7_A8_requirement_reason_wording_cannot_break_parity(self) -> None:
+        # Same authoritative fields (repository, source, key, requiredness, min authority,
+        # applicability, semantic scope, content); only the requirement prose differs.
+        codex = document(requirements=[requirement(scope="api:payments",
+                                                   reason="Need payment API constraints for implementation",
+                                                   applicability={"languages": ["python", "java"]})],
+                         sources=[source(applicability={"languages": ["java", "python"]})])
+        opencode = document(requirements=[requirement(scope="api : payments",
+                                                      reason="Use payment API rules",
+                                                      applicability={"languages": ["java", "python"]})],
+                            sources=[source(applicability={"languages": ["python", "java"]})])
+        parity = kc.semantic_parity(codex, opencode)
+        self.assertTrue(parity["parity"], parity["differences"])
+        self.assertEqual([], parity["differences"])
+        self.assertEqual(kc.select(codex)["delivered_identity"],
+                         kc.select(opencode)["delivered_identity"])
+        # The prose stays inspectable representation.
+        self.assertEqual("Need payment API constraints for implementation",
+                         kc.select(codex)["entries"][0]["select_reason"])
+        # Removing reason from parity must not have removed semantic fields.
+        scope_differs = kc.semantic_parity(codex, document(
+            requirements=[requirement(scope="api:refunds", reason="Need payment API constraints for implementation")],
+            sources=[source(applicability={"languages": ["python", "java"]})]))
+        self.assertFalse(scope_differs["parity"])
+        self.assertIn("requirements", scope_differs["differences"])
+
+    def test_reason_only_differences_are_invisible_to_parity_and_identity(self) -> None:
+        left = document(requirements=[requirement(reason="left wording")])
+        right = document(requirements=[requirement(reason="right wording")])
+        self.assertTrue(kc.semantic_parity(left, right)["parity"])
+        self.assertEqual(kc.select(left)["delivered_identity"], kc.select(right)["delivered_identity"])
+        self.assertIn("reason", left["requirements"][0])  # representation preserved
 
     def test_a_real_semantic_difference_is_reported(self) -> None:
         other = document(contents={"project.architecture.overview": {"content": "different\n"}})
