@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 import bootstrap  # scripts/common, on sys.path
+import authority  # scripts/common, on sys.path
 
 ROOT = bootstrap.ROOT
 BASELINE_PATH = ROOT / "config/tool-baseline.yaml"
@@ -348,23 +349,44 @@ def _codex_mcp_checks(ctx: dict[str, Any]) -> list[Check]:
     config = (ctx.get("codex") or {}).get("config_path")
     if not config or not pathlib.Path(config).is_file():
         return [Check("codex", "headroom-mcp", SKIP, "codex config absent", "integrations")]
-    try:
-        lines = pathlib.Path(config).read_text(encoding="utf-8").splitlines(keepends=True)
-    except OSError:
-        return [Check("codex", "headroom-mcp", WARN, "codex config unreadable", "integrations")]
-    status, start, end, detail = bootstrap.find_toml_region(lines, "mcp_servers.headroom")
-    if status != "ok":
-        reason = f"[mcp_servers.headroom] {status}" + (f": {detail}" if detail else "")
+    data, error = authority.read_toml(config)
+    if data is None:
+        reason = error or "codex config unparseable"
         return [Check("codex", "headroom-mcp", WARN, reason, "integrations")]
-    segment = "".join(lines[start:end])
-    match = re.search(r'^\s*command\s*=\s*["\']([^"\']+)["\']', segment, re.MULTILINE)
-    command = match.group(1) if match else None
-    if not command:
+    table = data.get("mcp_servers")
+    entry = table.get("headroom") if isinstance(table, dict) else None
+    if not isinstance(entry, dict):
+        return [Check("codex", "headroom-mcp", WARN, "[mcp_servers.headroom] missing", "integrations")]
+    command = entry.get("command")
+    if not isinstance(command, str) or not command:
         return [Check("codex", "headroom-mcp", WARN, "declaration missing command", "integrations")]
     ok = bool(shutil.which(command)) or pathlib.Path(command).exists()
     return [Check("codex", "headroom-mcp", PASS if ok else WARN,
                   "MCP command resolvable" if ok else "MCP command not resolvable",
                   "integrations", observed=command)]
+
+
+def _authority_checks(ctx: dict[str, Any], env: dict[str, str]) -> list[Check]:
+    """The machine's declared runtime policy, from the ONE authority model.
+
+    Doctor reports the same authoritative permitted/prohibited state that
+    verify-environment reports and the runtime resolver enforces. It never probes a
+    provider (availability is a runtime observation, not a readiness fact) and never
+    weakens a policy check.
+    """
+    try:
+        policy = authority.machine_policy(env)
+    except authority.AuthorityError as exc:
+        return [Check("authority", "machine-policy", FAIL, f"machine policy unreadable: {exc}", "core")]
+    machine_id = policy["machine_id"] or "unresolved"
+    if "ollama" in policy["prohibited"]:
+        state = policy["prohibited"]["ollama"]
+        reason = "local inference prohibited by machine policy; health probe skipped"
+    else:
+        state = authority.PERMITTED
+        reason = "local inference permitted by machine profile"
+    return [Check("authority", "machine-policy", PASS, reason, "core",
+                  observed=f"{machine_id}:{state}")]
 
 
 def run(ctx: dict[str, Any], env: dict[str, str]) -> list[Check]:
@@ -383,6 +405,7 @@ def run(ctx: dict[str, Any], env: dict[str, str]) -> list[Check]:
     checks += _graphify_checks(ctx, baseline.get("graphify", {}), comps, version_timeout)
     checks += _headroom_checks(ctx, baseline.get("headroom", {}), comps, version_timeout, health_timeout)
     checks += _codex_mcp_checks(ctx)
+    checks += _authority_checks(ctx, env)
     return checks
 
 

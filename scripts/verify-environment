@@ -11,11 +11,11 @@ import subprocess
 import sys
 import urllib.error
 import urllib.request
-from typing import Any
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts/common"))
 import infra  # noqa: E402
+import authority  # noqa: E402
 import telemetry  # noqa: E402
 
 OLLAMA_ENDPOINT = "http://127.0.0.1:11434/api/tags"
@@ -31,33 +31,24 @@ def version(command: list[str]) -> str:
     return text[0] if result.returncode == 0 and text else "UNAVAILABLE"
 
 
-def _descriptor_policy(machine: dict[str, Any]) -> str | None:
-    if machine.get("local_inference") == NOT_CONFIGURED_BY_MACHINE_POLICY:
-        return NOT_CONFIGURED_BY_MACHINE_POLICY
-    if (machine.get("provider_availability") or {}).get("ollama") is False:
-        return NOT_CONFIGURED_BY_MACHINE_POLICY
-    return None
-
-
 def machine_local_inference_policy() -> str | None:
-    """Machine-declared local inference policy (None = configured/unknown machine).
+    """Machine-declared local inference policy (None = permitted/unknown machine).
 
     A machine that explicitly disables local inference (``local_inference`` or
-    ``provider_availability.ollama``) intentionally has no Ollama runtime, so the
-    health probe is skipped rather than reported as an environment failure. Machine
-    identity is ``LAI_MACHINE`` when set; otherwise the descriptor whose declared
-    ``repo_path`` is this exact repository is used (never guessed, only matched).
+    ``provider_availability.ollama: false``) intentionally has no Ollama runtime, so
+    the health probe is skipped rather than reported as an environment failure.
+
+    This delegates to the ONE authority model (scripts/common/authority.py), which
+    reads the committed descriptor directly: a machine-local file may override a
+    preference but never a hard prohibition. Machine identity is ``LAI_MACHINE``
+    when set; otherwise the descriptor whose declared ``repo_path`` is this exact
+    repository (never guessed, only matched).
     """
-    machine_id = os.environ.get("LAI_MACHINE")
-    if machine_id:
-        path = ROOT / "machines" / f"{machine_id}.yaml"
-        return _descriptor_policy(infra.load_json(path)) if path.exists() else None
-    for path in sorted((ROOT / "machines").glob("*.yaml")):
-        machine = infra.load_json(path)
-        declared = machine.get("repo_path")
-        if declared and os.path.expanduser(str(declared)) == str(ROOT):
-            return _descriptor_policy(machine)
-    return None
+    try:
+        return authority.machine_policy(dict(os.environ)).get("local_inference")
+    except authority.AuthorityError as exc:
+        print(f"WARN machine policy unreadable: {exc}", file=sys.stderr)
+        return None
 
 
 def main() -> int:
