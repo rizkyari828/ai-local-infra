@@ -55,6 +55,10 @@
   phase consumes. It retrieves nothing, grants no permission, and changes no runtime
   behaviour. See [Shared knowledge contract](SHARED_KNOWLEDGE_CONTRACT.md).
 
+- Master B adds durable active work and current-input reuse validation to the existing
+  operational SQLite store. Claims, mutation exclusion, recovery and generation
+  fencing are described in [Master B](MASTER_B.md).
+
 No server process exists. Commands are short-lived and state is inspectable. Active application files remain at `~/.qwen/settings.json` and `/etc/systemd/system/ollama.service.d/override.conf`; no symlinks are used.
 
 ## Safety and consistency
