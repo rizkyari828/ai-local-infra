@@ -76,11 +76,27 @@ class MachinePolicyTests(unittest.TestCase):
         self.assertEqual(0, code)
         self.assertIn("Ollama health: HTTP 200", out)
 
-    def test_unknown_machine_is_not_treated_as_policy(self) -> None:
-        with unittest.mock.patch.object(VERIFY.urllib.request, "urlopen", return_value=_Response()) as probe:
-            code, _out, _ = _run({"LAI_MACHINE": "does-not-exist"})
+    def test_unknown_machine_is_not_treated_as_permission(self) -> None:
+        # An explicit selector that does not resolve is authoritative intent: it fails
+        # rather than silently falling back to auto-discovery or "no policy".
+        with unittest.mock.patch.object(VERIFY.urllib.request, "urlopen") as probe:
+            code, out, err = _run({"LAI_MACHINE": "does-not-exist"})
+        probe.assert_not_called()
+        self.assertEqual(1, code)
+        self.assertIn("MACHINE_POLICY_INVALID", err)
+        self.assertIn("SKIPPED_INVALID_MACHINE_POLICY", out)
+
+    def test_unregistered_checkout_reports_no_machine_policy(self) -> None:
+        with unittest.mock.patch.object(VERIFY, "machine_policy",
+                                        return_value={"state": "GENUINELY_UNREGISTERED_MACHINE",
+                                                      "prohibited": {}, "local_inference": None,
+                                                      "machine_id": None, "error": None}), \
+                unittest.mock.patch.object(VERIFY.urllib.request, "urlopen", return_value=_Response()) as probe:
+            code, out, _ = _run({})
         probe.assert_called_once()
         self.assertEqual(0, code)
+        self.assertIn("Ollama policy: NO_MACHINE_POLICY", out)
+        self.assertIn("Ollama health: HTTP 200", out)
 
 
 if __name__ == "__main__":

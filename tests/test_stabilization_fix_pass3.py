@@ -8,6 +8,7 @@ plus a nearby equivalent variant (adversarial probe) for each.
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import subprocess
 import sys
@@ -69,11 +70,23 @@ def _plan(nodes, *, intent="READ_ONLY", planner_mode="NONE"):
             "order": [n["task_id"] for n in nodes], "nodes": nodes}
 
 
+def permit_local_inference(test: unittest.TestCase) -> None:
+    """Declare the machine this fixture runs on (see tests/test_stabilization_fix_pass2.py).
+
+    Hard machine policy binds at the shared execution boundary, so a mechanics fixture
+    states a machine whose policy permits local inference. No assertion changes.
+    """
+    patcher = unittest.mock.patch.dict(os.environ, {"LAI_MACHINE": "home-wsl"})
+    patcher.start()
+    test.addCleanup(patcher.stop)
+
+
 class Fixture(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.root = _repo(pathlib.Path(self.tmp.name) / "repo")
         self.state = pathlib.Path(self.tmp.name) / "state"
+        permit_local_inference(self)
 
     def tearDown(self) -> None:
         self.tmp.cleanup()

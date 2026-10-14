@@ -10,6 +10,7 @@ intent and invocation accounting.
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import subprocess
 import sys
@@ -67,11 +68,27 @@ def _plan(nodes, *, intent="READ_ONLY"):
             "order": [n["task_id"] for n in nodes], "nodes": nodes}
 
 
+def permit_local_inference(test: unittest.TestCase) -> None:
+    """Declare the machine these mechanics fixtures run on.
+
+    ``_ai`` routes a node to BALANCED, which resolves to the local student role, while
+    the fixtures use claimed-real (SUPPORTED) stub adapters. Hard machine policy is
+    part of execution authority (docs/RUNTIME_AUTHORITY.md) and binds at the shared
+    execution boundary, so the fixture states a machine whose policy permits local
+    inference. No assertion changes: these tests verify propagation/acceptance/
+    workspace mechanics, not machine permission.
+    """
+    patcher = unittest.mock.patch.dict(os.environ, {"LAI_MACHINE": "home-wsl"})
+    patcher.start()
+    test.addCleanup(patcher.stop)
+
+
 class ContractFixture(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.root = _repo(pathlib.Path(self.tmp.name) / "repo")
         self.state = pathlib.Path(self.tmp.name) / "state"
+        permit_local_inference(self)
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
@@ -469,6 +486,7 @@ class WorkspaceAuthorityTests(unittest.TestCase):
         self.workspace = _repo(pathlib.Path(self.tmp.name) / "target")
         (self.workspace / "marker.txt").write_text("workspace-marker-v1\n", encoding="utf-8")
         self.state = pathlib.Path(self.tmp.name) / "state"
+        permit_local_inference(self)
 
     def tearDown(self) -> None:
         self.tmp.cleanup()

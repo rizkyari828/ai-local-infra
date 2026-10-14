@@ -166,8 +166,59 @@ class MachinePolicyTests(unittest.TestCase):
         root = self.root_path()
         (root / "machines").mkdir(parents=True, exist_ok=True)
         (root / "machines" / "broken.yaml").write_text("{ nope", encoding="utf-8")
+        policy = authority.machine_policy({"LAI_MACHINE": "broken"}, root=root)
+        self.assertEqual(authority.MACHINE_DESCRIPTOR_MALFORMED, policy["state"])
+        self.assertIsNotNone(policy["error"])
+        self.assertEqual({}, policy["prohibited"])
         with self.assertRaises(authority.AuthorityError):
-            authority.machine_policy({"LAI_MACHINE": "broken"}, root=root)
+            authority.machine_policy_or_fail({"LAI_MACHINE": "broken"}, root=root)
+
+    def test_mistyped_boolean_policy_field_fails_explicitly(self) -> None:
+        root = self.root_with_descriptor(
+            {"id": "synthetic", "platform": "linux",
+             "provider_availability": {"ollama": "false"}})
+        policy = authority.machine_policy({"LAI_MACHINE": "synthetic"}, root=root)
+        self.assertEqual(authority.MACHINE_POLICY_FIELD_INVALID, policy["state"])
+        self.assertIn("must be a boolean", policy["error"])
+        # A mistyped prohibition is invalid, never a silent permission.
+        self.assertNotEqual(authority.VALID_REGISTERED_MACHINE, policy["state"])
+        with self.assertRaises(authority.AuthorityError):
+            authority.machine_policy_or_fail({"LAI_MACHINE": "synthetic"}, root=root)
+
+    def test_mistyped_local_inference_fails_explicitly(self) -> None:
+        root = self.root_with_descriptor(
+            {"id": "synthetic", "platform": "linux", "local_inference": False})
+        policy = authority.machine_policy({"LAI_MACHINE": "synthetic"}, root=root)
+        self.assertEqual(authority.MACHINE_POLICY_FIELD_INVALID, policy["state"])
+
+    def test_explicit_unknown_selector_is_invalid_not_unregistered(self) -> None:
+        policy = authority.machine_policy({"LAI_MACHINE": "work-mca"})  # typo of work-mac
+        self.assertEqual(authority.EXPLICIT_MACHINE_SELECTOR_INVALID, policy["state"])
+        self.assertIn("not a registered machine", policy["error"])
+        with self.assertRaises(authority.AuthorityError):
+            authority.machine_policy_or_fail({"LAI_MACHINE": "work-mca"})
+
+    def test_auto_discovery_malformed_descriptor_is_not_unrestricted(self) -> None:
+        root = self.root_path()
+        (root / "machines").mkdir(parents=True, exist_ok=True)
+        (root / "machines" / "unreadable.yaml").write_text("{ nope", encoding="utf-8")
+        outcome = authority.machine_policy({}, root=root)
+        self.assertEqual(authority.MACHINE_DESCRIPTOR_MALFORMED, outcome["state"])
+        with self.assertRaises(authority.AuthorityError):
+            authority.machine_policy_or_fail({}, root=root)
+
+    def test_genuinely_unregistered_machine_reports_no_policy(self) -> None:
+        root = self.root_path()
+        (root / "machines").mkdir(parents=True, exist_ok=True)
+        (root / "machines" / "other.yaml").write_text(
+            json.dumps({"id": "other", "platform": "linux", "repo_path": "/somewhere/else",
+                        "provider_availability": {"ollama": False}}), encoding="utf-8")
+        outcome = authority.machine_policy({}, root=root)
+        self.assertEqual(authority.GENUINELY_UNREGISTERED_MACHINE, outcome["state"])
+        self.assertEqual({}, outcome["prohibited"])
+        self.assertIsNone(outcome["error"])
+        # The portable V0.1 behavior is explicitly distinguishable from an invalid policy.
+        self.assertEqual(outcome, authority.machine_policy_or_fail({}, root=root))
 
     def test_machine_local_cannot_override_a_hard_prohibition(self) -> None:
         # provider_availability is owned by the committed descriptor: a local file may
@@ -180,6 +231,22 @@ class MachinePolicyTests(unittest.TestCase):
             json.dumps({"provider_availability": {"ollama": True}}), encoding="utf-8")
         policy = authority.machine_policy({"LAI_MACHINE": "synthetic", "LAI_STATE_DIR": str(state)}, root=root)
         self.assertIn("ollama", policy["prohibited"])
+
+    def test_machine_local_cannot_repair_an_invalid_policy(self) -> None:
+        root = self.root_with_descriptor(
+            {"id": "synthetic", "platform": "linux",
+             "provider_availability": {"ollama": "false"}})
+        state = pathlib.Path(self.tmp.name) / "state"
+        state.mkdir(parents=True)
+        (state / "machine.local.yaml").write_text(
+            json.dumps({"provider_availability": {"ollama": False},
+                        "local_inference": authority.NOT_CONFIGURED_BY_MACHINE_POLICY}), encoding="utf-8")
+        env = {"LAI_MACHINE": "synthetic", "LAI_STATE_DIR": str(state)}
+        policy = authority.machine_policy(env, root=root)
+        self.assertEqual(authority.MACHINE_POLICY_FIELD_INVALID, policy["state"])
+        self.assertEqual({}, policy["prohibited"])
+        with self.assertRaises(authority.AuthorityError):
+            authority.machine_policy_or_fail(env, root=root)
 
     def test_unknown_descriptor_keys_do_not_change_policy(self) -> None:
         root = self.root_with_descriptor(
@@ -270,20 +337,28 @@ class PolicyBlockTests(unittest.TestCase):
                                        "prohibited_providers": {"ollama": failover.NOT_CONFIGURED_BY_MACHINE_POLICY}})
         self.assertEqual(failover.NOT_CONFIGURED_BY_MACHINE_POLICY, block)
 
-    def test_machine_policy_binds_constraints_through_the_cli_helper(self) -> None:
-        import orchestrate_cli
+    def test_machine_policy_binds_constraints_at_the_boundary(self) -> None:
         with unittest.mock.patch.dict(os.environ, {"LAI_MACHINE": "work-mac"}):
-            bound = orchestrate_cli._machine_constraints({"local_only": False})
+            bound = authority.bind_constraints({"local_only": False})
         self.assertEqual({"ollama": authority.NOT_CONFIGURED_BY_MACHINE_POLICY},
                          bound["prohibited_providers"])
+        self.assertEqual("work-mac", bound["machine_policy"]["machine_id"])
+
+    def test_caller_cannot_weaken_a_machine_prohibition(self) -> None:
+        with unittest.mock.patch.dict(os.environ, {"LAI_MACHINE": "work-mac"}):
+            bound = authority.bind_constraints(
+                {"prohibited_providers": {"ollama": None, "deepseek": "caller_stricter"}})
+        self.assertEqual(authority.NOT_CONFIGURED_BY_MACHINE_POLICY,
+                         bound["prohibited_providers"]["ollama"])
+        # A caller may still narrow policy further.
+        self.assertEqual("caller_stricter", bound["prohibited_providers"]["deepseek"])
 
     def test_malformed_policy_refuses_instead_of_permitting(self) -> None:
-        import orchestrate_cli
         with unittest.mock.patch.dict(os.environ, {"LAI_MACHINE": "work-mac"}), \
-                unittest.mock.patch.object(authority, "machine_policy",
+                unittest.mock.patch.object(authority, "machine_policy_or_fail",
                                            side_effect=authority.AuthorityError("boom")):
-            with self.assertRaises(execution.ExecutionError):
-                orchestrate_cli._machine_constraints({})
+            with self.assertRaises(authority.AuthorityError):
+                authority.bind_constraints({})
 
 
 # --------------------------------------------------------------------------- #
@@ -387,7 +462,14 @@ class WorkspaceTests(unittest.TestCase):
         result = authority.resolve_workspace(plain)
         self.assertEqual(str(plain.resolve()), result["workspace"])
         self.assertFalse(result["repository"]["is_repository"])
-        self.assertEqual("name:plain", result["repository"]["id"])
+        # Conservative identity: a hashed canonical path, never a bare directory name,
+        # so two unrelated "plain" directories cannot collide.
+        self.assertTrue(result["repository"]["id"].startswith("path:"))
+        self.assertFalse(result["repository"]["portable"])
+        other = self.base / "elsewhere" / "plain"
+        other.mkdir(parents=True)
+        self.assertNotEqual(result["repository"]["id"],
+                            authority.resolve_workspace(other)["repository"]["id"])
 
     def test_conflicting_explicit_and_discovered_workspace_is_reported(self) -> None:
         other = _repo(self.base / "other", remote="https://example.com/org/other.git")
@@ -504,11 +586,22 @@ class DoctorVerifyRuntimeAgreementTests(unittest.TestCase):
         self.assertEqual("home-wsl:PERMITTED", checks[0].observed)
 
     def test_not_configured_machine_has_no_prohibition(self) -> None:
-        policy = authority.machine_policy({"LAI_MACHINE": "does-not-exist"})
-        self.assertEqual({}, policy["prohibited"])
-        with unittest.mock.patch.dict(os.environ, {"LAI_MACHINE": "does-not-exist"}):
+        # A genuinely unregistered checkout (no explicit selector) keeps the portable
+        # V0.1 behavior and reports it as NO_MACHINE_POLICY, not as a valid empty policy.
+        root = pathlib.Path(tempfile.mkdtemp())
+        (root / "machines").mkdir(parents=True)
+        try:
+            policy = authority.machine_policy({}, root=root)
+            self.assertEqual(authority.GENUINELY_UNREGISTERED_MACHINE, policy["state"])
+            self.assertEqual({}, policy["prohibited"])
+        finally:
+            __import__("shutil").rmtree(root, ignore_errors=True)
+
+    def test_explicit_unknown_machine_fails_in_doctor(self) -> None:
+        with unittest.mock.patch.dict(os.environ, {"LAI_MACHINE": "work-mca"}):
             checks = doctor._authority_checks({}, dict(os.environ))
-        self.assertEqual(doctor.PASS, checks[0].status)
+        self.assertEqual(doctor.FAIL, checks[0].status)
+        self.assertIn(authority.EXPLICIT_MACHINE_SELECTOR_INVALID, checks[0].observed)
 
     def test_malformed_configuration_fails_in_doctor_not_silently(self) -> None:
         with unittest.mock.patch.object(authority, "machine_policy",
@@ -517,13 +610,21 @@ class DoctorVerifyRuntimeAgreementTests(unittest.TestCase):
         self.assertEqual(doctor.FAIL, checks[0].status)
         self.assertIn("bad profile", checks[0].reason)
 
-    def test_verify_warns_and_permits_when_policy_is_unreadable(self) -> None:
-        stderr = __import__("io").StringIO()
-        with unittest.mock.patch.object(authority, "machine_policy",
-                                        side_effect=authority.AuthorityError("bad profile")), \
-                contextlib.redirect_stderr(stderr):
-            self.assertIsNone(VERIFY.machine_local_inference_policy())
-        self.assertIn("machine policy unreadable", stderr.getvalue())
+    def test_verify_refuses_an_invalid_policy_instead_of_probing(self) -> None:
+        # A policy that cannot be resolved is not a permission: no probe, not ready.
+        with unittest.mock.patch.object(authority, "machine_policy") as policy, \
+                unittest.mock.patch.object(VERIFY.urllib.request, "urlopen") as probe:
+            policy.return_value = {"state": authority.MACHINE_POLICY_FIELD_INVALID,
+                                   "prohibited": {}, "local_inference": None,
+                                   "machine_id": "synthetic", "error": "provider_availability.ollama "
+                                                                      "must be a boolean"}
+            out = __import__("io").StringIO()
+            with unittest.mock.patch.dict(os.environ, {"LAI_MACHINE": "synthetic"}), \
+                    contextlib.redirect_stdout(out), contextlib.redirect_stderr(__import__("io").StringIO()):
+                code = VERIFY.main()
+        probe.assert_not_called()
+        self.assertEqual(1, code)
+        self.assertIn("SKIPPED_INVALID_MACHINE_POLICY", out.getvalue())
 
     def test_runtime_unhealthy(self) -> None:
         health = failover.Health(binaries={"opencode": False}, providers={"opencode": {"deepseek"}})
@@ -561,8 +662,7 @@ class AdversarialProbeTests(unittest.TestCase):
 
     def test_P2_explicit_invocation_asks_for_a_forbidden_backend(self) -> None:
         with unittest.mock.patch.dict(os.environ, {"LAI_MACHINE": "work-mac"}):
-            import orchestrate_cli
-            constraints = orchestrate_cli._machine_constraints({"prefer_provider": "ollama"})
+            constraints = authority.bind_constraints({"prefer_provider": "ollama"})
         self.assertEqual("ollama", constraints["prefer_provider"])
         block = failover.policy_block("ollama", "BALANCED", constraints)
         self.assertEqual(authority.NOT_CONFIGURED_BY_MACHINE_POLICY, block)
@@ -626,8 +726,10 @@ class AdversarialProbeTests(unittest.TestCase):
         root = self.base / "badroot"
         (root / "machines").mkdir(parents=True)
         (root / "machines" / "broken.yaml").write_text("nope", encoding="utf-8")
+        policy = authority.machine_policy({"LAI_MACHINE": "broken"}, root=root)
+        self.assertEqual(authority.MACHINE_DESCRIPTOR_MALFORMED, policy["state"])
         with self.assertRaises(authority.AuthorityError):
-            authority.machine_policy({"LAI_MACHINE": "broken"}, root=root)
+            authority.machine_policy_or_fail({"LAI_MACHINE": "broken"}, root=root)
 
     def test_P9_health_changes_between_two_observations(self) -> None:
         first = failover.Health(binaries={"opencode": True}, providers={"opencode": {"ollama"}},
