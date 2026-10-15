@@ -234,11 +234,18 @@ def bounded_result(node: dict[str, Any], result: dict[str, Any]) -> Optional[dic
     unbounded prose blob or a partial/failed result). The text fields are semantic
     (normalized, not presentation-truncated); storage stays bounded by
     MAX_RESULT_JSON at write time."""
+    evidence = result.get("knowledge_evidence")
+    if evidence is not None and not (isinstance(evidence, dict)
+                                     and isinstance(evidence.get("bundle_fingerprint"), str)):
+        # Present but malformed persisted evidence must never be reused and must not
+        # crash the projection: refuse the bounded result so callers fail closed.
+        return None
     if node.get("executor") == "TOOL_ONLY":
         payload = result.get("result")
         if not isinstance(payload, dict) or not payload:
             return None
-        return {"tool_result": {str(k): payload[k] for k in sorted(payload)}}
+        return {"tool_result": {str(k): payload[k] for k in sorted(payload)},
+                **({'knowledge_fingerprint': evidence['bundle_fingerprint']} if evidence else {})}
     acceptance = result.get("acceptance_results")
     if not isinstance(acceptance, dict) or not acceptance:
         return None
@@ -256,6 +263,7 @@ def bounded_result(node: dict[str, Any], result: dict[str, Any]) -> Optional[dic
         "files_changed": sorted(str(f) for f in (result.get("files_changed") or [])),
         "acceptance_results": {str(k): bool(v) for k, v in sorted(acceptance.items())},
         "new_risk_signals": sorted(str(s) for s in (result.get("new_risk_signals") or [])),
+        **({'knowledge_fingerprint': evidence['bundle_fingerprint']} if evidence else {}),
         **({'verified_result': result['verified_result']} if result.get('verified_result') else {}),
         **({'exact_output_fingerprint': result['exact_output_fingerprint']}
            if 'exact_output' in (node.get('acceptance_criteria') or []) else {}),
