@@ -59,6 +59,7 @@
       "key": "model",
       "value": "{{codex.model}}",
       "create": true,
+      "adoptOnly": true,
       "requires": "codex.model"
     },
     {

@@ -732,12 +732,17 @@ def _plan_toml_key(unit: dict[str, Any], ctx: dict[str, Any], base: dict[str, An
     is reported MISSING, not fabricated. The key is only considered at top level
     (before the first table header); a table-scoped key of the same name is left
     untouched. Duplicate top-level declarations and malformed TOML are BLOCKED.
+
+    ``adoptOnly: true`` changes the drift behaviour for this one key: a present
+    value is adopted as-is, never rewritten. A differing value reports DRIFTED
+    (host value preserved) and takes no write; only an absent key is seeded.
     """
     target = pathlib.Path(expand(str(resolve(unit["target"], ctx))))
     key = unit["key"]
     desired_value = resolve(unit["value"], ctx)
     desired_line = f"{key} = {_toml_literal(desired_value)}\n"
     create = bool(unit.get("create"))
+    adopt_only = bool(unit.get("adoptOnly"))
     base.update(target=str(target), key=key, create=create, desired=desired_value)
     if not target.exists():
         base.update(state="MISSING",
@@ -774,8 +779,18 @@ def _plan_toml_key(unit: dict[str, Any], ctx: dict[str, Any], base: dict[str, An
         if '"""' in lines[offsets[0]] or "'''" in lines[offsets[0]]:
             base.update(state="BLOCKED", hard=True, reason=f"multi-line top-level {key} unsupported")
             return base
-        if parsed.get(key) == desired_value:
+        observed = parsed.get(key)
+        if observed == desired_value:
             base.update(state="ALIGNED", reason=f"top-level {key} matches")
+        elif adopt_only:
+            if not isinstance(observed, (str, bool, int, float)):
+                base.update(state="BLOCKED", hard=True,
+                            reason=f"top-level {key} value is not a plain scalar; not guessing")
+                return base
+            base.update(state="DRIFTED",
+                        reason=(f"top-level {key} differs: host {_toml_literal(observed)} vs "
+                                f"declared {_toml_literal(desired_value)}; adopt-only, host value preserved"),
+                        changes=False, write=None)
         else:
             write = "".join(lines[:offsets[0]]) + desired_line + "".join(lines[offsets[0] + 1:])
             base.update(state="DRIFTED", reason=f"top-level {key} differs",
