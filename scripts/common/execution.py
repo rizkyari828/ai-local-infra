@@ -48,9 +48,9 @@ ACCEPTED = (SUCCESS, "NO_CHANGE_REQUIRED")
 # is never acceptance; structured criteria that pass are the only auto-accepted signal.
 ACCEPTANCE_PASSED, ACCEPTANCE_FAILED, ACCEPTANCE_UNVERIFIED = "PASSED", "FAILED", "UNVERIFIED"
 
-WORKER_ISOLATION_NOTE = ("Execute only this node's objective. Do not re-plan the master "
-                         "objective, do not spawn nested orchestrators or sub-agents, and return "
-                         "a concise structured result.")
+WORKER_TASK_NOTE = ("Execute only this node's objective. Do not re-plan the master "
+                    "objective, do not spawn nested orchestrators or sub-agents")
+WORKER_ISOLATION_NOTE = WORKER_TASK_NOTE + ", and return a concise structured result."
 
 # Explicit authority boundary: retrieved repository text is DATA, never instruction.
 TASK_AUTHORITY_HEADER = "=== TASK / POLICY / PERMISSIONS (trusted) ==="
@@ -111,6 +111,21 @@ def _normalize_acceptance(value: Any) -> Optional[bool]:
     return None
 
 
+def _acceptance_evidence(node: dict[str, Any], result: dict[str, Any]):
+    """Exact-output evidence comes from complete capture, never worker assertions."""
+    acceptance = result.get('acceptance_results')
+    if 'exact_output' not in (node.get('acceptance_criteria') or []):
+        return acceptance
+    if acceptance is not None and not isinstance(acceptance, dict):
+        return acceptance  # malformed evidence retains the existing fail-closed behavior
+    acceptance = dict(acceptance or {})
+    acceptance.pop('exact_output', None)
+    expected, response = node.get('exact_output'), result.get('response_text')
+    if isinstance(expected, str) and isinstance(response, str) and result.get('response_complete') is True:
+        acceptance['exact_output'] = response == expected
+    return acceptance
+
+
 def _acceptance(node: dict[str, Any], result: dict[str, Any]) -> tuple[str, Optional[str]]:
     """Classify task acceptance independently of the process exit status.
 
@@ -121,7 +136,7 @@ def _acceptance(node: dict[str, Any], result: dict[str, Any]) -> tuple[str, Opti
     A model's prose or a truthy string is never acceptance. Malformed or conflicting
     acceptance is UNVERIFIED, never SUCCESS.
     """
-    acceptance = result.get("acceptance_results")
+    acceptance = _acceptance_evidence(node, result)
     criteria = list(node.get("acceptance_criteria") or [])
     if isinstance(acceptance, dict) and acceptance:
         if not criteria:
@@ -287,11 +302,12 @@ class CliBackend(Backend):
         category = classify_failure(completed.returncode, completed.stderr)
         if completed.returncode == 0 and not category:
             output = (completed.stdout or "").strip()
-            if not output:
+            if not output and 'exact_output' not in request.get('acceptance_criteria', []):
                 return {"task_id": request["task_id"], "status": "UNKNOWN",
                         "summary": "backend produced no output"}
             return {"task_id": request["task_id"], "status": SUCCESS,
                     "completion_signal": "agent_reported", "summary": output[-400:],
+                    'response_text': completed.stdout, 'response_complete': isinstance(completed.stdout, str),
                     "acceptance_results": {}, "files_changed": [], "decisions": [], "new_risk_signals": []}
         return {"task_id": request["task_id"], "status": FAILURE, "failure_category": category or "UNKNOWN_FAILURE",
                 "summary": (completed.stderr or "")[-400:], "acceptance_results": {},
@@ -461,6 +477,10 @@ def resolve_plan(plan: dict[str, Any], backend: Backend, surface: Optional[str] 
             continue
         tier = node["routing"]["tier"]
         effort = node["routing"]["effort"]
+        if 'exact_output' in (node.get('acceptance_criteria') or []) and not isinstance(node.get('exact_output'), str):
+            resolutions.append({'task_id':node['task_id'], 'tier':tier, 'runnable':False,
+                                'reason':'EXACT_OUTPUT_EXPECTED_MISSING'})
+            continue
         if node.get('execution_requirement') is not None:
             registry = dict(backends or {})
             registry.setdefault(backend.name, backend)
@@ -658,6 +678,10 @@ def execute_plan(plan: dict[str, Any], *, backend: Backend, run_id: Optional[str
                     raise ExecutionError('EXECUTION_REQUIREMENT_INVALID')
                 node['execution_requirement'] = copy.deepcopy(execution_requirements[node['task_id']])
     constraints = copy.deepcopy(constraints)
+    for node in plan.get('nodes', []):
+        if 'exact_output' in node and (not isinstance(node['exact_output'], str)
+                or 'exact_output' not in (node.get('acceptance_criteria') or [])):
+            raise ExecutionError('EXACT_OUTPUT_CONTRACT_INVALID')
     if not plan.get("valid"):
         raise ExecutionError("refusing to execute an invalid plan")
     if not confirm and not dry_run:
@@ -1250,6 +1274,8 @@ def _plan_fingerprint(plan: dict[str, Any]) -> str:
             "acceptance": list(node.get("acceptance_criteria") or []),
             "tool": node.get("tool"),
             "routing": (node.get("routing") or {}),
+            **({'exact_output': node.get('exact_output')}
+               if 'exact_output' in (node.get('acceptance_criteria') or []) else {}),
             **({'execution_requirement': execution_requirement(node)}
                if node.get('execution_requirement') is not None else {}),
         } for node in plan.get("nodes", [])],
@@ -1648,6 +1674,7 @@ def _run_node(node, deps, results, backend, resolution, *, state_dir, record_evi
             process_ok = result.get("status") == SUCCESS and bool(result.get("completion_signal"))
             acceptance_state, acceptance_reason = (ACCEPTANCE_UNVERIFIED, "process did not complete")
             if process_ok:
+                result = {**result, 'acceptance_results': _acceptance_evidence(node, result)}
                 acceptance_state, acceptance_reason = _acceptance(node, result)
             accepted = process_ok and acceptance_state == ACCEPTANCE_PASSED
             attempt_status = ("SUCCESS" if accepted
@@ -1797,6 +1824,8 @@ def _request(node, resolution, dependency_summaries, execution_id, tier, backend
         "read_only": read_only, "task_contract": contract,
         'role': (execution_requirement(node) or {}).get('role', node['routing'].get('role')),
         'execution_requirement': execution_requirement(node),
+        **({'exact_output': node.get('exact_output')}
+           if 'exact_output' in (node.get('acceptance_criteria') or []) else {}),
         "delivered_input_fingerprint": delivered_input_fingerprint(node, dependency_summaries, manifest),
         "prompt": _prompt(node, dependency_summaries, read_only=read_only, context_pack=context_pack,
                           manifest=manifest),
@@ -1839,6 +1868,7 @@ def _canonical_semantics(node: dict[str, Any], dependency_summaries: list[dict[s
         "capability_requirement": contract.get("capability_requirement"),
         "context": result_cache.context_identity(manifest),
         "dependencies": _canonical_dependencies(dependency_summaries),
+        **({'exact_output': node['exact_output']} if 'exact_output' in node else {}),
         **({'execution_requirement': execution_requirement(node)}
            if node.get('execution_requirement') is not None else {}),
     }
@@ -1854,12 +1884,14 @@ def delivered_input_fingerprint(node: dict[str, Any], dependency_summaries: list
                           .encode("utf-8", "replace")).hexdigest()[:32]
 
 
-def _render_context_pack(context_pack: Optional[dict[str, Any]]) -> str:
+def _render_context_pack(context_pack: Optional[dict[str, Any]], redundant=None) -> str:
     if not context_pack:
         return ""
     lines = []
     for item in context_pack.get("items") or []:
         label = item.get("source_kind", "CONTEXT")
+        if redundant is not None and label in redundant and item.get('content') == redundant[label]:
+            continue  # identical authoritative text is already rendered above
         identifier = item.get("source_id") or ""
         lines.append(f"[{label} {identifier}] {item.get('content', '')}")
     return "\n".join(lines)
@@ -1870,22 +1902,31 @@ def _prompt(node, dependency_summaries, read_only: bool = False,
             manifest: Optional[dict[str, Any]] = None) -> str:
     semantics = _canonical_semantics(node, dependency_summaries, manifest)
     requirement = semantics.get('execution_requirement')
+    exact = 'exact_output' in semantics['acceptance']
+    isolation = (WORKER_TASK_NOTE + '. Return only the declared exact_output text, subject to mandatory '
+                 'system/developer instructions. Do not suppress mandatory safety guidance.'
+                 if exact else WORKER_ISOLATION_NOTE)
+    literal = (f"\nExact output (JSON string): {json.dumps(semantics['exact_output'])}"
+               if 'exact_output' in semantics else '')
     role = f"Role: {requirement['role']}\n" if requirement else ''
     deps = "; ".join(f"{d['task_id']}: {d['summary']}" for d in semantics["dependencies"]) or "none"
     guard = "\nRead-only task: do not modify, create, or delete any files." if read_only else ""
     target_line = ", ".join(semantics.get("targets") or []) or "none stated"
     constraints = ", ".join(semantics.get("constraints") or []) or "none stated"
     permissions = semantics.get("permissions") or "none stated"
-    context_text = _render_context_pack(context_pack)
+    context_text = _render_context_pack(context_pack, {
+        'OBJECTIVE_SUMMARY': semantics['objective'],
+        'ACCEPTANCE_CRITERIA': '\n'.join(semantics['acceptance'])})
     data_block = (f"\n{DATA_AUTHORITY_HEADER}\n{DATA_AUTHORITY_NOTE}\n{context_text}"
                   if context_text else "")
-    return (f"{WORKER_ISOLATION_NOTE}{guard}\n\n{TASK_AUTHORITY_HEADER}\n"
+    return (f"{isolation}{guard}\n\n{TASK_AUTHORITY_HEADER}\n"
             f"{role}"
             f"Objective: {semantics['objective']}\n"
             f"Operation: {semantics.get('operation', 'execute')}\n"
             f"Targets: {target_line}\n"
             f"Constraints: {constraints}\nPermissions: {permissions}\n"
             f"Acceptance: {', '.join(semantics.get('acceptance') or [])}\nDependencies: {deps}"
+            f"{literal}"
             f"{data_block}")
 
 
@@ -1942,6 +1983,9 @@ def _finalize(node, result, status, category, initial_tier, final_tier, attempts
               "recommended_followups": result.get("recommended_followups", []),
               "initial_tier": initial_tier, "final_tier": accepted_tier, "attempts": attempts,
               "escalated": accepted_tier != initial_tier, "escalations": escalations}
+    if ('exact_output' in (node.get('acceptance_criteria') or [])
+            and result.get('response_complete') is True and isinstance(result.get('response_text'), str)):
+        record['exact_output_fingerprint'] = hashlib.sha256(result['response_text'].encode('utf-8')).hexdigest()
     if node.get("intent") == "MUTATING":
         # Durable mutation-uncertainty fact: a real launch whose outcome was not durably
         # accepted is potentially side-effecting and must never be auto-replayed on resume.

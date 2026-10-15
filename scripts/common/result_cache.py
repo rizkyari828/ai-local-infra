@@ -167,6 +167,8 @@ def task_semantic_fingerprint(node: dict[str, Any], *,
         "produces_artifacts": sorted(str(p) for p in (node.get("produces_artifacts") or [])),
         "consumes_results_from": sorted(str(c) for c in (node.get("consumes_results_from") or [])),
         "tool": node.get("tool"),
+        **({'exact_output': node.get('exact_output')}
+           if 'exact_output' in (node.get('acceptance_criteria') or []) else {}),
     }
     return _hash(material)
 
@@ -236,12 +238,16 @@ def bounded_result(node: dict[str, Any], result: dict[str, Any]) -> Optional[dic
         return None
     if not all(bool(ok) for ok in acceptance.values()):
         return None
+    if 'exact_output' in (node.get('acceptance_criteria') or []) and not result.get('exact_output_fingerprint'):
+        return None
     return {
         "summary": _normalize(result.get("summary")),
         "decisions": [_normalize(entry) for entry in (result.get("decisions") or [])],
         "files_changed": sorted(str(f) for f in (result.get("files_changed") or [])),
         "acceptance_results": {str(k): bool(v) for k, v in sorted(acceptance.items())},
         "new_risk_signals": sorted(str(s) for s in (result.get("new_risk_signals") or [])),
+        **({'exact_output_fingerprint': result['exact_output_fingerprint']}
+           if 'exact_output' in (node.get('acceptance_criteria') or []) else {}),
     }
 
 
