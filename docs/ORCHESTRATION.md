@@ -4,9 +4,11 @@
 with per-node symbolic routing and context budgets, so you can give a single
 high-level objective instead of hand-splitting work into Low/Medium/High prompts.
 
-**V0.1 is plan-only.** It calls no model, makes no network request, spawns no
-worker, and persists nothing. The raw objective is processed in memory and is
-never written to `evidence.db`, `knowledge/*`, a decision id, or any plan file.
+`plan` calls no model, makes no network request, spawns no worker, and persists
+nothing; the raw objective is processed in memory and is never written to
+`evidence.db`, `knowledge/*`, a decision id, or any plan file. `run` executes the
+validated graph instead (see [Execution](EXECUTION.md)) and persists the
+orchestration lifecycle to the operational store (`../scripts/common/orchestration_store.py`).
 
 ```bash
 ./scripts/orchestrate plan --objective "Audit the multi-machine AI infra, fix graphify config if needed, update docs, run tests, and give the final report"
@@ -111,6 +113,10 @@ Each node carries `task_family` + routing recommendation so Phase 5B can connect
 `task node -> execution -> learn start -> learn finish` via an opaque `decision_id`.
 Planning records **no** synthetic outcomes and writes nothing.
 
-Not implemented in V0.1: live multi-model execution, worker spawn, automatic
-model/provider switching, automatic planner switching, token accounting,
-retention, embeddings, and Graphify rebuild.
+Implemented since this section was first written: live multi-model execution and
+worker spawn (`orchestrate_cli.cmd_run` -> `execution.execute_plan`), automatic
+model/provider switching (`failover.resolve`; see
+[Exact orchestration routing](ORCHESTRATION_ROUTING_FIX.md)), and explicit,
+user-invoked Graphify rebuild (`bootstrap.run_graph_rebuild`). Still not implemented
+in V0.1: automatic planner switching, token accounting, retention, embeddings, and
+automatic Graphify rebuild.
