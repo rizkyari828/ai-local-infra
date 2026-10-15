@@ -92,4 +92,6 @@ identity even with the same filename and repository HEAD. Incompatible work must
 be revalidated rather than adopted under the old identity.
 
 Phase A core gate: focused file-consumer tests plus the unchanged frozen-contract
-suite. Production integration and recovery have a separate Phase B gate.
+suite. Phase B integrates this runtime into the execution controller and the
+Master B durable lifecycle; the Phase B tests are offline-only and exercise no
+live provider or model.
