@@ -32,6 +32,7 @@ import context_retrieval  # scripts/common, on sys.path
 import derived_knowledge as knowledge  # scripts/common, on sys.path
 import evidence  # scripts/common, on sys.path
 import result_cache  # scripts/common, on sys.path
+import knowledge_runtime
 import orchestration_store  # scripts/common, on sys.path
 
 ROOT = infra.ROOT
@@ -773,6 +774,89 @@ def _current_knowledge(node, provider):
     return copy.deepcopy(document)
 
 
+def _knowledge_state(node, provider, root):
+    try:
+        snapshot = knowledge_runtime.resolve(root, node)
+    except knowledge_runtime.KnowledgeRuntimeError as exc:
+        raise active_work.WorkError(str(exc)) from None
+    document = _current_knowledge(node, provider)
+    if snapshot is not None and document is not None:
+        raise active_work.WorkError('KNOWLEDGE_AUTHORITY_CONFLICT')
+    if snapshot is None and document is not None:
+        import knowledge_contract
+        if knowledge_contract.select(document)['outcome'] != knowledge_contract.READY:
+            raise active_work.WorkError('REQUIRED_CONTEXT_UNAVAILABLE')
+    return (snapshot['document'] if snapshot is not None else document), snapshot
+
+
+def _knowledge_evidence(snapshot):
+    return knowledge_runtime.evidence(snapshot) if snapshot is not None else None
+
+
+def _check_knowledge_evidence(result, snapshot):
+    if result.get('knowledge_evidence') != _knowledge_evidence(snapshot):
+        raise active_work.WorkError('PERSISTED_KNOWLEDGE_EVIDENCE_INVALID')
+
+
+def _attach_knowledge(context, snapshot):
+    if snapshot is None:
+        return
+    if context is None or context.get('status') != context_retrieval.STATUS_READY:
+        raise active_work.WorkError('CONTEXT_REQUIRED_SOURCE_MISSING')
+    bundle = snapshot['bundle']
+    if context.get('pack') is None:
+        context['pack'] = {'items': []}
+    context['pack']['items'].append({'source_kind': 'VALIDATED_KNOWLEDGE',
+        'source_id': knowledge_runtime.VERSION,
+        'content': knowledge_runtime.stable({'bundle_version': bundle['bundle_version'], 'items': bundle['items']})})
+    context['manifest'].setdefault('items', []).append({'source_kind': 'VALIDATED_KNOWLEDGE',
+        'source_id': knowledge_runtime.VERSION, 'fingerprint': bundle['bundle_fingerprint'], 'required': True})
+    context['manifest']['knowledge_evidence'] = _knowledge_evidence(snapshot)
+
+
+def _check_dependency_knowledge(node, plan, results, root):
+    pending, seen = list(node['depends_on']), set()
+    by_id = {n['task_id']: n for n in plan['nodes']}
+    while pending:
+        task = pending.pop()
+        if task in seen:
+            continue
+        seen.add(task)
+        dependency = by_id.get(task)
+        if dependency is None:
+            # A dependency id absent from the plan cannot be validated: fail closed.
+            raise active_work.WorkError('DEPENDENCY_KNOWLEDGE_UNKNOWN')
+        pending.extend(dependency['depends_on'])
+        if results.get(task, {}).get('status') not in ACCEPTED:
+            continue
+        try:
+            snapshot = knowledge_runtime.resolve(root, dependency)
+        except knowledge_runtime.KnowledgeRuntimeError as exc:
+            raise active_work.WorkError(str(exc)) from None
+        if results[task].get('knowledge_evidence') != _knowledge_evidence(snapshot):
+            raise active_work.WorkError('DEPENDENCY_KNOWLEDGE_CHANGED')
+
+
+def _input_budget(node, adapter, context, facts, prompt=None):
+    if prompt is None:
+        prompt = _prompt(node, facts, read_only=node.get('intent') == 'READ_ONLY',
+                        context_pack=(context or {}).get('pack'), manifest=(context or {}).get('manifest'))
+    limit = context_retrieval.load_budgets().get((node.get('context') or {}).get('budget', 'SMALL'))
+    if limit is not None and len(prompt) > limit:
+        raise active_work.WorkError('CONTEXT_BUDGET_INSUFFICIENT')
+    # Native adapter bounds only; no invented conversion from tokens to characters.
+    # A declared bound must be a positive integer: an absent key means "no declared
+    # bound", while 0, a negative, or a non-int is an invalid declaration (never an
+    # implicit "unlimited") and fails closed.
+    capabilities = adapter.capabilities()
+    for key, size in [('max_context_chars', len(prompt)), ('max_context_bytes', len(prompt.encode('utf-8')))]:
+        bound = capabilities.get(key)
+        if bound is None:
+            continue
+        if type(bound) is not int or bound <= 0 or size > bound:
+            raise active_work.WorkError('CONTEXT_BUDGET_INSUFFICIENT')
+
+
 def execute_plan(plan: dict[str, Any], *, backend: Backend, run_id: Optional[str] = None,
                  state_dir: Optional[pathlib.Path] = None, repo_root: Optional[pathlib.Path] = None,
                  confirm: bool = False, dry_run: bool = False, allow_dirty: bool = False,
@@ -899,6 +983,12 @@ def execute_plan(plan: dict[str, Any], *, backend: Backend, run_id: Optional[str
             prior = previous['nodes'].get(task_id, {})
             if node.get('executor') == 'TOOL_ONLY' or prior.get('status') not in ACCEPTED:
                 continue
+            try:
+                _, snapshot = _knowledge_state(node, knowledge_provider, repo_root)
+                _check_knowledge_evidence(prior, snapshot)
+            except active_work.WorkError as exc:
+                resume_refusal = (task_id, 'REFUSE_RESUME_KNOWLEDGE: ' + str(exc), ACCEPTANCE_UNVERIFIED)
+                break
             verdict, reason = _persisted_acceptance(node, prior, _dependency_facts(node, previous['nodes']))
             if verdict != ACCEPTANCE_PASSED:
                 category = ('REFUSE_RESUME_VERIFIED_EVIDENCE_INVALID' if reason == 'VERIFIED_EVIDENCE_INVALID'
@@ -989,10 +1079,16 @@ def execute_plan(plan: dict[str, Any], *, backend: Backend, run_id: Optional[str
                     break
                 try:
                     current_context = _build_node_context(node, _dependency_facts(node, results), repo_root)
+                    document, snapshot = _knowledge_state(node, knowledge_provider, repo_root)
+                    _check_knowledge_evidence(results[task_id], snapshot)
+                    _check_dependency_knowledge(node, plan, results, repo_root)
+                    _attach_knowledge(current_context, snapshot)
+                    current_backend = backend_registry.get(resolutions[task_id].get('backend'), backend)
+                    if snapshot is not None:
+                        _input_budget(node, current_backend, current_context, _dependency_facts(node, results))
                     current_b = active_work.identity(node, repo_root, current_context,
                         _dependency_facts(node, results), bind_machine_policy(constraints),
-                        resolutions[task_id], backend_registry.get(resolutions[task_id].get("backend"), backend),
-                        _current_knowledge(node, knowledge_provider))
+                        resolutions[task_id], current_backend, document)
                 except active_work.WorkError as exc:
                     reject_adoption(task_id, str(exc))
                     break
@@ -1023,8 +1119,16 @@ def execute_plan(plan: dict[str, Any], *, backend: Backend, run_id: Optional[str
                 results[task_id] = {"status": SKIPPED, "task_id": task_id}
                 continue
             if node.get("executor") == "TOOL_ONLY":
+                try:
+                    document, snapshot = _knowledge_state(node, knowledge_provider, repo_root)
+                    _check_dependency_knowledge(node, plan, results, repo_root)
+                except active_work.WorkError as exc:
+                    reject_adoption(task_id, str(exc))
+                    continue
                 results[task_id] = _run_tool_node(node, deps, results, tool_executor,
                                                   state_dir=state_dir, record_evidence=record_evidence)
+                if snapshot is not None:
+                    results[task_id]['knowledge_evidence'] = _knowledge_evidence(snapshot)
                 # Deterministic results always carry a fingerprint: descendant DAG identity
                 # must be complete regardless of whether the optional result cache is on.
                 if results[task_id]["status"] in (SUCCESS, "NO_CHANGE_REQUIRED"):
@@ -1041,6 +1145,7 @@ def execute_plan(plan: dict[str, Any], *, backend: Backend, run_id: Optional[str
             identity = _cache_identity(node, context_result, dependency_summaries, identity_project,
                                        freshness, state["head"])
             refresh_count = [0]
+            knowledge_snapshot = [None]
             def refresh():
                 effective = bind_machine_policy(constraints)
                 fresh_bindings = resolve_plan({**plan, "nodes": [node]}, backend, surface,
@@ -1052,6 +1157,7 @@ def execute_plan(plan: dict[str, Any], *, backend: Backend, run_id: Optional[str
                 for dep in (deps if refresh_count[0] else []):
                     dep_node = next(t for t in plan["nodes"] if t["task_id"] == dep)
                     if dep_node.get("executor") == "TOOL_ONLY":
+                        _, dep_snapshot = _knowledge_state(dep_node, knowledge_provider, repo_root)
                         if dep_node.get("tool", {}).get("operation") == "repository_state":
                             facts_now = deterministic.ToolExecutor(root=repo_root)._repository_state()
                             prior = results[dep]
@@ -1062,16 +1168,21 @@ def execute_plan(plan: dict[str, Any], *, backend: Backend, run_id: Optional[str
                                                       state_dir=state_dir, record_evidence=False)
                         if refreshed["status"] not in (SUCCESS, "NO_CHANGE_REQUIRED"):
                             raise active_work.WorkError("DEPENDENCY_CURRENTLY_INVALID")
+                        if dep_snapshot is not None:
+                            refreshed['knowledge_evidence'] = _knowledge_evidence(dep_snapshot)
                         _annotate_result(dep_node, refreshed)
                         results[dep] = refreshed
                 facts = _dependency_facts(node, results)
                 fresh_context = _build_node_context(node, facts, repo_root)
-                document = _current_knowledge(node, knowledge_provider)
+                document, snapshot = _knowledge_state(node, knowledge_provider, repo_root)
+                _check_dependency_knowledge(node, plan, results, repo_root)
+                _attach_knowledge(fresh_context, snapshot)
+                knowledge_snapshot[0] = snapshot
                 selected_backend = backend_registry.get(fresh_bindings[0].get("backend"), backend)
                 work_identity = active_work.identity(node, repo_root, fresh_context, facts,
                     effective, fresh_bindings[0], selected_backend, document)
                 # Contract input is supplied explicitly; no runtime retrieval/skill loading.
-                if document:
+                if document and snapshot is None:
                     import knowledge_contract
                     selected = knowledge_contract.select(document)
                     if selected["entries"] and fresh_context.get("pack") is None:
@@ -1085,6 +1196,8 @@ def execute_plan(plan: dict[str, Any], *, backend: Backend, run_id: Optional[str
                     fresh_context["manifest"].setdefault("items", []).append({
                         "source_kind": "knowledge_contract", "source_id": "selected",
                         "fingerprint": selected["delivered_identity"], "required": True})
+                if snapshot is not None:
+                    _input_budget(node, selected_backend, fresh_context, facts)
                 refresh_count[0] += 1
                 return work_identity, (fresh_context, facts, effective, fresh_bindings[0])
 
@@ -1101,6 +1214,25 @@ def execute_plan(plan: dict[str, Any], *, backend: Backend, run_id: Optional[str
                     contract = worker_node.setdefault("task_contract", {})
                     contract["constraints"] = list(contract.get("constraints") or []) + [
                         "Mutation scope: this repository workspace only; external service mutations are not authorized"]
+                snapshot = knowledge_snapshot[0]
+                def validate_launch(request):
+                    try:
+                        latest = knowledge_runtime.resolve(repo_root, node)
+                    except knowledge_runtime.KnowledgeRuntimeError as exc:
+                        raise active_work.WorkError(str(exc)) from None
+                    if _knowledge_evidence(latest) != _knowledge_evidence(snapshot):
+                        raise active_work.WorkError('KNOWLEDGE_CHANGED_BEFORE_LAUNCH')
+                    _check_dependency_knowledge(node, plan, results, repo_root)
+                    if snapshot is not None:
+                        expected = knowledge_runtime.stable({'bundle_version': knowledge_runtime.VERSION,
+                                                             'items': snapshot['bundle']['items']})
+                        items = [i for i in (request.get('context_pack') or {}).get('items', [])
+                                 if i.get('source_kind') == 'VALIDATED_KNOWLEDGE']
+                        if (items != [{'source_kind': 'VALIDATED_KNOWLEDGE',
+                                      'source_id': knowledge_runtime.VERSION, 'content': expected}]
+                                or request['prompt'].count(expected) != 1
+                                or request['context_manifest'].get('knowledge_evidence') != _knowledge_evidence(snapshot)):
+                            raise active_work.WorkError('KNOWLEDGE_DELIVERY_INVALID')
                 result = _run_node(worker_node, deps, results, backend, binding,
                     state_dir=state_dir, record_evidence=record_evidence,
                     infra_retries=infra_retries, same_tier_retries=same_tier_retries,
@@ -1109,11 +1241,14 @@ def execute_plan(plan: dict[str, Any], *, backend: Backend, run_id: Optional[str
                     backends=backend_registry, health=health, constraints=effective,
                     attempts=attempts, context_manifests=context_manifests,
                     dependency_summaries=facts, prebuilt_context=context,
-                    durable_store=work_store, claim=claim, owner_run=run_id)
+                    durable_store=work_store, claim=claim, owner_run=run_id, prelaunch_check=validate_launch)
+                if snapshot is not None and result.get('attempts', 0) > 0:
+                    result['knowledge_evidence'] = _knowledge_evidence(snapshot)
                 return _redact_value(result)
 
             try:
                 def check_adoption(result):
+                    _check_knowledge_evidence(result, knowledge_snapshot[0])
                     verdict, _ = _persisted_acceptance(node, result, _dependency_facts(node, results))
                     if verdict != ACCEPTANCE_PASSED:
                         raise active_work.WorkError('PERSISTED_ACCEPTANCE_' + verdict)
@@ -1142,8 +1277,9 @@ def execute_plan(plan: dict[str, Any], *, backend: Backend, run_id: Optional[str
                             else result_cache.REASON_CACHE_MISS})
                 context_manifests.setdefault(task_id, (context_result or {}).get("manifest"))
             except active_work.WorkError as exc:
-                if str(exc).startswith('PERSISTED_ACCEPTANCE_'):
-                    verdict = str(exc).removeprefix('PERSISTED_ACCEPTANCE_')
+                if str(exc).startswith(('PERSISTED_ACCEPTANCE_', 'PERSISTED_KNOWLEDGE_')):
+                    verdict = (str(exc).removeprefix('PERSISTED_ACCEPTANCE_')
+                               if str(exc).startswith('PERSISTED_ACCEPTANCE_') else ACCEPTANCE_UNVERIFIED)
                     reject_adoption(task_id, str(exc), verdict)
                     node_result = results[task_id]
                     cache_meta['rejected'] += 1
@@ -1638,7 +1774,7 @@ def _run_node(node, deps, results, backend, resolution, *, state_dir, record_evi
               repo_root, candidates=None, backends=None, health=None,
               constraints=None, attempts=None, context_manifests=None,
               dependency_summaries=None, prebuilt_context=None,
-              durable_store=None, claim=None, owner_run=None) -> dict[str, Any]:
+              durable_store=None, claim=None, owner_run=None, prelaunch_check=None) -> dict[str, Any]:
     tier = node["routing"]["tier"]
     requirement = execution_requirement(node)
     initial_tier = tier
@@ -1775,6 +1911,14 @@ def _run_node(node, deps, results, backend, resolution, *, state_dir, record_evi
             manifest = context_manifests.setdefault(node["task_id"], context_result["manifest"]
                                                     if context_result is not None else {})
             manifest["delivered_input_fingerprint"] = request["delivered_input_fingerprint"]
+        try:
+            if prelaunch_check is not None:
+                prelaunch_check(request)
+            if (context_result or {}).get('manifest', {}).get('knowledge_evidence') is not None:
+                _input_budget(node, current_backend, context_result, dependency_summaries, request['prompt'])
+        except active_work.WorkError as exc:
+            return _finalize_node(node, {}, BLOCKED, str(exc), initial_tier, tier, attempt,
+                escalations, decision_id, resolution, state_dir, record_evidence, candidate=last_launched)
         if durable_store is not None:
             durable_store.launch(claim)  # durable intent before any possible external call
         attempt += 1
