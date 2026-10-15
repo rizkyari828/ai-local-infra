@@ -31,8 +31,9 @@ carries only what the service reported; absent token/context values stay `None`
 and are never fabricated.
 
 Provider resolution is a small registry (`PROVIDER_BUILDERS`) plus
-`build_provider(config, name)`, so a future `DeepSeekProvider` or
-`CodexProvider` is added by registration, not by runtime branching.
+`build_provider(config, name)`. `DeepSeekProvider` is implemented
+(`../scripts/common/providers.py`); a future `CodexProvider` is added by
+registration, not by runtime branching.
 
 ## Configuration and portability
 
@@ -114,11 +115,15 @@ Ollama. A live smoke test exists but is skipped unless
 `LAI_OLLAMA_INTEGRATION=1` and a healthy endpoint/model are already present; it
 never downloads a model.
 
-## Future compatibility
+## Compatibility
 
-Routing is not implemented. `RuntimeResult` already carries success/failure,
-failure category, provider, model, duration, attempt count, and `trace_id`, which
-is the information a future policy needs:
+Model routing is implemented at the orchestration layer, not inside this runtime:
+`../scripts/common/routing.py` recommends a task-class tier/effort,
+`../scripts/common/route_cli.py` exposes it, and `../scripts/common/failover.py`
+resolves exact and fallback bindings (see [Model routing](MODEL_ROUTING.md) and
+[Exact orchestration routing](ORCHESTRATION_ROUTING_FIX.md)). This runtime keeps
+returning success/failure, failure category, provider, model, duration, attempt
+count, and `trace_id` — the per-attempt evidence routing consumes:
 
 ```text
 Qwen local -> DeepSeek -> Codex
