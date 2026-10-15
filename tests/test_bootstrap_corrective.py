@@ -285,26 +285,31 @@ class CodexModelTests(CorrectiveCliBase):
         first_table = next(i for i, line in enumerate(lines) if line.lstrip().startswith("["))
         self.assertLess(model_line, first_table)
 
-    def test_drifted_model_updated_preserving_unrelated(self) -> None:
+    def test_drifted_model_preserved_not_overwritten(self) -> None:
         declared = self.declared_model()
         drifted = "gpt-5.4"
         self.assertNotEqual(drifted, declared,
                             "the drifted fixture value must differ from the declared value")
-        self.write(self.config,
-                   f'model = "{drifted}"\n'
-                   'model_reasoning_effort = "high"\n\n'
-                   '[projects."/p"]\n'
-                   'trust_level = "trusted"\n\n'
-                   '[mcp_servers.other]\n'
-                   'command = "/usr/bin/other"\n')
+        original = (f'model = "{drifted}"\n'
+                    'model_reasoning_effort = "high"\n\n'
+                    '[projects."/p"]\n'
+                    'trust_level = "trusted"\n\n'
+                    '[mcp_servers.other]\n'
+                    'command = "/usr/bin/other"\n')
+        self.write(self.config, original)
         result = self.cli("apply")
         self.assertEqual(0, result.returncode, result.stderr)
         after = self.config.read_text(encoding="utf-8")
-        self.assertIn(f'model = "{declared}"', after)
-        self.assertNotIn(drifted, after)
+        self.assertIn(f'model = "{drifted}"', after)      # host value preserved
+        self.assertNotIn(f'model = "{declared}"', after)  # not overwritten
         self.assertIn('model_reasoning_effort = "high"', after)
         self.assertIn("[mcp_servers.other]", after)
         self.assertIn('trust_level = "trusted"', after)
+        unit = self.plan()["codex.model"]
+        self.assertEqual("DRIFTED", unit["state"])
+        self.assertFalse(unit.get("changes"))
+        self.assertIsNone(unit.get("write"))
+        self.assertIn("preserved", unit.get("reason", ""))
 
     def test_matching_model_is_aligned(self) -> None:
         self.write(self.config, f'model = "{self.declared_model()}"\n')
@@ -352,6 +357,79 @@ class CodexModelTests(CorrectiveCliBase):
         second = self.cli("apply")
         self.assertIn("No action taken", second.stdout)
         self.assertEqual(after_first, self.config.read_bytes())
+
+
+class CodexModelAdoptOnlyTests(CorrectiveCliBase):
+    """Adopt-only semantics for the ``codex.model`` toml-key unit (T1..T5)."""
+
+    def declared_model(self) -> str:
+        """The ``codex.model`` this machine's descriptor effectively declares."""
+        ctx, _meta = bootstrap.load_effective(self.env)
+        return ctx["codex"]["model"]
+
+    def drifted_value(self) -> str:
+        declared = self.declared_model()
+        drifted = "gpt-5.4"
+        self.assertNotEqual(drifted, declared)
+        return drifted
+
+    def test_T1_missing_key_is_seeded_with_descriptor_value(self) -> None:
+        self.write(self.config, 'model_reasoning_effort = "high"\n')
+        result = self.cli("apply")
+        self.assertEqual(0, result.returncode, result.stderr)
+        after = self.config.read_text(encoding="utf-8")
+        self.assertIn(f'model = "{self.declared_model()}"', after)
+        self.assertIn('model_reasoning_effort = "high"', after)
+
+    def test_T2_present_different_writes_nothing_and_reports_drifted(self) -> None:
+        # Baseline: seed all managed content aligned, then drift only the model.
+        self.write(self.config, f'model = "{self.declared_model()}"\n')
+        self.cli("apply")
+        drifted = self.drifted_value()
+        text = self.config.read_text(encoding="utf-8").replace(
+            f'model = "{self.declared_model()}"', f'model = "{drifted}"')
+        self.write(self.config, text)
+        before = self.config.read_bytes()
+        result = self.cli("apply")
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual(before, self.config.read_bytes())  # byte-identical: nothing written
+        self.assertIn(f'model = "{drifted}"', self.config.read_text(encoding="utf-8"))
+        unit = self.plan()["codex.model"]
+        self.assertEqual("DRIFTED", unit["state"])
+        self.assertFalse(unit.get("changes"))
+        self.assertIsNone(unit.get("write"))
+        self.assertIn("preserved", unit.get("reason", ""))
+
+    def test_T3_present_equal_is_aligned_no_write(self) -> None:
+        self.write(self.config, f'model = "{self.declared_model()}"\n')
+        result = self.cli("apply")
+        self.assertEqual(0, result.returncode, result.stderr)
+        unit = self.plan()["codex.model"]
+        self.assertEqual("ALIGNED", unit["state"])
+        self.assertFalse(unit.get("changes"))
+        self.assertIsNone(unit.get("write"))
+        self.assertIn(f'model = "{self.declared_model()}"',
+                      self.config.read_text(encoding="utf-8"))
+
+    def test_T4_dry_run_reports_no_change_for_drifted_model(self) -> None:
+        drifted = self.drifted_value()
+        original = f'model = "{drifted}"\n'
+        self.write(self.config, original)
+        result = self.cli("apply", "--dry-run")
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertNotIn("CHANGE codex.model", result.stdout)
+        self.assertIn("DRIFTED", result.stdout)
+        self.assertEqual(original, self.config.read_text(encoding="utf-8"))
+
+    def test_T5_unflagged_toml_key_still_rewrites(self) -> None:
+        target = self.codex / "other.toml"
+        self.write(target, 'model = "old"\n')
+        unit = {"id": "other.model", "mode": "toml-key", "target": str(target),
+                "key": "model", "value": "new", "create": True}
+        result = bootstrap._plan_toml_key(unit, {}, {})
+        self.assertEqual("DRIFTED", result["state"])
+        self.assertTrue(result["changes"])
+        self.assertIn('model = "new"', result["write"])
 
 
 # --------------------------------------------------------------------------- #
