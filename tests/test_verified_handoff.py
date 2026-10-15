@@ -310,8 +310,11 @@ class VerifiedHandoffTests(Fixture):
                                          (json.dumps(result), row['rowid']))
         store.connection.commit()
         report = self.workflow(cache=True)
-        self.assertEqual(2, len(self.deepseek.calls))
-        self.assertEqual('4', report['nodes']['I']['verified_result']['verification']['fields']['LENGTH'])
+        self.assertEqual(1, len(self.deepseek.calls))
+        self.assertEqual('PERSISTED_ACCEPTANCE_UNVERIFIED', report.get('error'))
+        self.assertEqual('BLOCKED', report['nodes']['I']['status'])
+        self.assertEqual('BLOCKED', report['nodes']['R']['status'])
+        self.assertEqual([], report['attempts'])
 
     def test_H17_verified_workflow_single_flight_preserves_two_claims(self):
         import active_work

@@ -136,3 +136,20 @@ Master B, contract and stabilization regressions remain required.
 
 Live handoff is not verified. A later bounded smoke needs explicit authorization;
 these changes do not authorize inference, fallback, or extra workers.
+
+## Recovery acceptance revalidation
+
+Every controller adoption of an eligible persisted result checks all declared criteria
+with the existing typed acceptance rules, before independently checking its capture
+proof. Stored false, missing, malformed, or conflicting evidence is not overwritten by
+an otherwise valid response envelope. Exact-output reuse also checks the stored lossless
+response digest. No worker is launched to repair invalid persisted acceptance.
+
+The same check runs at cache lookup, claim acquisition, the final adoption race check,
+and resume. Resume invalidation blocks the affected task and its transitive dependents;
+unaffected successful historical tasks may remain. Existing CACHE_REJECTED, TASK_FAILED,
+and RUN_FAILED events record refusal. The returned state, counters and durable terminal
+statuses agree; historical Attempt rows are preserved and no refusal Attempt is created.
+Valid resume, partial-publication recovery, identity, fencing and mutation exclusion
+retain their existing behavior. Controller-path regressions are in
+`tests/test_handoff_recovery.py`.

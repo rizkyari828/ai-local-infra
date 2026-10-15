@@ -156,7 +156,7 @@ class WorkStore(ops.OrchestrationStore):
             raise WorkError('STALE_GENERATION')
         return row
 
-    def accepted(self, identity, *, postcondition=None, generation=None):
+    def accepted(self, identity, *, postcondition=None, generation=None, acceptance_check=None):
         row = self.connection.execute(
             'SELECT * FROM accepted_work WHERE work_key=? AND version=? ORDER BY rowid DESC LIMIT 1',
             (identity['equivalence_identity'], VERSION)).fetchone()
@@ -165,6 +165,10 @@ class WorkStore(ops.OrchestrationStore):
         if generation is not None and row['generation'] != generation:
             return None
         result = json.loads(row['result'])
+        if identity['execution_compatibility'].get('result_contract') and acceptance_check is None:
+            raise WorkError('PERSISTED_ACCEPTANCE_UNVERIFIED')
+        if acceptance_check is not None:
+            acceptance_check(result)
         if result.get('status') != 'SUCCESS' or result.get('acceptance') != 'PASSED':
             return None
         compatibility = identity['execution_compatibility']
@@ -200,7 +204,8 @@ class WorkStore(ops.OrchestrationStore):
                 'reused_from_task_id': row['owner_task'], 'cache_entry_id': row['result_id'],
                 **({'durable_result_id': row['result_id']} if contracts else {})}
 
-    def acquire(self, identity, run, task, *, lease=30, now=None, reuse=False, result_generation=None, after_result=None):
+    def acquire(self, identity, run, task, *, lease=30, now=None, reuse=False, result_generation=None,
+                after_result=None, acceptance_check=None):
         now = time.time() if now is None else now
         key = identity['equivalence_identity']
         with self.atomic():
@@ -210,7 +215,8 @@ class WorkStore(ops.OrchestrationStore):
             published = self.connection.execute(
                 'SELECT rowid FROM accepted_work WHERE work_key=? ORDER BY rowid DESC LIMIT 1', (key,)).fetchone()
             new_result = after_result is not None and published is not None and published[0] > after_result
-            if (reuse or new_result) and identity['mode'] == 'READ_ONLY' and self.accepted(identity, generation=result_generation) is not None:
+            if (reuse or new_result) and identity['mode'] == 'READ_ONLY' and self.accepted(
+                    identity, generation=result_generation, acceptance_check=acceptance_check) is not None:
                 return 'RESULT', row
             conflicts = self.connection.execute(
                 "SELECT * FROM active_work WHERE workspace=? AND state IN ('CLAIMED','RUNNING','OUTCOME_UNCERTAIN')"
@@ -393,7 +399,7 @@ class Lease:
 
 
 def coordinate(store, refresh, execute, *, run, task, reuse, force_refresh=False,
-               postcondition=None, wait_seconds=30):
+               postcondition=None, wait_seconds=30, acceptance_check=None):
     """Bounded contention; refresh includes policy, knowledge, context and dependencies."""
     if not isinstance(wait_seconds, (int, float)) or not math.isfinite(wait_seconds) or wait_seconds < 0:
         raise WorkError('WAIT_BOUND_INVALID')
@@ -409,7 +415,8 @@ def coordinate(store, refresh, execute, *, run, task, reuse, force_refresh=False
             joined_generation = prior['generation']
         can_reuse = (reuse and not force_refresh) or waited or joined_generation is not None
         accepted = store.accepted(current, postcondition=postcondition,
-            generation=joined_generation if force_refresh else None) if can_reuse and current['mode'] != 'MUTATING' else None
+            generation=joined_generation if force_refresh else None,
+            acceptance_check=acceptance_check) if can_reuse and current['mode'] != 'MUTATING' else None
         if accepted is not None:
             store.recover()  # closes result-persisted/claim-publication crash window
             again, _ = refresh()
@@ -420,7 +427,8 @@ def coordinate(store, refresh, execute, *, run, task, reuse, force_refresh=False
             return {**accepted, 'task_id': task, 'attempts': 0, 'execution_source': 'CACHE',
                     'master_b_identity': current}, current, context
         state, claim = store.acquire(current, run, task, reuse=can_reuse,
-            result_generation=joined_generation if force_refresh else None, after_result=result_marker)
+            result_generation=joined_generation if force_refresh else None, after_result=result_marker,
+            acceptance_check=acceptance_check)
         if state == 'RESULT':
             waited = True
             continue
@@ -447,7 +455,8 @@ def coordinate(store, refresh, execute, *, run, task, reuse, force_refresh=False
                 can_reuse = True
             # Close the reuse-lookup/acquisition race, independent of claim liveness.
             accepted = store.accepted(current, postcondition=postcondition,
-            generation=joined_generation if force_refresh and not known_mutation else None) if can_reuse else None
+            generation=joined_generation if force_refresh and not known_mutation else None,
+            acceptance_check=acceptance_check) if can_reuse else None
             if accepted is not None:
                 again, _ = refresh()
                 store.fail(claim)  # current postcondition checked under workspace exclusion

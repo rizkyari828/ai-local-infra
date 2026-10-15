@@ -174,7 +174,8 @@ def _acceptance_evidence(node: dict[str, Any], result: dict[str, Any], dependenc
     return acceptance
 
 
-def _acceptance(node: dict[str, Any], result: dict[str, Any], dependencies=None) -> tuple[str, Optional[str]]:
+def _acceptance(node: dict[str, Any], result: dict[str, Any], dependencies=None,
+                *, persisted: bool = False) -> tuple[str, Optional[str]]:
     """Classify task acceptance independently of the process exit status.
 
     PASSED      -> every required criterion has explicit typed evidence and passes
@@ -184,7 +185,7 @@ def _acceptance(node: dict[str, Any], result: dict[str, Any], dependencies=None)
     A model's prose or a truthy string is never acceptance. Malformed or conflicting
     acceptance is UNVERIFIED, never SUCCESS.
     """
-    acceptance = _acceptance_evidence(node, result, dependencies)
+    acceptance = result.get('acceptance_results') if persisted else _acceptance_evidence(node, result, dependencies)
     criteria = list(node.get("acceptance_criteria") or [])
     if isinstance(acceptance, dict) and acceptance:
         if not criteria:
@@ -218,6 +219,46 @@ def _acceptance(node: dict[str, Any], result: dict[str, Any], dependencies=None)
     if any(cue in summary for cue in _EXPLANATORY_ACCEPTANCE):
         return ACCEPTANCE_UNVERIFIED, "worker did not claim task completion"
     return ACCEPTANCE_UNVERIFIED, "no independent acceptance evidence"
+
+
+def _persisted_acceptance(node, result, dependencies):
+    """Check the whole stored contract BEFORE independently rechecking capture proof.
+
+    Recomputing a reserved criterion first would overwrite a stored false/missing
+    value and silently repair contradictory evidence instead of refusing adoption.
+    """
+    state, reason = _acceptance(node, result, persisted=True)
+    if state != ACCEPTANCE_PASSED:
+        return state, reason
+    if result.get('status') != SUCCESS or result.get('acceptance') != ACCEPTANCE_PASSED:
+        return ACCEPTANCE_UNVERIFIED, 'persisted completion/acceptance inconsistent'
+    if any(key in node for key in deterministic.RESULT_CONTRACTS):
+        proof = result.get('verified_result')
+        if (not deterministic.valid_verified_result(proof)
+                or {proof['criterion']: proof['contract']} != {
+                    key: node[key] for key in deterministic.RESULT_CONTRACTS if key in node}
+                or proof['source_task_id'] != node['task_id']
+                or proof['source_task_fingerprint'] != result_cache.task_semantic_fingerprint(node)
+                or result.get('result_verification') != proof['verification']):
+            return ACCEPTANCE_UNVERIFIED, 'VERIFIED_EVIDENCE_INVALID'
+        captured = {**result, 'response_text': proof['captured_output'], 'response_complete': True}
+        key, check, expected = _verified_capture(node, captured, dependencies)
+        if expected != proof:
+            return ACCEPTANCE_UNVERIFIED, 'VERIFIED_EVIDENCE_INVALID'
+        if check['status'] != ACCEPTANCE_PASSED:
+            return check['status'], check['reason']
+        state, reason = _acceptance(node, captured, dependencies)
+        if state != ACCEPTANCE_PASSED:
+            return state, reason
+    if 'exact_output' in (node.get('acceptance_criteria') or []):
+        fingerprint = result.get('exact_output_fingerprint')
+        if (not isinstance(fingerprint, str) or len(fingerprint) != 64
+                or any(c not in '0123456789abcdef' for c in fingerprint)):
+            return ACCEPTANCE_UNVERIFIED, 'complete exact-output evidence missing'
+        expected = hashlib.sha256(node['exact_output'].encode('utf-8')).hexdigest()
+        if fingerprint != expected:
+            return ACCEPTANCE_FAILED, 'exact-output evidence mismatch'
+    return ACCEPTANCE_PASSED, None
 
 
 class ExecutionError(RuntimeError):
@@ -826,6 +867,7 @@ def execute_plan(plan: dict[str, Any], *, backend: Backend, run_id: Optional[str
     state["policy_fingerprint"] = policy_fingerprint
     identity_project = project_id or orchestration_store.repository_identity(repo_root)["repository_id"]
     previous: Optional[dict[str, Any]] = None
+    resume_refusal = None
     if resume:
         previous, resume_state = _load_resume_state(run_dir)
         if resume_state == _RESUME_MISSING:
@@ -852,12 +894,21 @@ def execute_plan(plan: dict[str, Any], *, backend: Backend, run_id: Optional[str
             report["error"] = (f"REFUSE_RESUME_UNCERTAIN_MUTATION: {uncertain} may have mutated before "
                                "acceptance was recorded; human review required")
             return report
-        changed = _resume_input_changed(plan, previous, repo_root, identity_project, state["head"],
-                                        constraints)
-        if changed is not None:
-            report["error"] = (f"REFUSE_RESUME_INPUT_CHANGED: relevant input for {changed} changed under "
-                               "the same HEAD; refusing to reuse stale results")
-            return report
+        for task_id in plan['order']:
+            node = next(n for n in plan['nodes'] if n['task_id'] == task_id)
+            prior = previous['nodes'].get(task_id, {})
+            if node.get('executor') == 'TOOL_ONLY' or prior.get('status') not in ACCEPTED:
+                continue
+            verdict, reason = _persisted_acceptance(node, prior, _dependency_facts(node, previous['nodes']))
+            if verdict != ACCEPTANCE_PASSED:
+                category = ('REFUSE_RESUME_VERIFIED_EVIDENCE_INVALID' if reason == 'VERIFIED_EVIDENCE_INVALID'
+                            else 'REFUSE_RESUME_ACCEPTANCE_' + verdict)
+                resume_refusal = (task_id, category, verdict)
+                break
+        if resume_refusal is None:
+            changed = _resume_input_changed(plan, previous, repo_root, identity_project, state["head"], constraints)
+            if changed is not None:
+                resume_refusal = (changed, 'REFUSE_RESUME_INPUT_CHANGED', ACCEPTANCE_UNVERIFIED)
     results: dict[str, dict[str, Any]] = dict(previous["nodes"]) if previous else {}
     # Hard budget: resume never resets the counter; take the smaller of persisted/requested ceiling.
     persisted_max = (previous or {}).get("hard_max_ai_calls")
@@ -908,8 +959,16 @@ def execute_plan(plan: dict[str, Any], *, backend: Backend, run_id: Optional[str
     durable_run = work_store.get_run(run_id)
     if resume and durable_run:
         budget["used"] = max(budget["used"], durable_run.get("used_ai_calls") or 0)
+    def reject_adoption(task_id, category, verdict=ACCEPTANCE_UNVERIFIED):
+        report['error'] = category
+        for affected in _invalidate_adoption(plan, results, task_id, category, verdict):
+            work_store.cache_event(run_id, 'CACHE_REJECTED', task_id=affected,
+                payload={'reason': results[affected]['failure_category'],
+                         'acceptance': results[affected]['acceptance']})
     try:
-        for task_id in plan["order"]:
+        if resume_refusal is not None:
+            reject_adoption(*resume_refusal)
+        for task_id in ([] if resume_refusal is not None else plan["order"]):
             node = next(item for item in plan["nodes"] if item["task_id"] == task_id)
             # Resume reuses only completed AI work whose relevant input identity is
             # PROVEN unchanged against the CURRENT dependency state. Upstream dependencies
@@ -918,20 +977,15 @@ def execute_plan(plan: dict[str, Any], *, backend: Backend, run_id: Optional[str
             # persisted one invalidates a stale descendant SUCCESS instead of reusing it.
             if (resume and node.get("executor") != "TOOL_ONLY"
                     and results.get(task_id, {}).get("status") in (SUCCESS, "NO_CHANGE_REQUIRED")):
-                if any(key in node for key in deterministic.RESULT_CONTRACTS):
-                    prior = results[task_id].get('verified_result')
-                    if (not deterministic.valid_verified_result(prior)
-                            or {prior['criterion']: prior['contract']} != {
-                                key: node[key] for key in deterministic.RESULT_CONTRACTS if key in node}):
-                        report['error'] = 'REFUSE_RESUME_VERIFIED_EVIDENCE_INVALID'
-                        break
+                verdict, reason = _persisted_acceptance(node, results[task_id], _dependency_facts(node, results))
+                if verdict != ACCEPTANCE_PASSED:
+                    category = ('REFUSE_RESUME_VERIFIED_EVIDENCE_INVALID' if reason == 'VERIFIED_EVIDENCE_INVALID'
+                                else 'REFUSE_RESUME_ACCEPTANCE_' + verdict)
+                    reject_adoption(task_id, category, verdict)
+                    break
                 if not _resume_reuse_valid(node, results, identity_project, state["head"], constraints,
                                            repo_root):
-                    report["error"] = (f"REFUSE_RESUME_INPUT_CHANGED: current dependency/input state "
-                                       f"for {task_id} changed under the same HEAD; refusing to reuse "
-                                       "stale results")
-                    results[task_id] = {"status": NOT_RUN, "task_id": task_id}
-                    _mark_not_run(plan, task_id, results)
+                    reject_adoption(task_id, 'REFUSE_RESUME_INPUT_CHANGED')
                     break
                 try:
                     current_context = _build_node_context(node, _dependency_facts(node, results), repo_root)
@@ -940,13 +994,13 @@ def execute_plan(plan: dict[str, Any], *, backend: Backend, run_id: Optional[str
                         resolutions[task_id], backend_registry.get(resolutions[task_id].get("backend"), backend),
                         _current_knowledge(node, knowledge_provider))
                 except active_work.WorkError as exc:
-                    report["error"] = str(exc)
+                    reject_adoption(task_id, str(exc))
                     break
                 if node.get("intent") == "MUTATING" and results[task_id].get("coordination_outcome") == "OUTCOME_UNCERTAIN":
-                    report["error"] = "REFUSE_RESUME_UNCERTAIN_MUTATION"
+                    reject_adoption(task_id, 'REFUSE_RESUME_UNCERTAIN_MUTATION')
                     break
                 if results[task_id].get("master_b_identity") != current_b:
-                    report["error"] = "REFUSE_RESUME_CURRENT_IDENTITY_CHANGED"
+                    reject_adoption(task_id, 'REFUSE_RESUME_CURRENT_IDENTITY_CHANGED')
                     break
                 if any(key in node for key in deterministic.RESULT_CONTRACTS):
                     proof = results[task_id]['verified_result']
@@ -954,12 +1008,12 @@ def execute_plan(plan: dict[str, Any], *, backend: Backend, run_id: Optional[str
                     if (proof['source_task_fingerprint'] != compatible['result_task_fingerprint']
                             or (node.get('review_result')
                                 and proof['reviewed_source'] != compatible['reviewed_source'])):
-                        report['error'] = 'REFUSE_RESUME_VERIFIED_EVIDENCE_INVALID'
+                        reject_adoption(task_id, 'REFUSE_RESUME_VERIFIED_EVIDENCE_INVALID')
                         break
                 continue
             deps = node["depends_on"]
             if any(results.get(dep, {}).get("status") not in (SUCCESS, SKIPPED, "NO_CHANGE_REQUIRED") for dep in deps):
-                results[task_id] = {"status": BLOCKED, "task_id": task_id}
+                results[task_id] = {**results.get(task_id, {}), "status": BLOCKED, "task_id": task_id}
                 continue
             if node.get('review_result') and _review_source(node, _dependency_facts(node, results)) is None:
                 results[task_id] = {'status': BLOCKED, 'task_id': task_id,
@@ -1059,11 +1113,15 @@ def execute_plan(plan: dict[str, Any], *, backend: Backend, run_id: Optional[str
                 return _redact_value(result)
 
             try:
+                def check_adoption(result):
+                    verdict, _ = _persisted_acceptance(node, result, _dependency_facts(node, results))
+                    if verdict != ACCEPTANCE_PASSED:
+                        raise active_work.WorkError('PERSISTED_ACCEPTANCE_' + verdict)
                 node_result, work_identity, fresh = active_work.coordinate(
                     work_store, refresh, execute_owned, run=run_id, task=task_id,
                     reuse=cache, force_refresh=force_refresh, wait_seconds=wait_seconds,
                     postcondition=(lambda result: postcondition_verifier(node, result, repo_root))
-                        if postcondition_verifier else None)
+                        if postcondition_verifier else None, acceptance_check=check_adoption)
                 context_result, dependency_summaries, _, _ = fresh
                 identity = _cache_identity(node, context_result, dependency_summaries,
                     identity_project, freshness, repo_state(repo_root)["head"])
@@ -1084,8 +1142,14 @@ def execute_plan(plan: dict[str, Any], *, backend: Backend, run_id: Optional[str
                             else result_cache.REASON_CACHE_MISS})
                 context_manifests.setdefault(task_id, (context_result or {}).get("manifest"))
             except active_work.WorkError as exc:
-                node_result = {"task_id": task_id, "status": BLOCKED, "failure_category": str(exc)}
-                report["error"] = str(exc)
+                if str(exc).startswith('PERSISTED_ACCEPTANCE_'):
+                    verdict = str(exc).removeprefix('PERSISTED_ACCEPTANCE_')
+                    reject_adoption(task_id, str(exc), verdict)
+                    node_result = results[task_id]
+                    cache_meta['rejected'] += 1
+                else:
+                    node_result = {"task_id": task_id, "status": BLOCKED, "failure_category": str(exc)}
+                    report["error"] = str(exc)
             except KeyboardInterrupt:
                 node_result = {"status": CANCELLED, "task_id": task_id}
                 _mark_not_run(plan, task_id, results)
@@ -1128,7 +1192,7 @@ def execute_plan(plan: dict[str, Any], *, backend: Backend, run_id: Optional[str
                 cache_entry_id=outcome.get("cache_entry_id"),
                 input_fingerprint=outcome.get("input_fingerprint"),
                 result_fingerprint=outcome.get("result_fingerprint"))
-        work_store.finish_run(run_id, "SUCCEEDED" if len(results) == len(plan["nodes"]) and all(
+        work_store.finish_run(run_id, "SUCCEEDED" if not report.get('error') and len(results) == len(plan["nodes"]) and all(
             orchestration_store.is_task_success(r.get("status")) for r in results.values()) else "FAILED",
             used_ai_calls=budget["used"], final_head=repo_state(repo_root)["head"],
             failure_category=report.get("error"))
@@ -1175,6 +1239,21 @@ def _mark_not_run(plan: dict[str, Any], current: str, results: dict[str, dict[st
     index = plan["order"].index(current)
     for future in plan["order"][index + 1:]:
         results.setdefault(future, {"status": NOT_RUN, "task_id": future})
+
+
+def _invalidate_adoption(plan, results, task_id, category, verdict):
+    affected = {task_id}
+    # ponytail: fixed-point scans suit small sequential DAGs; index reverse edges for large plans.
+    while True:
+        expanded = affected | {node['task_id'] for node in plan['nodes'] if affected.intersection(node['depends_on'])}
+        if expanded == affected:
+            break
+        affected = expanded
+    for current in affected:
+        results[current] = {'task_id': current, 'status': BLOCKED, 'attempts': 0,
+            'acceptance': verdict if current == task_id else ACCEPTANCE_UNVERIFIED,
+            'failure_category': category if current == task_id else 'DEPENDENCY_ACCEPTANCE_INVALID'}
+    return [task for task in plan['order'] if task in affected]
 
 
 # --------------------------------------------------------------------------- #
@@ -2153,7 +2232,7 @@ def _finalize(node, result, status, category, initial_tier, final_tier, attempts
 
 
 def _final_summary(plan: dict[str, Any], results: dict[str, dict[str, Any]]) -> dict[str, Any]:
-    blockers = [r["task_id"] for r in results.values() if r.get("status") in (FAILURE, UNVERIFIED)]
+    blockers = [r["task_id"] for r in results.values() if r.get("status") in (FAILURE, UNVERIFIED, BLOCKED)]
     return {"total": len(plan["nodes"]),
             "succeeded": sum(1 for r in results.values() if r.get("status") == SUCCESS),
             "failed": sum(1 for r in results.values() if r.get("status") == FAILURE),
