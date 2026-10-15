@@ -256,12 +256,27 @@ class CodexModelTests(CorrectiveCliBase):
                  '[mcp_servers.other]\n'
                  'command = "/usr/bin/other"\n')
 
+    def declared_model(self) -> str:
+        """The ``codex.model`` this machine's descriptor effectively declares.
+
+        These tests cover the *mechanism* — add a missing owned key, update a
+        drifted one, place it before the first table, never disturb unrelated
+        keys — not the particular model one machine happens to declare. The
+        expected value is therefore read from the same effective descriptor the
+        planner and the CLI read (``load_effective`` merges the committed
+        machine descriptor with any ``machine.local.yaml``). A wrong write still
+        fails the test, while the fixture no longer hardcodes a machine-specific
+        value that would break on the other machine.
+        """
+        ctx, _meta = bootstrap.load_effective(self.env)
+        return ctx["codex"]["model"]
+
     def test_missing_model_key_added_before_first_table(self) -> None:
         self.write(self.config, self.unrelated)
         result = self.cli("apply")
         self.assertEqual(0, result.returncode, result.stderr)
         after = self.config.read_text(encoding="utf-8")
-        self.assertIn('model = "gpt-5.6-sol"', after)
+        self.assertIn(f'model = "{self.declared_model()}"', after)
         self.assertIn('model_reasoning_effort = "high"', after)
         self.assertIn('[projects."/p"]', after)
         self.assertIn("[mcp_servers.other]", after)
@@ -271,8 +286,12 @@ class CodexModelTests(CorrectiveCliBase):
         self.assertLess(model_line, first_table)
 
     def test_drifted_model_updated_preserving_unrelated(self) -> None:
+        declared = self.declared_model()
+        drifted = "gpt-5.4"
+        self.assertNotEqual(drifted, declared,
+                            "the drifted fixture value must differ from the declared value")
         self.write(self.config,
-                   'model = "gpt-5.4"\n'
+                   f'model = "{drifted}"\n'
                    'model_reasoning_effort = "high"\n\n'
                    '[projects."/p"]\n'
                    'trust_level = "trusted"\n\n'
@@ -281,14 +300,14 @@ class CodexModelTests(CorrectiveCliBase):
         result = self.cli("apply")
         self.assertEqual(0, result.returncode, result.stderr)
         after = self.config.read_text(encoding="utf-8")
-        self.assertIn('model = "gpt-5.6-sol"', after)
-        self.assertNotIn("gpt-5.4", after)
+        self.assertIn(f'model = "{declared}"', after)
+        self.assertNotIn(drifted, after)
         self.assertIn('model_reasoning_effort = "high"', after)
         self.assertIn("[mcp_servers.other]", after)
         self.assertIn('trust_level = "trusted"', after)
 
     def test_matching_model_is_aligned(self) -> None:
-        self.write(self.config, 'model = "gpt-5.6-sol"\n')
+        self.write(self.config, f'model = "{self.declared_model()}"\n')
         self.assertEqual("ALIGNED", self.plan()["codex.model"]["state"])
 
     def test_table_scoped_model_is_not_confused(self) -> None:
@@ -297,7 +316,7 @@ class CodexModelTests(CorrectiveCliBase):
         self.assertEqual(0, result.returncode, result.stderr)
         after = self.config.read_text(encoding="utf-8")
         self.assertIn('[tui]\nmodel = "other-model"', after)
-        self.assertIn('model = "gpt-5.6-sol"', after)
+        self.assertIn(f'model = "{self.declared_model()}"', after)
 
     def test_top_level_model_table_is_blocked(self) -> None:
         self.write(self.config, '[model]\nprovider = "x"\n')
