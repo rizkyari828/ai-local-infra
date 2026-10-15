@@ -70,6 +70,9 @@ authority. They are read from their one owner:
 - **Provider/model resolution** (`config/model-routing.yaml` -> `models/roles.yaml`
   -> provider) — routing resolves names; it never changes classification or a
   user's selected model.
+- **`codex.model` managed unit** — observed and reported, not enforced: the unit
+  is adopt-only, so a user's existing `model` value in `config.toml` is preserved
+  and reported as DRIFTED rather than overwritten (only an absent key is seeded).
 - **Machine identity** — `LAI_MACHINE` when set, else the descriptor whose
   declared `repo_path` is exactly this repository. Never guessed.
 - **Repository identity** — remote URL (credential-stripped) or repository name.
