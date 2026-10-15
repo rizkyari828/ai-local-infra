@@ -69,14 +69,15 @@ Git-shared historical seed idempotently. Reviewed, distilled knowledge lives in
 sessions are stored, and nothing auto-promotes. See
 [Derived learning](DERIVED_LEARNING.md).
 
-## Task graph orchestration (plan-only)
+## Task graph orchestration (planning)
 
 `./scripts/orchestrate plan --objective "<one objective>"` decomposes a high-level
 objective into a small DAG of task nodes with per-node symbolic routing and context
 budgets. It is deterministic-first: known deterministic objectives plan as TOOL_ONLY
 (0 additional AI calls), simple AI objectives route directly (no AI planner), and
-only ambiguous/security objectives report `PLANNER_REQUIRED`. V0.1 plans only: no
-model call, no worker, no persistence, and the raw objective is never stored. See
+only ambiguous/security objectives report `PLANNER_REQUIRED`. The `plan` command
+calls no model, spawns no worker, and persists nothing; the raw objective is never
+stored. Execution is a separate, gated command (below). See
 [Orchestration](ORCHESTRATION.md) and [Deterministic-first execution](DETERMINISTIC_FIRST.md).
 
 ## Multi-model execution (gated)
