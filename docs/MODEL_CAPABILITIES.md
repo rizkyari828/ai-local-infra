@@ -89,10 +89,11 @@ required to enumerate everything.
   machine-local, never committed): actually discovered models, current
   availability, surface inventory, verification evidence/timestamps.
 
-A future milestone will seed verified **historical** observations into the local
-snapshot (source labels: `discovered`, `historical_verified`, `observed_runtime`,
-`manual_override`). Historical evidence stays distinguishable from live discovery;
-raw chats/prompts are never imported. This prepares the separate
+Verified **historical** observations are seeded into the local snapshot (source
+labels: `discovered`, `historical_verified`, `observed_runtime`, `manual_override`;
+see `../scripts/common/derived_knowledge.py`). Historical evidence stays
+distinguishable from live discovery; raw chats/prompts are never imported. This
+prepares the separate
 model-performance evidence layer for Derived Learning (provider, model, surface,
 tier, effort, outcome) — routing lessons key on `task_family`/`task_class`/
 `required_tier`/`required_effort`, never "always use model XYZ".
