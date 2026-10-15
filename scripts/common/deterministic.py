@@ -12,6 +12,7 @@ structured data (no terminal transcripts).
 from __future__ import annotations
 
 import json
+import hashlib
 import pathlib
 import re
 import subprocess
@@ -23,6 +24,116 @@ import learning  # scripts/common, on sys.path (secret guard)
 
 ROOT = infra.ROOT
 TEST_COMMANDS = {"unit_tests": [sys.executable, "-m", "unittest", "discover", "-s", "tests"]}
+
+# Explicit opt-in capture contracts; these are not executable validation expressions.
+RESULT_CONTRACTS = ('structured_result', 'review_result')
+MAX_RESPONSE_BYTES = 2048
+
+
+def validate_result_contract(node: dict[str, Any]) -> None:
+    criteria = node.get('acceptance_criteria') or []
+    declared = [key for key in RESULT_CONTRACTS if key in node or key in criteria]
+    if not declared:
+        return
+    if len(declared) != 1 or node.get('executor') == 'TOOL_ONLY':
+        raise ValueError('RESULT_CONTRACT_INVALID')
+    key = declared[0]
+    spec = node.get(key)
+    required = {'kind', 'source', 'allow_explanation'} if key == 'structured_result' else {'source_task_id', 'allow_explanation'}
+    if (key not in criteria or not isinstance(spec, dict) or set(spec) != required
+            or type(spec.get('allow_explanation')) is not bool):
+        raise ValueError('RESULT_CONTRACT_INVALID')
+    if key == 'structured_result':
+        source = spec['source']
+        if (spec['kind'] != 'reverse_text_v1' or not isinstance(source, str)
+                or not re.fullmatch(r'[A-Za-z0-9 ._-]{1,128}', source)
+                or learning.contains_secret_like(source)):
+            raise ValueError('RESULT_CONTRACT_INVALID')
+    elif (not isinstance(spec['source_task_id'], str)
+          or spec['source_task_id'] not in node.get('depends_on', [])
+          or (node.get('execution_requirement') or {}).get('role', (node.get('routing') or {}).get('role')) != 'reviewer'):
+        raise ValueError('RESULT_CONTRACT_INVALID')
+
+
+def verify_response(key: str, spec: dict[str, Any], response: Any, complete: Any) -> dict[str, Any]:
+    """Validate one bounded block from the COMPLETE capture, preserving outside text."""
+    def verdict(status, reason, fields=None):
+        return {'status': status, 'reason': reason, 'fields': fields or {}}
+    if not isinstance(response, str) or complete is not True:
+        return verdict('UNVERIFIED', 'COMPLETE_CAPTURE_MISSING')
+    if len(response.encode('utf-8', 'replace')) > MAX_RESPONSE_BYTES:
+        return verdict('FAILED', 'RESPONSE_TOO_LARGE')
+    if learning.contains_secret_like(response):
+        return verdict('FAILED', 'SENSITIVE_EVIDENCE')
+    tag = 'VERIFIABLE_RESULT' if key == 'structured_result' else 'REVIEW_RESULT'
+    begin, end = 'BEGIN_' + tag, 'END_' + tag
+    if begin not in response and end not in response:
+        return verdict('UNVERIFIED', 'RESULT_BLOCK_MISSING')
+    lines = response.splitlines()
+    if (response.count(begin) != 1 or response.count(end) != 1
+            or begin not in lines or end not in lines or lines.index(begin) >= lines.index(end)):
+        return verdict('FAILED', 'RESULT_BLOCK_AMBIGUOUS')
+    start, stop = lines.index(begin), lines.index(end)
+    outside = lines[:start] + lines[stop + 1:]
+    if (not spec['allow_explanation'] and any(line.strip() for line in outside)) or any(
+            re.match(r'^\s*(SOURCE|REVERSED|LENGTH|REVIEW_VERDICT):', line) for line in outside):
+        return verdict('FAILED', 'UNDECLARED_OR_CONFLICTING_TEXT')
+    fields = {}
+    for line in lines[start + 1:stop]:
+        match = re.fullmatch(r'([A-Z_]+): (.*)', line)
+        if not match or match[1] in fields:
+            return verdict('FAILED', 'RESULT_FIELDS_MALFORMED')
+        fields[match[1]] = match[2]
+    if key == 'structured_result':
+        expected = {'SOURCE': spec['source'], 'REVERSED': spec['source'][::-1], 'LENGTH': str(len(spec['source']))}
+        if set(fields) != set(expected):
+            return verdict('FAILED', 'RESULT_FIELDS_INVALID')
+        return {**verdict('PASSED' if fields == expected else 'FAILED',
+                         'DETERMINISTIC_FACTS_MATCH' if fields == expected else 'DETERMINISTIC_FACTS_MISMATCH', fields),
+                'expected': expected}
+    if set(fields) != {'REVIEW_VERDICT'} or fields['REVIEW_VERDICT'] not in ('PASS', 'FAIL'):
+        return verdict('FAILED', 'REVIEW_VERDICT_INVALID')
+    return verdict('PASSED' if fields['REVIEW_VERDICT'] == 'PASS' else 'FAILED',
+                   'REVIEW_PASS' if fields['REVIEW_VERDICT'] == 'PASS' else 'REVIEW_FAIL', fields)
+
+
+def evidence_fingerprint(evidence: dict[str, Any]) -> str:
+    material = {k: v for k, v in evidence.items() if k != 'evidence_fingerprint'}
+    return hashlib.sha256(json.dumps(material, sort_keys=True).encode('utf-8')).hexdigest()
+
+
+def valid_verified_result(value: Any) -> bool:
+    """Recheck persisted evidence; neither stored booleans nor its digest prove facts."""
+    if not isinstance(value, dict) or value.get('schema') != 'verified-result-v1':
+        return False
+    try:
+        key = value['criterion']
+        required = {'schema', 'criterion', 'contract', 'source_task_id', 'source_task_fingerprint',
+                    'result_type', 'captured_output', 'verification', 'acceptance', 'evidence_fingerprint'}
+        if key == 'review_result':
+            required.add('reviewed_source')
+        if (set(value) != required or len(json.dumps(value)) > 6000
+                or value['acceptance'] != 'PASSED' or key not in RESULT_CONTRACTS
+                or value['evidence_fingerprint'] != evidence_fingerprint(value)
+                or not isinstance(value['source_task_id'], str) or not value['source_task_id']
+                or not isinstance(value['result_type'], str)
+                or not isinstance(value['source_task_fingerprint'], str)
+                or not re.fullmatch(r'[0-9a-f]{32}', value['source_task_fingerprint'])
+                or learning.contains_secret_like(json.dumps(value))):
+            return False
+        validate_result_contract({'acceptance_criteria': [key], key: value['contract'],
+                                  'execution_requirement': {'role': 'reviewer'},
+                                  'depends_on': [value['contract'].get('source_task_id')]})
+        if key == 'review_result':
+            source = value['reviewed_source']
+            if (set(source) != {'task_id', 'result_fingerprint', 'evidence_fingerprint'}
+                    or source['task_id'] != value['contract']['source_task_id']
+                    or not all(isinstance(v, str) and v for v in source.values())):
+                return False
+        check = verify_response(key, value['contract'], value['captured_output'], True)
+        return check['status'] == 'PASSED' and check == value['verification']
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return False
 
 # Whitelisted operations. `mutating=False` for every V0.1 operation.
 OPERATIONS = {

@@ -111,22 +111,70 @@ def _normalize_acceptance(value: Any) -> Optional[bool]:
     return None
 
 
-def _acceptance_evidence(node: dict[str, Any], result: dict[str, Any]):
+def _review_source(node, dependencies):
+    spec = node.get('review_result')
+    if not spec:
+        return None
+    matches = [d for d in (dependencies or []) if d.get('task_id') == spec['source_task_id']]
+    if len(matches) != 1:
+        return None
+    fact = matches[0]
+    proof = fact.get('verified_result')
+    if (fact.get('status') != SUCCESS or fact.get('acceptance') != 'PASSED'
+            or not fact.get('result_fingerprint') or not deterministic.valid_verified_result(proof)
+            or proof['criterion'] != 'structured_result'
+            or proof['source_task_id'] != spec['source_task_id'] or _redact_value(proof) != proof):
+        return None
+    return fact
+
+
+def _verified_capture(node, result, dependencies=None):
+    keys = [key for key in deterministic.RESULT_CONTRACTS if key in (node.get('acceptance_criteria') or [])]
+    if not keys:
+        return None, None, None
+    key = keys[0]
+    check = deterministic.verify_response(key, node[key], result.get('response_text'), result.get('response_complete'))
+    source = _review_source(node, dependencies) if key == 'review_result' else None
+    if key == 'review_result' and source is None:
+        check = {'status': 'UNVERIFIED', 'reason': 'VERIFIED_DEPENDENCY_MISSING', 'fields': check['fields']}
+    if check['status'] != 'PASSED':
+        return key, check, None
+    proof = {'schema': 'verified-result-v1', 'criterion': key, 'contract': copy.deepcopy(node[key]),
+             'source_task_id': node['task_id'], 'source_task_fingerprint': result_cache.task_semantic_fingerprint(node),
+             'result_type': result_cache.result_type(node), 'captured_output': result['response_text'],
+             'verification': check, 'acceptance': 'PASSED'}
+    if source:
+        proof['reviewed_source'] = {'task_id': source['task_id'], 'result_fingerprint': source['result_fingerprint'],
+                                   'evidence_fingerprint': source['verified_result']['evidence_fingerprint']}
+    proof['evidence_fingerprint'] = deterministic.evidence_fingerprint(proof)
+    if _redact_value(proof) != proof or len(json.dumps(proof)) > 6000:
+        return key, {'status': 'FAILED', 'reason': 'EVIDENCE_UNSAFE_OR_TOO_LARGE', 'fields': {}}, None
+    return key, check, proof
+
+
+def _acceptance_evidence(node: dict[str, Any], result: dict[str, Any], dependencies=None):
     """Exact-output evidence comes from complete capture, never worker assertions."""
     acceptance = result.get('acceptance_results')
-    if 'exact_output' not in (node.get('acceptance_criteria') or []):
+    criteria = node.get('acceptance_criteria') or []
+    if not any(key in criteria for key in ('exact_output', *deterministic.RESULT_CONTRACTS)):
         return acceptance
     if acceptance is not None and not isinstance(acceptance, dict):
         return acceptance  # malformed evidence retains the existing fail-closed behavior
     acceptance = dict(acceptance or {})
-    acceptance.pop('exact_output', None)
-    expected, response = node.get('exact_output'), result.get('response_text')
-    if isinstance(expected, str) and isinstance(response, str) and result.get('response_complete') is True:
-        acceptance['exact_output'] = response == expected
+    if 'exact_output' in criteria:
+        acceptance.pop('exact_output', None)
+        expected, response = node.get('exact_output'), result.get('response_text')
+        if isinstance(expected, str) and isinstance(response, str) and result.get('response_complete') is True:
+            acceptance['exact_output'] = response == expected
+    key, check, _ = _verified_capture(node, result, dependencies)
+    if key:
+        acceptance.pop(key, None)
+        if check['status'] != 'UNVERIFIED':
+            acceptance[key] = check['status'] == 'PASSED'
     return acceptance
 
 
-def _acceptance(node: dict[str, Any], result: dict[str, Any]) -> tuple[str, Optional[str]]:
+def _acceptance(node: dict[str, Any], result: dict[str, Any], dependencies=None) -> tuple[str, Optional[str]]:
     """Classify task acceptance independently of the process exit status.
 
     PASSED      -> every required criterion has explicit typed evidence and passes
@@ -136,7 +184,7 @@ def _acceptance(node: dict[str, Any], result: dict[str, Any]) -> tuple[str, Opti
     A model's prose or a truthy string is never acceptance. Malformed or conflicting
     acceptance is UNVERIFIED, never SUCCESS.
     """
-    acceptance = _acceptance_evidence(node, result)
+    acceptance = _acceptance_evidence(node, result, dependencies)
     criteria = list(node.get("acceptance_criteria") or [])
     if isinstance(acceptance, dict) and acceptance:
         if not criteria:
@@ -290,6 +338,37 @@ class CliBackend(Backend):
             return command + [prompt]
         raise ExecutionError(f"unknown CLI backend {self.name}")
 
+    def _structured_capture(self, stdout):
+        if self.name != 'opencode':
+            return stdout, isinstance(stdout, str)
+        # OpenCode JSONL emits finalized text parts separately from reasoning/tools.
+        # Require one completed assistant message; never forward the event transcript.
+        if not isinstance(stdout, str) or len(stdout.encode('utf-8', 'replace')) > 131072:
+            return None, False
+        try:
+            events = [json.loads(line) for line in stdout.splitlines() if line.strip()]
+            if not events or any(not isinstance(event, dict) for event in events):
+                return None, False
+            if any(event.get('type') not in ('text', 'reasoning', 'step_start', 'step_finish', 'tool_use') for event in events):
+                return None, False
+            texts = [event['part'] for event in events if event.get('type') == 'text']
+            if not texts or any(part.get('type') != 'text' or not isinstance(part.get('text'), str) for part in texts):
+                return None, False
+            message_ids = {part['messageID'] for part in texts}
+            if len(message_ids) != 1 or not all(isinstance(part.get('id'), str) for part in texts):
+                return None, False
+            if len({part['id'] for part in texts}) != len(texts):
+                return None, False
+            finishes = [event['part'] for event in events if event.get('type') == 'step_finish'
+                        and event.get('part', {}).get('messageID') in message_ids]
+            if len(finishes) != 1 or finishes[0].get('reason') != 'stop':
+                return None, False
+            if events[-1].get('type') != 'step_finish' or events[-1]['part'] != finishes[0]:
+                return None, False
+            return ''.join(part['text'] for part in texts), True
+        except (KeyError, TypeError, ValueError, AttributeError):
+            return None, False
+
     def execute(self, request: dict[str, Any]) -> dict[str, Any]:
         try:
             completed = subprocess.run(self._command(request), cwd=request["working_dir"],
@@ -301,13 +380,17 @@ class CliBackend(Backend):
                     "summary": f"backend error: {type(exc).__name__}"}
         category = classify_failure(completed.returncode, completed.stderr)
         if completed.returncode == 0 and not category:
-            output = (completed.stdout or "").strip()
-            if not output and 'exact_output' not in request.get('acceptance_criteria', []):
+            response, complete = completed.stdout, isinstance(completed.stdout, str)
+            if any(key in request.get('acceptance_criteria', []) for key in deterministic.RESULT_CONTRACTS):
+                response, complete = self._structured_capture(completed.stdout)
+            output = (response or "").strip()
+            if not output and not any(key in request.get('acceptance_criteria', [])
+                                      for key in ('exact_output', *deterministic.RESULT_CONTRACTS)):
                 return {"task_id": request["task_id"], "status": "UNKNOWN",
                         "summary": "backend produced no output"}
             return {"task_id": request["task_id"], "status": SUCCESS,
                     "completion_signal": "agent_reported", "summary": output[-400:],
-                    'response_text': completed.stdout, 'response_complete': isinstance(completed.stdout, str),
+                    'response_text': response, 'response_complete': complete,
                     "acceptance_results": {}, "files_changed": [], "decisions": [], "new_risk_signals": []}
         return {"task_id": request["task_id"], "status": FAILURE, "failure_category": category or "UNKNOWN_FAILURE",
                 "summary": (completed.stderr or "")[-400:], "acceptance_results": {},
@@ -679,6 +762,10 @@ def execute_plan(plan: dict[str, Any], *, backend: Backend, run_id: Optional[str
                 node['execution_requirement'] = copy.deepcopy(execution_requirements[node['task_id']])
     constraints = copy.deepcopy(constraints)
     for node in plan.get('nodes', []):
+        try:
+            deterministic.validate_result_contract(node)
+        except ValueError as exc:
+            raise ExecutionError(str(exc)) from exc
         if 'exact_output' in node and (not isinstance(node['exact_output'], str)
                 or 'exact_output' not in (node.get('acceptance_criteria') or [])):
             raise ExecutionError('EXACT_OUTPUT_CONTRACT_INVALID')
@@ -831,6 +918,13 @@ def execute_plan(plan: dict[str, Any], *, backend: Backend, run_id: Optional[str
             # persisted one invalidates a stale descendant SUCCESS instead of reusing it.
             if (resume and node.get("executor") != "TOOL_ONLY"
                     and results.get(task_id, {}).get("status") in (SUCCESS, "NO_CHANGE_REQUIRED")):
+                if any(key in node for key in deterministic.RESULT_CONTRACTS):
+                    prior = results[task_id].get('verified_result')
+                    if (not deterministic.valid_verified_result(prior)
+                            or {prior['criterion']: prior['contract']} != {
+                                key: node[key] for key in deterministic.RESULT_CONTRACTS if key in node}):
+                        report['error'] = 'REFUSE_RESUME_VERIFIED_EVIDENCE_INVALID'
+                        break
                 if not _resume_reuse_valid(node, results, identity_project, state["head"], constraints,
                                            repo_root):
                     report["error"] = (f"REFUSE_RESUME_INPUT_CHANGED: current dependency/input state "
@@ -854,10 +948,22 @@ def execute_plan(plan: dict[str, Any], *, backend: Backend, run_id: Optional[str
                 if results[task_id].get("master_b_identity") != current_b:
                     report["error"] = "REFUSE_RESUME_CURRENT_IDENTITY_CHANGED"
                     break
+                if any(key in node for key in deterministic.RESULT_CONTRACTS):
+                    proof = results[task_id]['verified_result']
+                    compatible = current_b['execution_compatibility']
+                    if (proof['source_task_fingerprint'] != compatible['result_task_fingerprint']
+                            or (node.get('review_result')
+                                and proof['reviewed_source'] != compatible['reviewed_source'])):
+                        report['error'] = 'REFUSE_RESUME_VERIFIED_EVIDENCE_INVALID'
+                        break
                 continue
             deps = node["depends_on"]
             if any(results.get(dep, {}).get("status") not in (SUCCESS, SKIPPED, "NO_CHANGE_REQUIRED") for dep in deps):
                 results[task_id] = {"status": BLOCKED, "task_id": task_id}
+                continue
+            if node.get('review_result') and _review_source(node, _dependency_facts(node, results)) is None:
+                results[task_id] = {'status': BLOCKED, 'task_id': task_id,
+                                    'failure_category': 'VERIFIED_DEPENDENCY_MISSING'}
                 continue
             if node["conditional"] and not _conditional_active(node, deps, results):
                 results[task_id] = {"status": SKIPPED, "task_id": task_id}
@@ -1098,8 +1204,9 @@ def _dependency_facts(node: dict[str, Any], results: dict[str, dict[str, Any]]) 
     facts: list[dict[str, Any]] = []
     for dep in node["depends_on"]:
         outcome = results.get(dep, {})
+        source_outcome = outcome
         req = execution_requirement(node)
-        if req and req['role'] == 'reviewer':
+        if node.get('review_result') or (req and req['role'] == 'reviewer'):
             # Only bounded accepted evidence crosses the independent review boundary.
             # Source/diff context is separately retrieved from explicit context refs.
             outcome = {**outcome, 'summary': json.dumps({
@@ -1110,6 +1217,17 @@ def _dependency_facts(node: dict[str, Any], results: dict[str, dict[str, Any]]) 
                 sort_keys=True)[:2000]}
         fact: dict[str, Any] = {"task_id": dep, "summary": outcome.get("summary", ""),
                                 "status": outcome.get("status")}
+        if node.get('review_result') and dep == node['review_result']['source_task_id']:
+            proof = outcome.get('verified_result')
+            acceptance = source_outcome.get('acceptance_results')
+            source_node = {'acceptance_criteria': list(acceptance) if isinstance(acceptance, dict) else []}
+            bounded = result_cache.bounded_result(source_node, source_outcome)
+            if (deterministic.valid_verified_result(proof) and bounded is not None
+                    and outcome.get('acceptance') == 'PASSED'
+                    and source_outcome.get('durable_result_id')
+                    and source_outcome.get('coordination_outcome') != 'OUTCOME_UNCERTAIN'
+                    and outcome.get('result_fingerprint') == result_cache.result_fingerprint(proof['result_type'], bounded)):
+                fact.update(verified_result=proof, acceptance=outcome['acceptance'])
         # Meaningful dependency identity: the accepted result fingerprint, never
         # execution activity (reused vs executed must not change descendant identity).
         # A deterministically-inactive (SKIPPED) conditional node contributes a stable
@@ -1273,6 +1391,7 @@ def _plan_fingerprint(plan: dict[str, Any]) -> str:
             "contract": node.get("task_contract") or {"objective": node.get("objective_summary")},
             "acceptance": list(node.get("acceptance_criteria") or []),
             "tool": node.get("tool"),
+            **{key: node.get(key) for key in deterministic.RESULT_CONTRACTS if key in node},
             "routing": (node.get("routing") or {}),
             **({'exact_output': node.get('exact_output')}
                if 'exact_output' in (node.get('acceptance_criteria') or []) else {}),
@@ -1555,6 +1674,16 @@ def _run_node(node, deps, results, backend, resolution, *, state_dir, record_evi
                            working_dir=repo_root, context_pack=context_pack,
                            context_manifest=(context_result or {}).get("manifest"),
                            read_only=node.get("intent") == "READ_ONLY")
+        if node.get('review_result'):
+            source = _review_source(node, dependency_summaries)
+            delivered = [item for item in (context_pack or {}).get('items', [])
+                         if item.get('source_kind') == 'DEPENDENCY_FACT'
+                         and item.get('source_id') == node['review_result']['source_task_id']]
+            if (source is None or len(delivered) != 1 or delivered[0].get('redacted')
+                    or delivered[0].get('truncated')
+                    or delivered[0].get('content') != json.dumps(source, sort_keys=True)):
+                return _finalize_node(node, {}, BLOCKED, 'VERIFIED_DEPENDENCY_MISSING', initial_tier,
+                    tier, attempt, escalations, decision_id, resolution, state_dir, record_evidence)
         # Final delivered-input budget: the ACTUAL rendered semantic worker input (task
         # contract + required context + dependency facts + acceptance) must fit policy.
         delivered_limit = context_retrieval.load_budgets().get(
@@ -1635,6 +1764,8 @@ def _run_node(node, deps, results, backend, resolution, *, state_dir, record_evi
             # lost launch: the attempt row already exists.
             result = {"task_id": node["task_id"], "status": FAILURE, "failure_category": "UNKNOWN_FAILURE",
                       "summary": f"malformed adapter result: {type(result).__name__}"}
+        result.pop('verified_result', None)  # only the controller can issue verification evidence
+        result.pop('result_verification', None)
         candidate = {**candidate, "simulated": getattr(current_backend, "mode", "SUPPORTED") == "SIMULATED"}
         last_launched = candidate  # the candidate that actually ran this attempt
         try:
@@ -1674,8 +1805,13 @@ def _run_node(node, deps, results, backend, resolution, *, state_dir, record_evi
             process_ok = result.get("status") == SUCCESS and bool(result.get("completion_signal"))
             acceptance_state, acceptance_reason = (ACCEPTANCE_UNVERIFIED, "process did not complete")
             if process_ok:
-                result = {**result, 'acceptance_results': _acceptance_evidence(node, result)}
-                acceptance_state, acceptance_reason = _acceptance(node, result)
+                key, check, proof = _verified_capture(node, result, dependency_summaries)
+                if key:
+                    result['result_verification'] = check
+                    if proof:
+                        result['verified_result'] = proof
+                result = {**result, 'acceptance_results': _acceptance_evidence(node, result, dependency_summaries)}
+                acceptance_state, acceptance_reason = _acceptance(node, result, dependency_summaries)
             accepted = process_ok and acceptance_state == ACCEPTANCE_PASSED
             attempt_status = ("SUCCESS" if accepted
                               else UNVERIFIED if acceptance_state == ACCEPTANCE_UNVERIFIED and process_ok
@@ -1822,6 +1958,7 @@ def _request(node, resolution, dependency_summaries, execution_id, tier, backend
         "dependency_summaries": dependency_summaries, "knowledge_refs": node.get("knowledge_refs", []),
         "context_manifest": manifest, "context_pack": context_pack, "working_dir": str(working_dir),
         "read_only": read_only, "task_contract": contract,
+        **{key: node[key] for key in deterministic.RESULT_CONTRACTS if key in node},
         'role': (execution_requirement(node) or {}).get('role', node['routing'].get('role')),
         'execution_requirement': execution_requirement(node),
         **({'exact_output': node.get('exact_output')}
@@ -1845,6 +1982,8 @@ def _canonical_dependencies(dependency_summaries: list[dict[str, Any]]) -> list[
         fingerprint = dep.get("result_fingerprint")
         if fingerprint:
             entry["result_fingerprint"] = fingerprint
+        if dep.get('verified_result'):
+            entry.update(verified_result=dep['verified_result'], acceptance=dep.get('acceptance'))
         entries.append(entry)
     return sorted(entries, key=lambda item: str(item.get("task_id")))
 
@@ -1868,6 +2007,7 @@ def _canonical_semantics(node: dict[str, Any], dependency_summaries: list[dict[s
         "capability_requirement": contract.get("capability_requirement"),
         "context": result_cache.context_identity(manifest),
         "dependencies": _canonical_dependencies(dependency_summaries),
+        **{key: node[key] for key in deterministic.RESULT_CONTRACTS if key in node},
         **({'exact_output': node['exact_output']} if 'exact_output' in node else {}),
         **({'execution_requirement': execution_requirement(node)}
            if node.get('execution_requirement') is not None else {}),
@@ -1908,8 +2048,18 @@ def _prompt(node, dependency_summaries, read_only: bool = False,
                  if exact else WORKER_ISOLATION_NOTE)
     literal = (f"\nExact output (JSON string): {json.dumps(semantics['exact_output'])}"
                if 'exact_output' in semantics else '')
+    for key in deterministic.RESULT_CONTRACTS:
+        if key in semantics:
+            tag = 'VERIFIABLE_RESULT' if key == 'structured_result' else 'REVIEW_RESULT'
+            fields = 'SOURCE, REVERSED, LENGTH' if key == 'structured_result' else 'REVIEW_VERDICT (PASS or FAIL)'
+            literal += (f'\nDeclared {key}: {json.dumps(semantics[key], sort_keys=True)}'
+                        f'\nReturn exactly one BEGIN_{tag} / END_{tag} block on separate lines, '
+                        f'with only these KEY: value fields: {fields}. Mandatory safety guidance still applies.')
     role = f"Role: {requirement['role']}\n" if requirement else ''
     deps = "; ".join(f"{d['task_id']}: {d['summary']}" for d in semantics["dependencies"]) or "none"
+    if node.get('review_result'):
+        deps = '; '.join(f"{d['task_id']}: result_reference={d.get('result_fingerprint')}"
+                         for d in semantics['dependencies']) or 'none'
     guard = "\nRead-only task: do not modify, create, or delete any files." if read_only else ""
     target_line = ", ".join(semantics.get("targets") or []) or "none stated"
     constraints = ", ".join(semantics.get("constraints") or []) or "none stated"
@@ -1986,6 +2136,12 @@ def _finalize(node, result, status, category, initial_tier, final_tier, attempts
     if ('exact_output' in (node.get('acceptance_criteria') or [])
             and result.get('response_complete') is True and isinstance(result.get('response_text'), str)):
         record['exact_output_fingerprint'] = hashlib.sha256(result['response_text'].encode('utf-8')).hexdigest()
+    if result.get('result_verification'):
+        record['result_verification'] = result['result_verification']
+        record['execution_status'] = result.get('status')
+        record['completion_signal'] = result.get('completion_signal')
+    if status == SUCCESS and result.get('verified_result'):
+        record['verified_result'] = result['verified_result']
     if node.get("intent") == "MUTATING":
         # Durable mutation-uncertainty fact: a real launch whose outcome was not durably
         # accepted is potentially side-effecting and must never be auto-replayed on resume.

@@ -18,6 +18,7 @@ import time
 import uuid
 
 import authority
+import deterministic
 import knowledge_contract as kc
 import orchestration_store as ops
 import result_cache
@@ -104,6 +105,18 @@ def identity(node, root, context, dependencies, constraints, resolution, backend
             requested_model=req['requested_model'], requested_effort=req['requested_effort'],
             allowed_bindings=[{k:c.get(k) for k in ('backend','provider','model','native_variant')}
                               for c in resolution.get('candidates', [])])
+    contracts = {key: node[key] for key in deterministic.RESULT_CONTRACTS if key in node}
+    if contracts:
+        compatibility['result_contract'] = contracts
+        compatibility['result_task_fingerprint'] = result_cache.task_semantic_fingerprint(node)
+        if 'review_result' in contracts:
+            sources = [d for d in dependencies if d['task_id'] == contracts['review_result']['source_task_id']]
+            if len(sources) != 1 or not deterministic.valid_verified_result(sources[0].get('verified_result')):
+                raise WorkError('VERIFIED_DEPENDENCY_MISSING')
+            source = sources[0]
+            compatibility['reviewed_source'] = {'task_id': source['task_id'],
+                'result_fingerprint': source['result_fingerprint'],
+                'evidence_fingerprint': source['verified_result']['evidence_fingerprint']}
     equivalent = kc.active_work_equivalence_input(task=task,
         knowledge_identity=selected['delivered_identity'], execution_compatibility=compatibility)
     return {**equivalent, 'version': VERSION, 'workspace': repo['workspace_instance'],
@@ -155,6 +168,15 @@ class WorkStore(ops.OrchestrationStore):
         if result.get('status') != 'SUCCESS' or result.get('acceptance') != 'PASSED':
             return None
         compatibility = identity['execution_compatibility']
+        contracts = compatibility.get('result_contract')
+        if contracts:
+            proof = result.get('verified_result')
+            if (not deterministic.valid_verified_result(proof)
+                    or contracts != {proof['criterion']: proof['contract']}
+                    or proof['source_task_fingerprint'] != compatibility['result_task_fingerprint']
+                    or (proof['criterion'] == 'review_result'
+                        and proof['reviewed_source'] != compatibility['reviewed_source'])):
+                return None
         if identity['mode'] == 'READ_ONLY' and compatibility.get('freshness_policy') not in result_cache.REUSABLE_FRESHNESS:
             return None
         req = compatibility.get('execution_requirement') or {}
@@ -175,7 +197,8 @@ class WorkStore(ops.OrchestrationStore):
             if not row['postcondition_verified'] or postcondition is None or postcondition(result) is not True:
                 return None
         return {**result, 'reused_from_run_id': row['owner_run'],
-                'reused_from_task_id': row['owner_task'], 'cache_entry_id': row['result_id']}
+                'reused_from_task_id': row['owner_task'], 'cache_entry_id': row['result_id'],
+                **({'durable_result_id': row['result_id']} if contracts else {})}
 
     def acquire(self, identity, run, task, *, lease=30, now=None, reuse=False, result_generation=None, after_result=None):
         now = time.time() if now is None else now
@@ -451,6 +474,8 @@ def coordinate(store, refresh, execute, *, run, task, reuse, force_refresh=False
                 if verified:
                     ref = store.persist_result(claim, current, result, postcondition_verified=verified)
                     store.complete(claim, ref)
+                    if result.get('verified_result'):
+                        result['durable_result_id'] = ref
                 else:
                     store.fail(claim)
                     result['coordination_outcome'] = 'OUTCOME_UNCERTAIN'

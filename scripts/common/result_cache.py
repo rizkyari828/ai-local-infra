@@ -13,7 +13,8 @@ cannot be proven deterministically, the task executes normally.
 This module is the cache authority. It is separate from learning evidence
 (``learning/evidence.db``), operational run state (``orchestration/orchestration.db``),
 and portable knowledge (``knowledge/*``). It stores only bounded, structured,
-secret-safe accepted results — never raw prompts or raw model responses.
+secret-safe accepted results — never raw prompts. Explicit verified-result contracts
+may retain bounded, secret-checked visible response evidence.
 
 Deterministic only: no embeddings, no vector similarity, no fuzzy/AI matching, no
 network, no cross-machine sync.
@@ -24,6 +25,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import deterministic
 import pathlib
 import sqlite3
 import uuid
@@ -147,8 +149,9 @@ def _hash(value: Any) -> str:
 def task_semantic_fingerprint(node: dict[str, Any], *,
                               semantic_key: Optional[str] = None,
                               acceptance_contract: str = ACCEPTANCE_CONTRACT_VERSION) -> str:
-    """Deterministic signature of *what work the task means*. Run-local task_id and
-    timestamps never participate. When an explicit ``semantic_key`` is supplied the
+    """Deterministic signature of *what work the task means*. Ordinary run-local
+    task IDs and timestamps do not participate. Opt-in verified-result contracts bind
+    the source task ID for provenance. When an explicit ``semantic_key`` is supplied the
     free-text objective is excluded, so provably-equivalent wording collapses."""
     routing_c = node.get("routing") or {}
     objective = None if semantic_key else (node.get("objective_summary") or node.get("title") or "")
@@ -167,6 +170,9 @@ def task_semantic_fingerprint(node: dict[str, Any], *,
         "produces_artifacts": sorted(str(p) for p in (node.get("produces_artifacts") or [])),
         "consumes_results_from": sorted(str(c) for c in (node.get("consumes_results_from") or [])),
         "tool": node.get("tool"),
+        **{key: node[key] for key in ('structured_result', 'review_result') if key in node},
+        **({'verified_task_id': node.get('task_id')}
+           if any(key in node for key in deterministic.RESULT_CONTRACTS) else {}),
         **({'exact_output': node.get('exact_output')}
            if 'exact_output' in (node.get('acceptance_criteria') or []) else {}),
     }
@@ -240,12 +246,17 @@ def bounded_result(node: dict[str, Any], result: dict[str, Any]) -> Optional[dic
         return None
     if 'exact_output' in (node.get('acceptance_criteria') or []) and not result.get('exact_output_fingerprint'):
         return None
+    if any(key in (node.get('acceptance_criteria') or []) for key in ('structured_result', 'review_result')):
+        proof = result.get('verified_result')
+        if not deterministic.valid_verified_result(proof):
+            return None
     return {
         "summary": _normalize(result.get("summary")),
         "decisions": [_normalize(entry) for entry in (result.get("decisions") or [])],
         "files_changed": sorted(str(f) for f in (result.get("files_changed") or [])),
         "acceptance_results": {str(k): bool(v) for k, v in sorted(acceptance.items())},
         "new_risk_signals": sorted(str(s) for s in (result.get("new_risk_signals") or [])),
+        **({'verified_result': result['verified_result']} if result.get('verified_result') else {}),
         **({'exact_output_fingerprint': result['exact_output_fingerprint']}
            if 'exact_output' in (node.get('acceptance_criteria') or []) else {}),
     }
