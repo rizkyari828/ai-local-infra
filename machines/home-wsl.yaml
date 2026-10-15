@@ -4,7 +4,7 @@
   "platform": "linux",
   "os": "linux",
   "shell": "bash",
-  "repo_path": "~/ai-local-infra",
+  "repo_path": "~/Developer/Microservices/local-ai-infra",
   "graph_root": "~/.local/share/local-ai-infra/graphify",
   "state_dir": "~/.local/state/local-ai-infra",
   "codex": {
