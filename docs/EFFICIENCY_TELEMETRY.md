@@ -211,13 +211,16 @@ A baseline covers **one window and one machine**, and both are recorded in the s
 - `window.limit` - the run window used (default 20, the module's own default)
 - `window.runs_included` - how many runs the window actually covered
 - `window.machine_filter` - the machine filter applied, or `null`
-- `window.selection` - how those runs were chosen (`most recent N runs by created_at`)
+- `window.selection` - how those runs were chosen (`most recent N runs by created_at`, or
+  `most recent N runs of machine M by created_at` when a machine filter is set)
 - `window.exceptions` - any block that could not share that window, with the reason
 
-`--limit N` sets the window, and the same N is used for the `summary` and `cache` blocks,
-so those two always describe the same runs. `--machine ID` narrows every block to one
-machine. `--limit` picks the most recent N runs first and `--machine ID` then narrows that
-set, so `window.runs_included` can be smaller than `window.limit`. A block that cannot be
+Selection is **machine first, then the N most recent runs of that machine**:
+`--machine M --limit N` means the N most recent runs of machine M, not N arbitrary runs that
+happen to contain some of M. So `window.runs_included` equals N whenever M has at least N
+runs, and equals M's real run count when it has fewer. `--limit N` alone selects the N most
+recent runs overall. The same N is used for the `summary` and `cache` blocks, so those two
+always describe the same runs. A block that cannot be
 aligned without reshaping a module's public output is listed in `window.exceptions` rather
 than silently mixed in; today the `models` block is declared there, because the module
 aggregates every recorded attempt and exposes no run window.
@@ -244,8 +247,10 @@ added to a fixture set.
 
 ### Comparing two baselines
 
-A comparison is valid only when the two snapshots are comparable: `window.limit`,
-`window.machine_filter` and `window.runs_included` must line up, and `window.exceptions`
+A comparison is valid only when the two snapshots are comparable: `window.machine_filter`,
+`window.limit` and `window.runs_included` must line up (a machine-filtered snapshot has
+`window.runs_included` equal to the limit, or to that machine's run count when smaller),
+and `window.exceptions`
 must be the same on both sides. Two baselines taken at the same limit over unchanged
 state differ only in `captured_at`.
 
