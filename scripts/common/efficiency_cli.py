@@ -89,6 +89,13 @@ def _breakdown(rows: list[dict[str, Any]], field: str) -> dict[str, int]:
     return dict(sorted(counts.items(), key=lambda kv: (-kv[1], str(kv[0]))))
 
 
+def _selection(limit: int, machine: Optional[str]) -> str:
+    """The window is chosen machine-first, so record that, not just the limit."""
+    if machine is None:
+        return f"most recent {limit} runs by created_at"
+    return f"most recent {limit} runs of machine {machine} by created_at"
+
+
 def _resolve_identity(rows: list[dict[str, Any]], field: str, explicit: Optional[str],
                       hint: str) -> tuple[Optional[str], dict[str, Any]]:
     """Resolve machine/project over the runs actually covered. Never invents a value: a
@@ -164,11 +171,9 @@ def cmd_baseline(args: argparse.Namespace) -> int:
     try:
         summary = efficiency.get_recent_efficiency(store=store, state_dir=state_dir,
                                                    limit=args.limit, machine_id=args.machine)
-        # The module selects recent_runs(limit) and then filters by machine; read the same
-        # rows so the window block describes exactly the runs that were covered.
-        rows = store.recent_runs(limit=args.limit)
-        if args.machine is not None:
-            rows = [row for row in rows if row["machine_id"] == args.machine]
+        # Machine first, then the limit: the module narrows the run selection to the machine
+        # before applying the window, so `--machine M --limit N` is N runs OF M.
+        rows = store.recent_runs(limit=args.limit, machine_id=args.machine)
         cache = efficiency.get_cache_efficiency(store=store, state_dir=state_dir,
                                                 machine_id=args.machine, limit=args.limit)
         models = efficiency.get_model_usage(store=store, state_dir=state_dir,
@@ -199,7 +204,7 @@ def cmd_baseline(args: argparse.Namespace) -> int:
         "project_resolution": project_resolution,
         "window": {"limit": args.limit, "runs_included": covered,
                    "machine_filter": args.machine,
-                   "selection": f"most recent {args.limit} runs by created_at",
+                   "selection": _selection(args.limit, args.machine),
                    "exceptions": exceptions},
         # Blocks are the module's own output, never reshaped: a later diff needs no mapping.
         "summary": summary,

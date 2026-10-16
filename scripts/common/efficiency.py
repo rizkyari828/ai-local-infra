@@ -215,11 +215,7 @@ def get_recent_efficiency(*, store: Optional[orchestration_store.OrchestrationSt
     owns = store is None
     store = store or orchestration_store.OrchestrationStore(state_dir=state_dir)
     try:
-        rows = store.recent_runs(limit=limit)
-        if machine_id is not None:
-            rows = [r for r in rows if r["machine_id"] == machine_id]
-        if project_id is not None:
-            rows = [r for r in rows if r["project_id"] == project_id]
+        rows = store.recent_runs(limit=limit, machine_id=machine_id, project_id=project_id)
         summaries = [get_run_efficiency(r["run_id"], store=store, state_dir=state_dir) for r in rows]
         root = _state_dir_for(store, state_dir)
     finally:
@@ -272,10 +268,8 @@ def get_cache_efficiency(*, store: Optional[orchestration_store.OrchestrationSto
         if run_id is not None:
             run_ids = [run_id]
         else:
-            recent = store.recent_runs(limit=limit)
-            run_ids = [r["run_id"] for r in recent
-                       if (machine_id is None or r["machine_id"] == machine_id)
-                       and (project_id is None or r["project_id"] == project_id)]
+            recent = store.recent_runs(limit=limit, machine_id=machine_id, project_id=project_id)
+            run_ids = [r["run_id"] for r in recent]
         totals = {"hits": 0, "misses": 0, "rejected": 0, "written": 0, "invalid": 0, "bypassed_by_user": 0}
         for rid in run_ids:
             events = store.run_events(rid)

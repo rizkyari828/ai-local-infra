@@ -473,11 +473,24 @@ class OrchestrationStore:
                 "events": count("run_events"), "oldest": span[0], "newest": span[1],
                 "db_size_bytes": self.path.stat().st_size if self.path.exists() else 0}
 
-    def recent_runs(self, limit: int = 20) -> list[dict[str, Any]]:
+    def recent_runs(self, limit: int = 20, *, machine_id: Optional[str] = None,
+                    project_id: Optional[str] = None) -> list[dict[str, Any]]:
+        """Most recent runs, optionally narrowed to one machine/project *before* the limit is
+        applied, so ``limit`` counts that machine's runs rather than the rows that merely
+        fall inside a mixed window."""
+        where: list[str] = []
+        params: list[Any] = []
+        if machine_id is not None:
+            where.append("machine_id = ?")
+            params.append(machine_id)
+        if project_id is not None:
+            where.append("project_id = ?")
+            params.append(project_id)
+        clause = f" WHERE {' AND '.join(where)}" if where else ""
         rows = self.connection.execute(
             "SELECT run_id, project_id, machine_id, status, intent, planner_mode, hard_max_ai_calls,"
             " used_ai_calls, minimum_required_ai_calls, tool_only_count, failure_category, entry_mode,"
-            " created_at FROM runs ORDER BY created_at DESC LIMIT ?", (limit,))
+            f" created_at FROM runs{clause} ORDER BY created_at DESC LIMIT ?", (*params, limit))
         return [dict(row) for row in rows]
 
     def get_run(self, run_id: str) -> Optional[dict[str, Any]]:
