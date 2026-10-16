@@ -180,6 +180,50 @@ Telemetry JSON and query results are metadata-only: never prompts, responses, te
 transcripts, full context packs, diffs, tokens, or secrets. The secret guard still scans
 bounded operational fields.
 
+## Command surface (`scripts/efficiency`)
+
+Read-only CLI over the query layer above. It adds no metric, no cost and no token
+figure, and it never writes to the operational store, the learning store or the result
+cache. Every field printed comes from `scripts/common/efficiency.py`.
+(`scripts/orchestrate efficiency` remains as-is; this is the dedicated surface.)
+
+```bash
+./scripts/efficiency summary [--limit N] [--machine ID] [--json]
+./scripts/efficiency run <run_id> [--json]
+./scripts/efficiency models [--machine ID] [--json]
+./scripts/efficiency cache [--machine ID] [--json]
+./scripts/efficiency context <run_id> [--json]
+./scripts/efficiency baseline [--out PATH] [--json]
+```
+
+`--state-dir PATH` overrides the machine state root on every subcommand (default:
+`$LAI_STATE_DIR`). `summary` is bounded to the module's own recent-runs window
+(default `--limit 20`). `models` is not windowed: the module aggregates every recorded
+attempt, and adding a window here would reshape its output.
+
+## Pre-pilot baseline
+
+`./scripts/efficiency baseline` captures the current readings into one JSON document so
+a pilot can be diffed against it later without a mapping layer:
+
+- `schema_version`, `captured_at` (UTC, ISO 8601), machine id and project id
+- `summary`, `models` and `cache`: the module's own output blocks, unreshaped
+- `source`: the state directory and the number of runs included
+- `not_included`: what this baseline deliberately omits
+
+It contains **no** tokens, cost, RTK savings, Headroom savings, prompts, responses or
+transcripts — only counts, identifiers and timestamps. The default output path is
+`$LAI_STATE_DIR/efficiency/baseline-<UTC>.json`; `--out PATH` writes elsewhere. The
+snapshot is operator state, not repository content: it is never committed and never
+added to a fixture set.
+
+Two baselines over unchanged state differ only in `captured_at` (and the output path).
+
+These additions defer nothing new and move nothing out of §Deferred: automatic
+cross-machine aggregation/UI, HTTP API/WebSocket/SSE, a persisted telemetry warehouse,
+cost/token estimation, retention scheduling, and unifying RTK/Headroom savings with
+orchestration savings all remain deferred.
+
 ## Deferred
 
 Automatic cross-machine aggregation/UI, HTTP API/WebSocket/SSE, a persisted telemetry
