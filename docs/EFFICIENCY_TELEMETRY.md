@@ -216,10 +216,11 @@ A baseline covers **one window and one machine**, and both are recorded in the s
 
 `--limit N` sets the window, and the same N is used for the `summary` and `cache` blocks,
 so those two always describe the same runs. `--machine ID` narrows every block to one
-machine. A block that cannot be aligned without reshaping a module's public output is
-listed in `window.exceptions` rather than silently mixed in; today the `models` block is
-declared there, because the module aggregates every recorded attempt and exposes no run
-window.
+machine. `--limit` picks the most recent N runs first and `--machine ID` then narrows that
+set, so `window.runs_included` can be smaller than `window.limit`. A block that cannot be
+aligned without reshaping a module's public output is listed in `window.exceptions` rather
+than silently mixed in; today the `models` block is declared there, because the module
+aggregates every recorded attempt and exposes no run window.
 
 The snapshot also says which machine it describes:
 
