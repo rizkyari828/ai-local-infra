@@ -346,6 +346,80 @@ class AllUnknownTests(CliTestBase):
         self.assertEqual(2, document["window"]["runs_included"])
 
 
+class MachineFirstTests(CliTestBase):
+    """`--machine M --limit N` means the N most recent runs OF M, not N rows that happen to
+    contain some of them. The fixture puts the machine's runs *older* than other machines,
+    which is exactly the case the old filter-after-limit order got wrong."""
+
+    RUNS = (("run-a", "work-mac", "proj-1"),
+            ("run-b", "work-mac", "proj-1"),
+            ("run-c", "work-mac", "proj-1"),
+            ("run-d", "unknown", "proj-2"),
+            ("run-e", "unknown", "proj-2"),
+            ("run-f", "unknown", "proj-2"))
+
+    def _baseline(self, *args):
+        out = self.home / f"mf{abs(hash(args)) % 9999}.json"
+        result = self.cli("baseline", "--out", str(out), *args)
+        self.assertEqual(0, result.returncode, result.stderr)
+        return json.loads(out.read_text(encoding="utf-8"))
+
+    def _old_order_count(self, limit: int, machine: str) -> int:
+        """What the pre-change order (limit first, then filter) would have yielded."""
+        store = store_mod.OrchestrationStore(state_dir=self.state)
+        try:
+            return len([r for r in store.recent_runs(limit=limit) if r["machine_id"] == machine])
+        finally:
+            store.close()
+
+    def test_g1_machine_first_yields_the_limit_for_that_machine(self) -> None:
+        self.assertEqual(0, self._old_order_count(2, "work-mac"))    # the trap being fixed
+        document = self._baseline("--machine", "work-mac", "--limit", "2")
+        self.assertEqual(2, document["window"]["runs_included"])
+        self.assertEqual("most recent 2 runs of machine work-mac by created_at",
+                         document["window"]["selection"])
+        self.assertEqual(["run-c", "run-b"],
+                         [r["run_id"] for r in document["summary"]["runs"]])
+        self.assertTrue(all(r["machine_id"] == "work-mac" for r in document["summary"]["runs"]))
+
+    def test_g2_no_machine_filter_is_unchanged(self) -> None:
+        document = self._baseline("--limit", "4")
+        self.assertEqual(4, document["window"]["runs_included"])
+        self.assertIsNone(document["window"]["machine_filter"])
+        self.assertEqual(["run-f", "run-e", "run-d", "run-c"],
+                         [r["run_id"] for r in document["summary"]["runs"]])
+
+    def test_g3_a_machine_with_fewer_runs_reports_its_real_count(self) -> None:
+        document = self._baseline("--machine", "work-mac", "--limit", "50")
+        self.assertEqual(50, document["window"]["limit"])
+        self.assertEqual(3, document["window"]["runs_included"])   # the machine has only three
+        self.assertEqual(3, document["summary"]["totals"]["runs"])
+
+    def test_g4_totals_share_the_window(self) -> None:
+        document = self._baseline("--machine", "work-mac", "--limit", "2")
+        self.assertEqual(document["window"]["runs_included"], document["summary"]["totals"]["runs"])
+        self.assertEqual(document["window"]["runs_included"], document["cache"]["runs_considered"])
+        self.assertEqual(["models"], [e["block"] for e in document["window"]["exceptions"]])
+
+    def test_g5_determinism_at_a_fixed_limit_and_machine(self) -> None:
+        first = self._baseline("--machine", "work-mac", "--limit", "2")
+        second = self._baseline("--machine", "work-mac", "--limit", "2")
+        first.pop("captured_at")
+        second.pop("captured_at")
+        self.assertEqual(first, second)
+
+    def test_g6_read_only_holds_for_machine_first(self) -> None:
+        before = self.db_stat()
+        self._baseline("--machine", "work-mac", "--limit", "2")
+        self._baseline("--machine", "unknown", "--limit", "50")
+        self.assertEqual(before, self.db_stat())
+
+    def test_summary_subcommand_is_machine_first_too(self) -> None:
+        data = self.json_cli("summary", "--machine", "work-mac", "--limit", "2", "--json")
+        self.assertEqual(2, data["totals"]["runs"])
+        self.assertEqual(["run-c", "run-b"], [r["run_id"] for r in data["runs"]])
+
+
 class LauncherTests(unittest.TestCase):
     """E7: mirror tests/test_cli_launcher.py — the entrypoint delegates, and the shared
     launcher refuses an interpreter below 3.11 rather than failing with an import error."""
