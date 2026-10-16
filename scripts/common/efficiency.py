@@ -263,7 +263,8 @@ def get_model_usage(*, store: Optional[orchestration_store.OrchestrationStore] =
 def get_cache_efficiency(*, store: Optional[orchestration_store.OrchestrationStore] = None,
                          state_dir: Optional[pathlib.Path] = None, run_id: Optional[str] = None,
                          machine_id: Optional[str] = None,
-                         project_id: Optional[str] = None) -> dict[str, Any]:
+                         project_id: Optional[str] = None,
+                         limit: int = 200) -> dict[str, Any]:
     """Bounded cache telemetry from operational events (bounded reason codes)."""
     owns = store is None
     store = store or orchestration_store.OrchestrationStore(state_dir=state_dir)
@@ -271,7 +272,7 @@ def get_cache_efficiency(*, store: Optional[orchestration_store.OrchestrationSto
         if run_id is not None:
             run_ids = [run_id]
         else:
-            recent = store.recent_runs(limit=200)
+            recent = store.recent_runs(limit=limit)
             run_ids = [r["run_id"] for r in recent
                        if (machine_id is None or r["machine_id"] == machine_id)
                        and (project_id is None or r["project_id"] == project_id)]

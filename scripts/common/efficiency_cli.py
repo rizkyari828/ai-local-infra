@@ -32,6 +32,15 @@ SCHEMA_VERSION = 1
 NOT_INCLUDED = ("tokens", "cost", "RTK savings", "Headroom savings",
                 "prompts", "responses", "transcripts")
 
+# Values that name nothing on their own; a resolved identity never prefers them.
+_UNATTRIBUTED = (None, "", "unknown")
+
+# A block that cannot share the baseline's window without reshaping the module's public
+# output is declared here instead of being silently mixed in.
+EXCEPTIONS = ({"block": "models",
+               "reason": "the module aggregates every recorded attempt and exposes no run window; "
+                         "limiting it would reshape that output, so it is left as-is and declared here"},)
+
 
 def _state_dir(args: argparse.Namespace) -> pathlib.Path:
     return pathlib.Path(args.state_dir) if args.state_dir else infra.STATE_DIR
@@ -73,12 +82,28 @@ def _emit(data: Any, args: argparse.Namespace) -> None:
         _render(data)
 
 
-def _machine_id(summary: dict[str, Any]) -> Optional[str]:
-    # The module reports machine_id per run and as the active filter; prefer the filter.
-    if summary["machine_id"]:
-        return summary["machine_id"]
-    seen = {row["machine_id"] for row in summary["runs"] if row.get("machine_id")}
-    return next(iter(seen)) if len(seen) == 1 else None
+def _breakdown(rows: list[dict[str, Any]], field: str) -> dict[str, int]:
+    counts: dict[str, Any] = {}
+    for row in rows:
+        counts[row.get(field)] = counts.get(row.get(field), 0) + 1
+    return dict(sorted(counts.items(), key=lambda kv: (-kv[1], str(kv[0]))))
+
+
+def _resolve_identity(rows: list[dict[str, Any]], field: str, explicit: Optional[str],
+                      hint: str) -> tuple[Optional[str], dict[str, Any]]:
+    """Resolve machine/project over the runs actually covered. Never invents a value: a
+    null is always accompanied by the breakdown that explains it."""
+    covered = _breakdown(rows, field)
+    if explicit is not None:
+        return explicit, {"mode": "explicit", "covered_runs": covered,
+                          "note": f"filtered to {field}={explicit}"}
+    attributed = {k: n for k, n in covered.items() if k not in _UNATTRIBUTED}
+    if not attributed:
+        return None, {"mode": "unresolved", "covered_runs": covered,
+                      "note": f"every covered run reports an unknown or missing {field}"}
+    dominant = max(attributed, key=lambda key: attributed[key])
+    return dominant, {"mode": "dominant", "covered_runs": covered,
+                      "note": hint if len(covered) > 1 else f"single {field} across the covered window"}
 
 
 def cmd_summary(args: argparse.Namespace) -> int:
@@ -137,23 +162,50 @@ def cmd_baseline(args: argparse.Namespace) -> int:
     state_dir = _state_dir(args)
     store = _open_store(state_dir)
     try:
-        summary = efficiency.get_recent_efficiency(store=store, state_dir=state_dir, limit=DEFAULT_LIMIT)
-        models = efficiency.get_model_usage(store=store, state_dir=state_dir)
-        cache = efficiency.get_cache_efficiency(store=store, state_dir=state_dir)
+        summary = efficiency.get_recent_efficiency(store=store, state_dir=state_dir,
+                                                   limit=args.limit, machine_id=args.machine)
+        # The module selects recent_runs(limit) and then filters by machine; read the same
+        # rows so the window block describes exactly the runs that were covered.
+        rows = store.recent_runs(limit=args.limit)
+        if args.machine is not None:
+            rows = [row for row in rows if row["machine_id"] == args.machine]
+        cache = efficiency.get_cache_efficiency(store=store, state_dir=state_dir,
+                                                machine_id=args.machine, limit=args.limit)
+        models = efficiency.get_model_usage(store=store, state_dir=state_dir,
+                                            machine_id=args.machine)
     finally:
         store.close()
+
+    covered = summary["totals"]["runs"]
+    exceptions = [dict(exception) for exception in EXCEPTIONS]
+    if len(rows) != covered:
+        exceptions.append({"block": "window",
+                           "reason": f"the store's window holds {len(rows)} runs but the summary "
+                                     f"covered {covered}; window counts are reported from the summary"})
+
+    machine_id, machine_resolution = _resolve_identity(
+        rows, "machine_id", args.machine,
+        "mixed machine ids in the covered window; use --machine to pin one")
+    project_id, project_resolution = _resolve_identity(
+        rows, "project_id", None, "mixed project ids in the covered window")
 
     now = dt.datetime.now(dt.timezone.utc)
     document = {
         "schema_version": SCHEMA_VERSION,
         "captured_at": now.isoformat(timespec="seconds").replace("+00:00", "Z"),
-        "machine_id": _machine_id(summary),
-        "project_id": summary["project_id"],
+        "machine_id": machine_id,
+        "machine_resolution": machine_resolution,
+        "project_id": project_id,
+        "project_resolution": project_resolution,
+        "window": {"limit": args.limit, "runs_included": covered,
+                   "machine_filter": args.machine,
+                   "selection": f"most recent {args.limit} runs by created_at",
+                   "exceptions": exceptions},
         # Blocks are the module's own output, never reshaped: a later diff needs no mapping.
         "summary": summary,
         "models": models,
         "cache": cache,
-        "source": {"state_dir": summary["state_dir"], "runs_included": summary["totals"]["runs"]},
+        "source": {"state_dir": summary["state_dir"], "runs_included": covered},
         "not_included": list(NOT_INCLUDED),
     }
     path = (pathlib.Path(args.out) if args.out
@@ -202,7 +254,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("run_id")
     p.set_defaults(func=cmd_context)
 
-    p = sub.add_parser("baseline", parents=[base], help="capture a comparable baseline snapshot")
+    p = sub.add_parser("baseline", parents=[filtered], help="capture a comparable baseline snapshot")
+    p.add_argument("--limit", type=int, default=DEFAULT_LIMIT,
+                   help=f"runs in the baseline window, shared by every block (default {DEFAULT_LIMIT})")
     p.add_argument("--out", type=pathlib.Path,
                    help="write here instead of $LAI_STATE_DIR/efficiency/")
     p.set_defaults(func=cmd_baseline)
