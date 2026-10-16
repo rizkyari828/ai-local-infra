@@ -1,0 +1,18 @@
+#!/bin/sh
+# Efficiency telemetry CLI entrypoint (read-only).
+#
+# Thin wrapper over the shared supported-Python launcher (scripts/common/launch):
+# selects an already-installed CPython >= 3.11 and runs
+# scripts/common/efficiency_cli.py with the original arguments and exit code.
+# The implementation is a distinct module, so this never recurses.
+set -u
+
+self=$0
+case $self in
+    */*) ;;
+    *) self=$(command -v "$self" 2>/dev/null) || self=$0 ;;
+esac
+here=${self%/*}
+[ "$here" = "$self" ] && here=.
+
+exec "$here/common/launch" "$here/common/efficiency_cli.py" "$@"
