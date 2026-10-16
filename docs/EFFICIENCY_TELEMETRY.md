@@ -193,7 +193,7 @@ cache. Every field printed comes from `scripts/common/efficiency.py`.
 ./scripts/efficiency models [--machine ID] [--json]
 ./scripts/efficiency cache [--machine ID] [--json]
 ./scripts/efficiency context <run_id> [--json]
-./scripts/efficiency baseline [--out PATH] [--json]
+./scripts/efficiency baseline [--limit N] [--machine ID] [--out PATH] [--json]
 ```
 
 `--state-dir PATH` overrides the machine state root on every subcommand (default:
@@ -203,23 +203,56 @@ attempt, and adding a window here would reshape its output.
 
 ## Pre-pilot baseline
 
-`./scripts/efficiency baseline` captures the current readings into one JSON document so
-a pilot can be diffed against it later without a mapping layer:
+`./scripts/efficiency baseline [--limit N] [--machine ID]` captures the current readings
+into one JSON document so a pilot can be diffed against it later without a mapping layer.
 
-- `schema_version`, `captured_at` (UTC, ISO 8601), machine id and project id
-- `summary`, `models` and `cache`: the module's own output blocks, unreshaped
-- `source`: the state directory and the number of runs included
-- `not_included`: what this baseline deliberately omits
+A baseline covers **one window and one machine**, and both are recorded in the snapshot:
+
+- `window.limit` - the run window used (default 20, the module's own default)
+- `window.runs_included` - how many runs the window actually covered
+- `window.machine_filter` - the machine filter applied, or `null`
+- `window.selection` - how those runs were chosen (`most recent N runs by created_at`)
+- `window.exceptions` - any block that could not share that window, with the reason
+
+`--limit N` sets the window, and the same N is used for the `summary` and `cache` blocks,
+so those two always describe the same runs. `--machine ID` narrows every block to one
+machine. A block that cannot be aligned without reshaping a module's public output is
+listed in `window.exceptions` rather than silently mixed in; today the `models` block is
+declared there, because the module aggregates every recorded attempt and exposes no run
+window.
+
+The snapshot also says which machine it describes:
+
+- `machine_id` / `project_id` - the identity the baseline resolved, or `null`
+- `machine_resolution` / `project_resolution` - `mode` (`explicit`, `dominant` or
+  `unresolved`), the `covered_runs` breakdown, and a note
+
+A `null` is never bare: it always arrives with the breakdown that explains it (for
+example a window in which every run reports `unknown`). No identity is invented - every
+value comes from a run row.
+
+Remaining blocks: `schema_version`, `captured_at` (UTC, ISO 8601), `summary`, `models`,
+`cache` (the module's own output, unreshaped), `source` (state directory and runs
+included) and `not_included`.
 
 It contains **no** tokens, cost, RTK savings, Headroom savings, prompts, responses or
-transcripts — only counts, identifiers and timestamps. The default output path is
+transcripts - only counts, identifiers and timestamps. The default output path is
 `$LAI_STATE_DIR/efficiency/baseline-<UTC>.json`; `--out PATH` writes elsewhere. The
 snapshot is operator state, not repository content: it is never committed and never
 added to a fixture set.
 
-Two baselines over unchanged state differ only in `captured_at` (and the output path).
+### Comparing two baselines
 
-These additions defer nothing new and move nothing out of §Deferred: automatic
+A comparison is valid only when the two snapshots are comparable: `window.limit`,
+`window.machine_filter` and `window.runs_included` must line up, and `window.exceptions`
+must be the same on both sides. Two baselines taken at the same limit over unchanged
+state differ only in `captured_at`.
+
+The **on-disk run-directory count is not a run count.** `orchestration/` holds many
+directories, and most are not rows in the operational DB. `orchestration.db` is the
+authority, and `window.runs_included` counts its rows - never the directories on disk.
+
+These additions defer nothing new and move nothing out of the section below: automatic
 cross-machine aggregation/UI, HTTP API/WebSocket/SSE, a persisted telemetry warehouse,
 cost/token estimation, retention scheduling, and unifying RTK/Headroom savings with
 orchestration savings all remain deferred.
